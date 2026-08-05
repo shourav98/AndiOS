@@ -111,9 +111,11 @@ from routers import (
     owners,
     call_campaigns,
     calls,
+    admin,
 )
 
 app.include_router(auth.router)
+app.include_router(admin.router)
 app.include_router(agents.router)
 app.include_router(webhooks.router)
 app.include_router(leads.router)

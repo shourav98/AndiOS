@@ -15,7 +15,8 @@ SYSTEM_PROMPT_QUALIFY = """You are Andi, an AI real estate assistant for a Dubai
 Your job is to qualify leads by understanding their requirements through friendly WhatsApp conversation.
 Gather: budget (min/max in AED), bedrooms required, preferred location in Dubai, purpose (rent/buy), move-in timeline, and if renting, the number of cheques they prefer.
 Be warm, concise, and professional. Use simple language. Never ask more than 1-2 questions at a time.
-Always respond in the same language the lead uses (English or Arabic)."""
+Always respond in the same language the lead uses (English or Arabic).
+If the user wants to schedule a viewing, ALWAYS call the `check_calendar_slots` function to get available times, then offer the first two closest options to the user. Do not make up times."""
 
 SYSTEM_PROMPT_HANDOVER = """You analyze WhatsApp conversations to detect if a lead needs a human agent.
 Return a JSON object with:
@@ -61,13 +62,77 @@ async def qualify_and_respond(
     # Add the new inbound message
     messages.append({"role": "user", "content": new_message})
 
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "check_calendar_slots",
+                "description": "Check available viewing slots in the agent's Google Calendar. Call this when the user asks to schedule a viewing.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        }
+    ]
+
     response = await client.chat.completions.create(
         model=settings.OPENAI_MODEL,
         messages=messages,
+        tools=tools,
         max_tokens=300,
         temperature=0.7,
     )
-    return response.choices[0].message.content.strip()
+    
+    response_message = response.choices[0].message
+    
+    if response_message.tool_calls:
+        # Handle function call
+        from database.supabase_client import get_supabase
+        from services.calendar_service import get_available_slots
+        from datetime import datetime, timedelta
+        import pytz
+        
+        sb = get_supabase()
+        agency_id = lead_context.get("agency_id")
+        
+        # In a multi-tenant app, fetch connector by agency_id. Our current schema doesn't have agency_id in connectors table unless added.
+        # Wait, the RLS policy for connectors assumes agency_id exists. Let's use service role or just query.
+        connector = sb.table("connectors").select("auth_data").eq("name", "google_calendar").eq("agency_id", agency_id).eq("is_connected", True).limit(1).execute()
+        
+        slots_text = "No calendar connected. Tell the user you will have an agent contact them to schedule."
+        if connector.data and connector.data[0].get("auth_data"):
+            auth_data = connector.data[0]["auth_data"]
+            tz = pytz.timezone("Asia/Dubai")
+            now = datetime.now(tz)
+            date_from = now
+            date_to = now + timedelta(days=3)
+            slots = get_available_slots(auth_data, "primary", date_from, date_to)
+            if not slots:
+                slots_text = "No slots available in the next 3 days. Ask the user if next week works."
+            else:
+                slot_strs = [datetime.fromisoformat(s["start"]).strftime("%A, %b %d at %I:%M %p") for s in slots[:4]]
+                slots_text = f"Available slots: {', '.join(slot_strs)}. Offer the first two closest options."
+        
+        # Append function result and call again
+        messages.append(response_message)
+        messages.append({
+            "role": "tool",
+            "tool_call_id": response_message.tool_calls[0].id,
+            "name": "check_calendar_slots",
+            "content": slots_text
+        })
+        
+        second_response = await client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            messages=messages,
+            max_tokens=300,
+            temperature=0.7,
+        )
+        return second_response.choices[0].message.content.strip()
+
+    return response_message.content.strip()
 
 
 async def detect_handover(

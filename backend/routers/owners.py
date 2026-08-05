@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+import csv
+import io
 from pydantic import BaseModel, EmailStr
 from typing import List, Optional
 from database.supabase_client import get_supabase
@@ -108,6 +110,59 @@ async def bulk_upload_owners(payload: BulkUploadRequest, current_user: dict = De
     except Exception as e:
         logger.error(f"Error bulk uploading owners: {e}")
         raise HTTPException(status_code=500, detail="Failed to bulk upload owners")
+
+@router.post("/bulk-upload-csv", status_code=201)
+async def bulk_upload_owners_csv(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(verify_token)
+):
+    """Bulk upload multiple owners via CSV file."""
+    sb = get_supabase()
+    agency_id = current_user.get("agency_id")
+
+    if not agency_id:
+        raise HTTPException(status_code=400, detail="User is not associated with any agency")
+
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="File must be a CSV")
+
+    try:
+        contents = await file.read()
+        decoded = contents.decode("utf-8")
+        reader = csv.DictReader(io.StringIO(decoded))
+        
+        insert_data = []
+        for row in reader:
+            # Expected columns: name, phone, email, property_group, property_unit
+            if not row.get("name") or not row.get("phone"):
+                continue # Skip rows without required fields
+                
+            data = {
+                "name": row["name"],
+                "phone": row["phone"],
+                "email": row.get("email"),
+                "property_group": row.get("property_group"),
+                "property_unit": row.get("property_unit"),
+                "call_status": "Not called",
+                "agency_id": agency_id
+            }
+            insert_data.append(data)
+            
+        if not insert_data:
+            raise HTTPException(status_code=400, detail="No valid data found in CSV")
+            
+        result = sb.table("owners").insert(insert_data).execute()
+        
+        return api_success(
+            data={"count": len(result.data)}, 
+            message=f"{len(result.data)} owners uploaded via CSV successfully", 
+            status_code=201
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error bulk uploading owners via CSV: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to parse CSV: {str(e)}")
 
 @router.get("/{owner_id}")
 async def get_owner(owner_id: str, current_user: dict = Depends(verify_token)):

@@ -8,9 +8,11 @@ Scheduler Service — APScheduler background jobs for:
 """
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime, timedelta
 from database.supabase_client import get_supabase
 from services.whatsapp_service import send_whatsapp_message
+from services.ai_service import generate_owner_report
 import logging
 
 logger = logging.getLogger(__name__)
@@ -261,3 +263,47 @@ def cancel_viewing_jobs(viewing_id: str):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
     logger.info(f"Cancelled all scheduled jobs for viewing {viewing_id}")
+
+# ─── Recurring Cron Jobs ───────────────────────────────────────────────────────
+
+async def weekly_reengagement_job():
+    """Job: runs weekly to re-engage unresponsive leads."""
+    try:
+        sb = get_supabase()
+        seven_days_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        leads = sb.table("leads").select("*").in_("status", ["new", "qualifying"]).lt("updated_at", seven_days_ago).execute()
+        for lead in leads.data:
+            name = lead.get("name", "there").split()[0]
+            msg = f"Hi {name}! 👋 Andi here. Are you still looking for a property? Let me know if I can help you find something!"
+            await send_whatsapp_message(lead.get("phone", ""), msg)
+            # Update updated_at so they aren't spammed
+            sb.table("leads").update({"updated_at": datetime.utcnow().isoformat()}).eq("id", lead["id"]).execute()
+            logger.info(f"Sent weekly re-engagement to lead {lead['id']}")
+    except Exception as e:
+        logger.error(f"Error in weekly reengagement job: {e}")
+
+
+async def landlord_weekly_report_job():
+    """Job: runs every Friday to send AI-generated reports to landlords."""
+    try:
+        sb = get_supabase()
+        owners = sb.table("owners").select("*").execute()
+        for owner in owners.data:
+            # Mock data for owner report - in a real app, query viewings and leads for the owner's properties
+            report_data = {
+                "period_start": (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d"),
+                "period_end": datetime.utcnow().strftime("%Y-%m-%d"),
+                "leads_generated": 15,
+                "viewings_conducted": 4,
+                "feedback": ["Great location", "Price slightly above budget"],
+            }
+            report_msg = await generate_owner_report(report_data)
+            await send_whatsapp_message(owner.get("phone", ""), f"📊 *Your Weekly Property Report*\n\n{report_msg}")
+            logger.info(f"Sent weekly report to owner {owner['id']}")
+    except Exception as e:
+        logger.error(f"Error in landlord weekly report job: {e}")
+
+
+# Register cron jobs
+scheduler.add_job(weekly_reengagement_job, CronTrigger(day_of_week='wed', hour=10), id="weekly_reengagement_job", replace_existing=True)
+scheduler.add_job(landlord_weekly_report_job, CronTrigger(day_of_week='fri', hour=17), id="landlord_weekly_report_job", replace_existing=True)

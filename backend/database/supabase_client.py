@@ -5,14 +5,12 @@ Never expose this key to the frontend.
 from supabase import create_client, Client
 from config import settings
 
-_supabase: Client | None = None
-
-
 def get_supabase() -> Client:
-    global _supabase
-    if _supabase is None:
-        _supabase = create_client(
-            settings.SUPABASE_URL,
-            settings.SUPABASE_SERVICE_ROLE_KEY,
-        )
-    return _supabase
+    """
+    Creates and returns a new Supabase client instance per request.
+    This prevents auth session leakage across concurrent requests.
+    """
+    return create_client(
+        settings.SUPABASE_URL,
+        settings.SUPABASE_SERVICE_ROLE_KEY,
+    )

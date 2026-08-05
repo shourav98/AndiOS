@@ -19,3 +19,5 @@ pytest>=8.3.0
 pytest-asyncio>=0.24.0
 anyio>=4.6.0
 twilio>=9.3.0
+reportlab>=4.2.0
+stripe>=10.12.0

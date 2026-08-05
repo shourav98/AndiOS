@@ -167,6 +167,270 @@ async def property_finder_webhook(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─── Bayut Webhook ─────────────────────────────────────────────────────────────
+
+@router.post("/bayut")
+async def bayut_webhook(request: Request):
+    """
+    Receives new lead from Bayut portal.
+    Deduplicates, stores lead, triggers AI WhatsApp greeting.
+    """
+    start_time = time.time()
+    sb = get_supabase()
+    payload = await request.json()
+
+    # Log raw webhook
+    log_entry = sb.table("webhook_logs").insert({
+        "source": "bayut",
+        "payload": payload,
+        "processed": False,
+    }).execute()
+    log_id = log_entry.data[0]["id"]
+
+    try:
+        # Bayut specific payload parsing (can be adjusted based on exact Bayut format)
+        lead_data = payload.get("lead", payload)
+        external_id = str(lead_data.get("id", ""))
+        name = lead_data.get("name") or f"{lead_data.get('first_name', '')} {lead_data.get('last_name', '')}".strip()
+        phone = str(lead_data.get("phone") or lead_data.get("mobile", ""))
+        email = lead_data.get("email", "")
+        property_ref = str(lead_data.get("reference", ""))
+        property_address = lead_data.get("property_title", "")
+        bedrooms = lead_data.get("bedrooms")
+        budget = lead_data.get("price")
+        location = lead_data.get("location", "")
+
+        if not phone:
+            raise ValueError("No phone number in webhook payload")
+
+        # Resolve agency + agent
+        agent_phone = lead_data.get("agent_phone")
+        agent_email = lead_data.get("agent_email")
+        agency_id, assigned_agent_id = await resolve_agency_and_agent(
+            source="bayut",
+            property_ref=property_ref or None,
+            agent_phone=str(agent_phone) if agent_phone else None,
+            agent_email=agent_email,
+        )
+        if not agency_id:
+            raise ValueError("Could not resolve agency for inbound lead")
+
+        # Deduplication
+        if external_id and await is_duplicate(external_id):
+            logger.info(f"Duplicate Bayut lead ignored: {external_id}")
+            sb.table("webhook_logs").update({
+                "processed": True,
+                "error": "duplicate",
+                "processing_time_ms": int((time.time() - start_time) * 1000),
+            }).eq("id", log_id).execute()
+            return api_success(message="Lead already exists", data={"status": "duplicate"})
+
+        existing = await get_existing_lead_by_phone(phone)
+        if existing:
+            sb.table("webhook_logs").update({
+                "processed": True,
+                "lead_id": existing["id"],
+                "error": "phone_duplicate",
+                "processing_time_ms": int((time.time() - start_time) * 1000),
+            }).eq("id", log_id).execute()
+            return api_success(message="Lead with this phone already exists", data={"status": "duplicate"})
+
+        # Create Lead
+        lead_insert = {
+            "external_lead_id": external_id or None,
+            "name": name or "Unknown",
+            "phone": phone,
+            "email": email or None,
+            "source": "bayut",
+            "property_ref": property_ref or None,
+            "property_address": property_address or None,
+            "bedrooms": int(bedrooms) if bedrooms else None,
+            "budget_max": float(budget) if budget else None,
+            "location_pref": location or None,
+            "status": "new",
+            "ai_stage": "greeting",
+            "is_ai_handling": True,
+            "agency_id": agency_id,
+        }
+        if assigned_agent_id:
+            lead_insert["assigned_agent_id"] = assigned_agent_id
+
+        new_lead = sb.table("leads").insert(lead_insert).execute()
+        lead_id = new_lead.data[0]["id"]
+
+        # Send AI Greeting via WhatsApp (<3 min SLA)
+        greeting = (
+            f"Hi {name.split()[0]}! 👋 I'm Andi, your AI assistant from the agency.\n\n"
+            f"I saw your enquiry about {'the ' + property_ref + ' listing' if property_ref else 'a property'} "
+            f"{'in ' + location if location else ''} on Bayut. \n\n"
+            f"I'd love to help you find your perfect home! Could you tell me:\n"
+            f"1. What's your budget range?\n"
+            f"2. How many bedrooms are you looking for?"
+        )
+        await send_whatsapp_message(phone, greeting)
+
+        # Log conversation
+        sb.table("conversations").insert({
+            "lead_id": lead_id,
+            "agency_id": agency_id,
+            "direction": "outbound",
+            "channel": "whatsapp",
+            "message_body": greeting,
+            "sender_type": "ai",
+        }).execute()
+
+        sb.table("leads").update({"status": "qualifying"}).eq("id", lead_id).execute()
+
+        sb.table("webhook_logs").update({
+            "processed": True,
+            "lead_id": lead_id,
+            "processing_time_ms": int((time.time() - start_time) * 1000),
+        }).eq("id", log_id).execute()
+
+        logger.info(f"New Bayut lead created: {lead_id} ({name}, {phone})")
+        return api_success(data={"lead_id": lead_id}, message="Bayut lead processed successfully")
+
+    except Exception as e:
+        logger.error(f"Bayut webhook error: {e}")
+        sb.table("webhook_logs").update({
+            "error": str(e),
+            "processing_time_ms": int((time.time() - start_time) * 1000),
+        }).eq("id", log_id).execute()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Dubizzle Webhook ──────────────────────────────────────────────────────────
+
+@router.post("/dubizzle")
+async def dubizzle_webhook(request: Request):
+    """
+    Receives new lead from Dubizzle portal.
+    Deduplicates, stores lead, triggers AI WhatsApp greeting.
+    """
+    start_time = time.time()
+    sb = get_supabase()
+    payload = await request.json()
+
+    # Log raw webhook
+    log_entry = sb.table("webhook_logs").insert({
+        "source": "dubizzle",
+        "payload": payload,
+        "processed": False,
+    }).execute()
+    log_id = log_entry.data[0]["id"]
+
+    try:
+        # Dubizzle specific payload parsing
+        lead_data = payload.get("lead", payload)
+        external_id = str(lead_data.get("id", ""))
+        name = lead_data.get("name") or f"{lead_data.get('first_name', '')} {lead_data.get('last_name', '')}".strip()
+        phone = str(lead_data.get("phone") or lead_data.get("mobile", ""))
+        email = lead_data.get("email", "")
+        property_ref = str(lead_data.get("reference", ""))
+        property_address = lead_data.get("property_title", "")
+        bedrooms = lead_data.get("bedrooms")
+        budget = lead_data.get("price")
+        location = lead_data.get("location", "")
+
+        if not phone:
+            raise ValueError("No phone number in webhook payload")
+
+        # Resolve agency + agent
+        agent_phone = lead_data.get("agent_phone")
+        agent_email = lead_data.get("agent_email")
+        agency_id, assigned_agent_id = await resolve_agency_and_agent(
+            source="dubizzle",
+            property_ref=property_ref or None,
+            agent_phone=str(agent_phone) if agent_phone else None,
+            agent_email=agent_email,
+        )
+        if not agency_id:
+            raise ValueError("Could not resolve agency for inbound lead")
+
+        # Deduplication
+        if external_id and await is_duplicate(external_id):
+            logger.info(f"Duplicate Dubizzle lead ignored: {external_id}")
+            sb.table("webhook_logs").update({
+                "processed": True,
+                "error": "duplicate",
+                "processing_time_ms": int((time.time() - start_time) * 1000),
+            }).eq("id", log_id).execute()
+            return api_success(message="Lead already exists", data={"status": "duplicate"})
+
+        existing = await get_existing_lead_by_phone(phone)
+        if existing:
+            sb.table("webhook_logs").update({
+                "processed": True,
+                "lead_id": existing["id"],
+                "error": "phone_duplicate",
+                "processing_time_ms": int((time.time() - start_time) * 1000),
+            }).eq("id", log_id).execute()
+            return api_success(message="Lead with this phone already exists", data={"status": "duplicate"})
+
+        # Create Lead
+        lead_insert = {
+            "external_lead_id": external_id or None,
+            "name": name or "Unknown",
+            "phone": phone,
+            "email": email or None,
+            "source": "dubizzle",
+            "property_ref": property_ref or None,
+            "property_address": property_address or None,
+            "bedrooms": int(bedrooms) if bedrooms else None,
+            "budget_max": float(budget) if budget else None,
+            "location_pref": location or None,
+            "status": "new",
+            "ai_stage": "greeting",
+            "is_ai_handling": True,
+            "agency_id": agency_id,
+        }
+        if assigned_agent_id:
+            lead_insert["assigned_agent_id"] = assigned_agent_id
+
+        new_lead = sb.table("leads").insert(lead_insert).execute()
+        lead_id = new_lead.data[0]["id"]
+
+        # Send AI Greeting via WhatsApp (<3 min SLA)
+        greeting = (
+            f"Hi {name.split()[0]}! 👋 I'm Andi, your AI assistant from the agency.\n\n"
+            f"I saw your enquiry about {'the ' + property_ref + ' listing' if property_ref else 'a property'} "
+            f"{'in ' + location if location else ''} on Dubizzle. \n\n"
+            f"I'd love to help you find your perfect home! Could you tell me:\n"
+            f"1. What's your budget range?\n"
+            f"2. How many bedrooms are you looking for?"
+        )
+        await send_whatsapp_message(phone, greeting)
+
+        # Log conversation
+        sb.table("conversations").insert({
+            "lead_id": lead_id,
+            "agency_id": agency_id,
+            "direction": "outbound",
+            "channel": "whatsapp",
+            "message_body": greeting,
+            "sender_type": "ai",
+        }).execute()
+
+        sb.table("leads").update({"status": "qualifying"}).eq("id", lead_id).execute()
+
+        sb.table("webhook_logs").update({
+            "processed": True,
+            "lead_id": lead_id,
+            "processing_time_ms": int((time.time() - start_time) * 1000),
+        }).eq("id", log_id).execute()
+
+        logger.info(f"New Dubizzle lead created: {lead_id} ({name}, {phone})")
+        return api_success(data={"lead_id": lead_id}, message="Dubizzle lead processed successfully")
+
+    except Exception as e:
+        logger.error(f"Dubizzle webhook error: {e}")
+        sb.table("webhook_logs").update({
+            "error": str(e),
+            "processing_time_ms": int((time.time() - start_time) * 1000),
+        }).eq("id", log_id).execute()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ─── WhatsApp Webhooks ─────────────────────────────────────────────────────────
 
 @router.get("/whatsapp")

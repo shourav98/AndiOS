@@ -101,7 +101,8 @@ async def register(body: RegisterRequest):
 
         # Step 2: Create agency
         slug = body.agency_name.lower().replace(" ", "-").replace("_", "-")
-        # Ensure slug is unique by appending part of user_id if needed
+        # Ensure slug is unique by appending part of user_id
+        slug = f"{slug}-{user_id[:6]}"
         agency_result = sb.table("agencies").insert({
             "name": body.agency_name,
             "slug": slug,
