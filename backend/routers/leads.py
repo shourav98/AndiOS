@@ -12,13 +12,14 @@ from uuid import UUID
 from database.supabase_client import get_supabase
 from models.lead import LeadCreate, LeadUpdate, LeadResponse, LeadStats, HandoverRequest
 from middleware.auth_middleware import verify_token
+from utils.response import api_success, ApiResponse
 import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/leads", tags=["Leads"])
 
 
-@router.get("", response_model=list[LeadResponse])
+@router.get("", response_model=ApiResponse[list[LeadResponse]])
 async def list_leads(
     status: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
@@ -45,10 +46,10 @@ async def list_leads(
         query = query.or_(f"name.ilike.%{search}%,phone.ilike.%{search}%,email.ilike.%{search}%")
 
     result = query.range(offset, offset + limit - 1).execute()
-    return result.data
+    return api_success(data=result.data, message="Leads retrieved successfully")
 
 
-@router.get("/stats", response_model=LeadStats)
+@router.get("/stats", response_model=ApiResponse[LeadStats])
 async def get_lead_stats(_: dict = Depends(verify_token)):
     """Aggregate stats for the Overview dashboard cards."""
     sb = get_supabase()
@@ -68,13 +69,16 @@ async def get_lead_stats(_: dict = Depends(verify_token)):
     lead_to_viewing = round((viewings_booked / total * 100), 1) if total > 0 else 0
     viewing_to_close = round((stats["closed"] / viewings_done * 100), 1) if viewings_done > 0 else 0
 
-    return {
-        "total": total,
-        **stats,
-        "avg_response_time_seconds": None,  # computed from conversations if needed
-        "lead_to_viewing_pct": lead_to_viewing,
-        "viewing_to_close_pct": viewing_to_close,
-    }
+    return api_success(
+        data={
+            "total": total,
+            **stats,
+            "avg_response_time_seconds": None,  # computed from conversations if needed
+            "lead_to_viewing_pct": lead_to_viewing,
+            "viewing_to_close_pct": viewing_to_close,
+        },
+        message="Lead stats retrieved successfully"
+    )
 
 
 @router.get("/{lead_id}")
@@ -101,14 +105,17 @@ async def get_lead(lead_id: UUID, _: dict = Depends(verify_token)):
         .execute()
     ).data
 
-    return {
-        **lead.data,
-        "conversations": conversations,
-        "viewings": viewings,
-    }
+    return api_success(
+        data={
+            **lead.data,
+            "conversations": conversations,
+            "viewings": viewings,
+        },
+        message="Lead details retrieved successfully"
+    )
 
 
-@router.patch("/{lead_id}", response_model=LeadResponse)
+@router.patch("/{lead_id}", response_model=ApiResponse[LeadResponse])
 async def update_lead(lead_id: UUID, body: LeadUpdate, _: dict = Depends(verify_token)):
     """Update lead status, assigned agent, or qualification data."""
     sb = get_supabase()
@@ -123,7 +130,7 @@ async def update_lead(lead_id: UUID, body: LeadUpdate, _: dict = Depends(verify_
     result = sb.table("leads").update(update_data).eq("id", str(lead_id)).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Lead not found")
-    return result.data[0]
+    return api_success(data=result.data[0], message="Lead updated successfully")
 
 
 @router.post("/{lead_id}/handover")
@@ -144,7 +151,7 @@ async def trigger_handover(lead_id: UUID, body: HandoverRequest, _: dict = Depen
         raise HTTPException(status_code=404, detail="Lead not found")
 
     logger.info(f"Manual handover triggered for lead {lead_id}: {body.reason}")
-    return {"status": "success", "lead_id": str(lead_id), "handover_reason": body.reason}
+    return api_success(data={"lead_id": str(lead_id), "handover_reason": body.reason}, message="Manual handover triggered")
 
 
 @router.post("/{lead_id}/restore-ai")
@@ -158,4 +165,4 @@ async def restore_ai_handling(lead_id: UUID, _: dict = Depends(verify_token)):
     }).eq("id", str(lead_id)).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Lead not found")
-    return {"status": "success", "message": "AI handling restored"}
+    return api_success(message="AI handling restored")

@@ -16,6 +16,7 @@ from services.whatsapp_service import (
     parse_twilio_inbound,
 )
 from services.ai_service import qualify_and_respond, detect_handover, extract_lead_qualifications
+from utils.response import api_success
 from config import settings
 import logging
 
@@ -72,7 +73,7 @@ async def property_finder_webhook(request: Request):
                 "error": "duplicate",
                 "processing_time_ms": int((time.time() - start_time) * 1000),
             }).eq("id", log_id).execute()
-            return {"status": "duplicate", "message": "Lead already exists"}
+            return api_success(message="Lead already exists", data={"status": "duplicate"})
 
         # Secondary dedup by phone
         existing = await get_existing_lead_by_phone(phone)
@@ -84,7 +85,7 @@ async def property_finder_webhook(request: Request):
                 "error": "phone_duplicate",
                 "processing_time_ms": int((time.time() - start_time) * 1000),
             }).eq("id", log_id).execute()
-            return {"status": "duplicate", "message": "Lead with this phone already exists"}
+            return api_success(message="Lead with this phone already exists", data={"status": "duplicate"})
 
         # ── Create Lead ──
         new_lead = sb.table("leads").insert({
@@ -136,7 +137,7 @@ async def property_finder_webhook(request: Request):
         }).eq("id", log_id).execute()
 
         logger.info(f"New PF lead created: {lead_id} ({name}, {phone})")
-        return {"status": "success", "lead_id": lead_id}
+        return api_success(data={"lead_id": lead_id}, message="Property Finder lead processed successfully")
 
     except Exception as e:
         logger.error(f"Property Finder webhook error: {e}")
@@ -281,4 +282,4 @@ async def whatsapp_inbound(request: Request):
         if update_data:
             sb.table("leads").update(update_data).eq("id", lead_id).execute()
 
-    return {"status": "ok"}
+    return api_success(message="WhatsApp messages processed successfully")

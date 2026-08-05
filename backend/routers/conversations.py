@@ -10,13 +10,14 @@ from database.supabase_client import get_supabase
 from models.conversation import SendMessageRequest, ConversationResponse
 from services.whatsapp_service import send_whatsapp_message
 from middleware.auth_middleware import verify_token, get_current_user_id
+from utils.response import api_success, ApiResponse
 import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/conversations", tags=["Conversations"])
 
 
-@router.get("/{lead_id}", response_model=list[ConversationResponse])
+@router.get("/{lead_id}", response_model=ApiResponse[list[ConversationResponse]])
 async def get_conversation(lead_id: UUID, _: dict = Depends(verify_token)):
     """Get full conversation thread for a lead (WhatsApp chat view)."""
     sb = get_supabase()
@@ -33,7 +34,7 @@ async def get_conversation(lead_id: UUID, _: dict = Depends(verify_token)):
         .order("timestamp", desc=False)
         .execute()
     )
-    return result.data
+    return api_success(data=result.data, message="Conversation retrieved successfully")
 
 
 @router.post("/{lead_id}/send")
@@ -66,7 +67,7 @@ async def agent_send_message(
         "sender_id": body.agent_id or user_id,
     }).execute()
 
-    return {"status": "sent", "conversation_id": conv.data[0]["id"]}
+    return api_success(data={"conversation_id": conv.data[0]["id"]}, message="Message sent successfully")
 
 
 @router.post("/{lead_id}/read")
@@ -76,4 +77,4 @@ async def mark_as_read(lead_id: UUID, _: dict = Depends(verify_token)):
     sb.table("conversations").update({"is_read": True}).eq("lead_id", str(lead_id)).eq(
         "direction", "inbound"
     ).execute()
-    return {"status": "ok"}
+    return api_success(message="Messages marked as read")

@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from database.supabase_client import get_supabase
 from services.ai_service import generate_owner_report
 from middleware.auth_middleware import verify_token, get_current_user_id
+from utils.response import api_success
 import logging
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ async def list_reports(_: dict = Depends(verify_token)):
         .limit(50)
         .execute()
     )
-    return result.data
+    return api_success(data=result.data, message="Reports retrieved successfully")
 
 
 @router.post("/owner/generate")
@@ -121,7 +122,7 @@ async def generate_report(
     }).execute()
 
     logger.info(f"Owner report generated for {period_days}-day period")
-    return {**stored.data[0], "ai_narrative": ai_narrative}
+    return api_success(data={**stored.data[0], "ai_narrative": ai_narrative}, message="Report generated successfully")
 
 
 @router.get("/owner/{report_id}")
@@ -131,4 +132,4 @@ async def get_report(report_id: UUID, _: dict = Depends(verify_token)):
     result = sb.table("owner_reports").select("*").eq("id", str(report_id)).single().execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Report not found")
-    return result.data
+    return api_success(data=result.data, message="Report retrieved successfully")

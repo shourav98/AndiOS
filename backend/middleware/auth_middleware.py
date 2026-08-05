@@ -14,20 +14,25 @@ security = HTTPBearer()
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     """
-    FastAPI dependency — validates JWT and returns decoded payload.
+    FastAPI dependency — validates JWT using Supabase and returns user payload.
     Usage: add `current_user: dict = Depends(verify_token)` to any route.
     """
     token = credentials.credentials
     try:
-        # Supabase JWTs are signed with the JWT secret
-        payload = jwt.decode(
-            token,
-            settings.SUPABASE_SERVICE_ROLE_KEY,
-            algorithms=["HS256"],
-            options={"verify_aud": False},
-        )
-        return payload
-    except JWTError as e:
+        from database.supabase_client import get_supabase
+        sb = get_supabase()
+        
+        # Validates token securely against Supabase and gets the user
+        response = sb.auth.get_user(token)
+        
+        if not response or not response.user:
+            raise Exception("No user found for token")
+            
+        return {
+            "sub": response.user.id,
+            "email": response.user.email
+        }
+    except Exception as e:
         logger.warning(f"Invalid JWT: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

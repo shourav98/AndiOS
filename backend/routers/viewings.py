@@ -19,6 +19,7 @@ from services.calendar_service import (
 )
 from services.scheduler import schedule_viewing_jobs, cancel_viewing_jobs
 from middleware.auth_middleware import verify_token
+from utils.response import api_success, ApiResponse
 import json, logging
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ def _get_calendar_token(sb) -> tuple[str, dict]:
     return calendar_id, auth_data
 
 
-@router.get("", response_model=list[ViewingResponse])
+@router.get("", response_model=ApiResponse[list[ViewingResponse]])
 async def list_viewings(
     agent_id: Optional[UUID] = Query(None),
     status: Optional[str] = Query(None),
@@ -65,7 +66,7 @@ async def list_viewings(
     if date_to:
         query = query.lte("viewing_datetime", date_to.isoformat())
 
-    return query.limit(limit).execute().data
+    return api_success(data=query.limit(limit).execute().data, message="Viewings retrieved successfully")
 
 
 @router.get("/available-slots")
@@ -88,7 +89,7 @@ async def available_slots(
                 calendar_id = agent.data["calendar_id"]
 
         slots = get_available_slots(token_data, calendar_id, date_from, date_to, duration_minutes)
-        return {"slots": slots, "calendar_id": calendar_id}
+        return api_success(data={"slots": slots, "calendar_id": calendar_id}, message="Available slots retrieved")
     except HTTPException:
         raise
     except Exception as e:
@@ -96,7 +97,7 @@ async def available_slots(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("", response_model=ViewingResponse)
+@router.post("", response_model=ApiResponse[ViewingResponse])
 async def create_viewing(body: ViewingCreate, _: dict = Depends(verify_token)):
     """
     Book a property viewing:
@@ -192,19 +193,19 @@ async def create_viewing(body: ViewingCreate, _: dict = Depends(verify_token)):
     }).execute()
 
     logger.info(f"Viewing created: {viewing['id']} for lead {body.lead_id}")
-    return viewing
+    return api_success(data=viewing, message="Viewing created successfully", status_code=201)
 
 
-@router.get("/{viewing_id}", response_model=ViewingResponse)
+@router.get("/{viewing_id}", response_model=ApiResponse[ViewingResponse])
 async def get_viewing(viewing_id: UUID, _: dict = Depends(verify_token)):
     sb = get_supabase()
     result = sb.table("viewings").select("*").eq("id", str(viewing_id)).single().execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Viewing not found")
-    return result.data
+    return api_success(data=result.data, message="Viewing retrieved successfully")
 
 
-@router.patch("/{viewing_id}", response_model=ViewingResponse)
+@router.patch("/{viewing_id}", response_model=ApiResponse[ViewingResponse])
 async def update_viewing(viewing_id: UUID, body: ViewingUpdate, _: dict = Depends(verify_token)):
     """Update or cancel a viewing. Cancels Google Calendar event if status=cancelled."""
     sb = get_supabase()
@@ -241,4 +242,4 @@ async def update_viewing(viewing_id: UUID, body: ViewingUpdate, _: dict = Depend
             await send_whatsapp_message(lead.data["phone"], cancel_msg)
 
     result = sb.table("viewings").update(update_data).eq("id", str(viewing_id)).execute()
-    return result.data[0]
+    return api_success(data=result.data[0], message="Viewing updated successfully")

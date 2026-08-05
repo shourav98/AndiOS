@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from services.scheduler import scheduler
 from config import settings
+from utils.response import api_success
 import logging
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -62,13 +63,34 @@ app.add_middleware(
 )
 
 
-# ─── Global Error Handler ─────────────────────────────────────────────────────
+# ─── Global Error Handlers ────────────────────────────────────────────────────
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from utils.response import api_error
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error. Please try again."},
+        content=api_error("Internal server error", 500, data=str(exc) if settings.DEBUG else None),
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=api_error(exc.detail, exc.status_code),
+        headers=getattr(exc, "headers", None)
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content=api_error("Validation error", 422, data=exc.errors()),
     )
 
 
@@ -85,6 +107,7 @@ from routers import (
     contracts,
     cheques,
     connectors,
+    dashboard,
 )
 
 app.include_router(auth.router)
@@ -97,18 +120,22 @@ app.include_router(documents.router)
 app.include_router(contracts.router)
 app.include_router(cheques.router)
 app.include_router(connectors.router)
+app.include_router(dashboard.router)
 
 
 # ─── Health Check ─────────────────────────────────────────────────────────────
 @app.get("/", tags=["Health"])
 async def root():
-    return {
-        "service": "AndiOS API",
-        "version": "1.0.0",
-        "status": "operational",
-        "phase": "Phase 1 — AI Lead Management",
-        "docs": "/docs",
-    }
+    return api_success(
+        data={
+            "service": "AndiOS API",
+            "version": "1.0.0",
+            "status": "operational",
+            "phase": "Phase 1 — AI Lead Management",
+            "docs": "/docs",
+        },
+        message="API is running"
+    )
 
 
 @app.get("/health", tags=["Health"])
@@ -122,10 +149,13 @@ async def health():
     except Exception as e:
         db_status = f"error: {str(e)}"
 
-    return {
-        "status": "ok" if db_status == "connected" else "degraded",
-        "database": db_status,
-        "scheduler": "running" if scheduler.running else "stopped",
-        "whatsapp_provider": settings.WHATSAPP_PROVIDER,
-        "ai_model": settings.OPENAI_MODEL,
-    }
+    return api_success(
+        data={
+            "status": "ok" if db_status == "connected" else "degraded",
+            "database": db_status,
+            "scheduler": "running" if scheduler.running else "stopped",
+            "whatsapp_provider": settings.WHATSAPP_PROVIDER,
+            "ai_model": settings.OPENAI_MODEL,
+        },
+        message="Health check completed"
+    )

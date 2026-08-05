@@ -12,6 +12,7 @@ from database.supabase_client import get_supabase
 from services.calendar_service import get_auth_url, exchange_code_for_tokens
 from services.whatsapp_service import send_whatsapp_message
 from middleware.auth_middleware import verify_token
+from utils.response import api_success
 from config import settings
 import logging
 
@@ -41,7 +42,7 @@ async def list_connectors(_: dict = Depends(verify_token)):
                 "dubizzle": "Dubizzle",
             }.get(c["name"], c["name"]),
         })
-    return connectors
+    return api_success(data=connectors, message="Connectors retrieved successfully")
 
 
 # ─── Google Calendar OAuth ─────────────────────────────────────────────────────
@@ -52,7 +53,7 @@ async def google_calendar_auth(_: dict = Depends(verify_token)):
     if not settings.GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=400, detail="Google OAuth not configured. Set GOOGLE_CLIENT_ID in .env")
     auth_url = get_auth_url()
-    return {"auth_url": auth_url}
+    return api_success(data={"auth_url": auth_url}, message="Google OAuth URL generated")
 
 
 @router.get("/google-calendar/callback")
@@ -87,7 +88,7 @@ async def google_calendar_disconnect(_: dict = Depends(verify_token)):
         "is_connected": False,
         "auth_data": None,
     }).eq("name", "google_calendar").execute()
-    return {"status": "disconnected"}
+    return api_success(message="Google Calendar disconnected")
 
 
 @router.post("/google-calendar/test")
@@ -110,7 +111,7 @@ async def test_google_calendar(_: dict = Depends(verify_token)):
         service = _build_service(connector.data["auth_data"])
         calendar_id = settings.GOOGLE_SHARED_CALENDAR_ID or "primary"
         cal = service.calendars().get(calendarId=calendar_id).execute()
-        return {"status": "connected", "calendar_name": cal.get("summary"), "calendar_id": calendar_id}
+        return api_success(data={"calendar_name": cal.get("summary"), "calendar_id": calendar_id}, message="Google Calendar connected")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Calendar test failed: {str(e)}")
 
@@ -131,7 +132,7 @@ async def test_whatsapp(to_phone: str = Query(...), _: dict = Depends(verify_tok
     sb = get_supabase()
     sb.table("connectors").update({"is_connected": True, "last_sync": "now()"}).eq("name", "whatsapp").execute()
 
-    return {"status": "sent", "provider": settings.WHATSAPP_PROVIDER}
+    return api_success(data={"provider": settings.WHATSAPP_PROVIDER}, message="WhatsApp test message sent")
 
 
 @router.post("/property-finder/test")
@@ -153,4 +154,4 @@ async def test_property_finder_webhook(_: dict = Depends(verify_token)):
     }
     async with httpx.AsyncClient() as client:
         resp = await client.post(f"{settings.API_BASE_URL}/webhooks/property-finder", json=test_payload)
-    return {"status": "test_sent", "response": resp.json()}
+    return api_success(data={"response": resp.json()}, message="Test Property Finder webhook sent")

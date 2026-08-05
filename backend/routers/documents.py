@@ -3,10 +3,11 @@ from models.document import DocumentCreate, DocumentResponse
 from database import supabase_client
 from middleware.auth_middleware import verify_token
 from services.document_service import extract_document_data
+from utils.response import api_success, ApiResponse
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
 
-@router.post("/", response_model=DocumentResponse)
+@router.post("/", response_model=ApiResponse[DocumentResponse])
 async def create_document(doc: DocumentCreate, token: dict = Depends(verify_token)):
     """Creates a new document record and immediately triggers AI extraction."""
     sb = supabase_client.get_supabase()
@@ -24,11 +25,11 @@ async def create_document(doc: DocumentCreate, token: dict = Depends(verify_toke
     doc_data["extracted_data"] = extracted
     doc_data["status"] = "extracted"
     
-    return doc_data
+    return api_success(data=doc_data, message="Document created successfully")
 
-@router.get("/lead/{lead_id}", response_model=list[DocumentResponse])
+@router.get("/lead/{lead_id}", response_model=ApiResponse[list[DocumentResponse]])
 def get_documents_by_lead(lead_id: str, token: dict = Depends(verify_token)):
     """Get all documents associated with a lead."""
     sb = supabase_client.get_supabase()
     result = sb.table("documents").select("*").eq("lead_id", lead_id).execute()
-    return result.data
+    return api_success(data=result.data, message="Documents retrieved successfully")

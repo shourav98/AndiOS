@@ -11,25 +11,26 @@ from uuid import UUID
 from database.supabase_client import get_supabase
 from models.agent import AgentCreate, AgentUpdate, AgentResponse
 from middleware.auth_middleware import verify_token
+from utils.response import api_success, ApiResponse
 import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agents", tags=["Agents"])
 
 
-@router.get("", response_model=list[AgentResponse])
+@router.get("", response_model=ApiResponse[list[AgentResponse]])
 async def list_agents(_: dict = Depends(verify_token)):
     sb = get_supabase()
     result = sb.table("agents").select("*").eq("is_active", True).order("name").execute()
-    return result.data
+    return api_success(data=result.data, message="Agents retrieved successfully")
 
 
-@router.post("", response_model=AgentResponse)
+@router.post("", response_model=ApiResponse[AgentResponse], status_code=201)
 async def create_agent(body: AgentCreate, _: dict = Depends(verify_token)):
     sb = get_supabase()
     try:
         result = sb.table("agents").insert(body.model_dump(exclude_none=True)).execute()
-        return result.data[0]
+        return api_success(data=result.data[0], message="Agent created successfully", status_code=201)
     except Exception as e:
         if "unique" in str(e).lower():
             raise HTTPException(status_code=409, detail="Agent with this email already exists")
@@ -54,10 +55,10 @@ async def get_agent(agent_id: UUID, _: dict = Depends(verify_token)):
         "total_viewings": len(viewings),
         "viewings_completed": sum(1 for v in viewings if v["status"] == "completed"),
     }
-    return {**agent.data, "stats": stats}
+    return api_success(data={**agent.data, "stats": stats}, message="Agent profile retrieved successfully")
 
 
-@router.patch("/{agent_id}", response_model=AgentResponse)
+@router.patch("/{agent_id}", response_model=ApiResponse[AgentResponse])
 async def update_agent(agent_id: UUID, body: AgentUpdate, _: dict = Depends(verify_token)):
     sb = get_supabase()
     update_data = body.model_dump(exclude_none=True)
@@ -66,7 +67,7 @@ async def update_agent(agent_id: UUID, body: AgentUpdate, _: dict = Depends(veri
     result = sb.table("agents").update(update_data).eq("id", str(agent_id)).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Agent not found")
-    return result.data[0]
+    return api_success(data=result.data[0], message="Agent updated successfully")
 
 
 @router.delete("/{agent_id}")
@@ -76,4 +77,4 @@ async def deactivate_agent(agent_id: UUID, _: dict = Depends(verify_token)):
     result = sb.table("agents").update({"is_active": False}).eq("id", str(agent_id)).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Agent not found")
-    return {"status": "deactivated", "agent_id": str(agent_id)}
+    return api_success(data={"agent_id": str(agent_id)}, message="Agent deactivated successfully")
