@@ -23,6 +23,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
 
+def _sync_user_app_metadata(user_id: str, agency_id: str, role: str, agent_id: str) -> None:
+    """Store tenant context in Supabase Auth app_metadata for JWT claims."""
+    sb = get_supabase()
+    sb.auth.admin.update_user_by_id(
+        user_id,
+        {
+            "app_metadata": {
+                "agency_id": str(agency_id),
+                "role": role,
+                "agent_id": str(agent_id),
+            }
+        },
+    )
+
+
 # ─── Request / Response Models ──────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
@@ -112,6 +127,12 @@ async def register(body: RegisterRequest):
 
         agent = agent_result.data[0] if agent_result.data else None
 
+        if agent:
+            try:
+                _sync_user_app_metadata(user_id, agency_id, "owner", agent["id"])
+            except Exception as meta_err:
+                logger.warning(f"Could not sync app_metadata on register: {meta_err}")
+
         return api_success(
             message="Account created. Please verify your email with the OTP sent.",
             status_code=201,
@@ -152,6 +173,27 @@ async def verify_otp(body: VerifyOTPRequest):
 
         if not response.session:
             raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
+
+        # Sync tenant context into JWT app_metadata after email verification
+        if response.user and body.type == "email":
+            agent_result = (
+                sb.table("agents")
+                .select("id, agency_id, role")
+                .eq("email", body.email)
+                .limit(1)
+                .execute()
+            )
+            if agent_result.data:
+                agent = agent_result.data[0]
+                try:
+                    _sync_user_app_metadata(
+                        response.user.id,
+                        agent["agency_id"],
+                        agent["role"],
+                        agent["id"],
+                    )
+                except Exception as meta_err:
+                    logger.warning(f"Could not sync app_metadata on verify-otp: {meta_err}")
 
         return api_success(
             message="Email verified successfully.",
@@ -214,6 +256,12 @@ async def login(body: LoginRequest):
             .execute()
         )
         agent = agent_result.data if agent_result.data else None
+
+        if agent:
+            try:
+                _sync_user_app_metadata(user.id, agent["agency_id"], agent["role"], agent["id"])
+            except Exception as meta_err:
+                logger.warning(f"Could not sync app_metadata on login: {meta_err}")
 
         return api_success(
             message="User logged in successfully",

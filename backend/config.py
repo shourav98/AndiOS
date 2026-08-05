@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     # Property Finder
     PROPERTY_FINDER_WEBHOOK_SECRET: str = ""
 
+    # Multi-tenant webhook routing (set in production when multiple agencies exist)
+    DEFAULT_AGENCY_ID: str = ""
+
     # App
     APP_ENV: str = "development"
     SECRET_KEY: str = "change-me-in-production"

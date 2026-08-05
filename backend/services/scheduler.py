@@ -159,13 +159,23 @@ async def send_feedback_followup(viewing_id: str):
 
 # ─── Schedule Jobs for a New Viewing ──────────────────────────────────────────
 
-def schedule_viewing_jobs(viewing_id: str, viewing_datetime: datetime, lead_id: str):
+def schedule_viewing_jobs(
+    viewing_id: str,
+    viewing_datetime: datetime,
+    lead_id: str,
+    agency_id: str | None = None,
+):
     """
     Schedule all automated messages for a newly booked viewing.
     Call this immediately after creating a viewing.
     """
     sb = get_supabase()
     now = datetime.utcnow()
+
+    # Resolve agency_id from lead if not provided
+    if not agency_id:
+        lead = sb.table("leads").select("agency_id").eq("id", lead_id).single().execute()
+        agency_id = lead.data.get("agency_id") if lead.data else None
 
     # 24h reminder
     remind_24h = viewing_datetime - timedelta(hours=24)
@@ -180,6 +190,7 @@ def schedule_viewing_jobs(viewing_id: str, viewing_datetime: datetime, lead_id: 
         sb.table("follow_ups").insert({
             "lead_id": lead_id,
             "viewing_id": viewing_id,
+            "agency_id": agency_id,
             "type": "reminder_24h",
             "scheduled_at": remind_24h.isoformat(),
             "status": "pending",
@@ -198,6 +209,7 @@ def schedule_viewing_jobs(viewing_id: str, viewing_datetime: datetime, lead_id: 
         sb.table("follow_ups").insert({
             "lead_id": lead_id,
             "viewing_id": viewing_id,
+            "agency_id": agency_id,
             "type": "reminder_2h",
             "scheduled_at": remind_2h.isoformat(),
             "status": "pending",
@@ -215,6 +227,7 @@ def schedule_viewing_jobs(viewing_id: str, viewing_datetime: datetime, lead_id: 
     sb.table("follow_ups").insert({
         "lead_id": lead_id,
         "viewing_id": viewing_id,
+        "agency_id": agency_id,
         "type": "post_viewing",
         "scheduled_at": post_viewing.isoformat(),
         "status": "pending",
@@ -232,6 +245,7 @@ def schedule_viewing_jobs(viewing_id: str, viewing_datetime: datetime, lead_id: 
     sb.table("follow_ups").insert({
         "lead_id": lead_id,
         "viewing_id": viewing_id,
+        "agency_id": agency_id,
         "type": "feedback",
         "scheduled_at": feedback.isoformat(),
         "status": "pending",

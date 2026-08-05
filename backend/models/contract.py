@@ -4,13 +4,28 @@ from datetime import datetime, date
 from uuid import UUID
 
 class ContractBase(BaseModel):
-    lead_id: UUID
-    type: str  # tenancy_agreement | addendum
-    property_address: str
-    rent_amount: float
+    lead_id: Optional[UUID] = None
+    type: str = "tenancy_agreement"
+    property_unit: Optional[str] = None
+    area_community: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    rent_amount: Optional[float] = None
+    rent_words: Optional[str] = None
+    number_of_cheques: Optional[int] = None
     security_deposit: Optional[float] = None
-    start_date: date
-    end_date: date
+    broker_fee: Optional[float] = None
+    
+    owner_name: Optional[str] = None
+    owner_phone: Optional[str] = None
+    owner_email: Optional[str] = None
+    owner_emirates_id: Optional[str] = None
+    
+    tenant_name: Optional[str] = None
+    tenant_phone: Optional[str] = None
+    tenant_email: Optional[str] = None
+    tenant_emirates_id: Optional[str] = None
+    
     notes: Optional[str] = None
 
 class ContractCreate(ContractBase):

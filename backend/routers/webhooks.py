@@ -16,6 +16,7 @@ from services.whatsapp_service import (
     parse_twilio_inbound,
 )
 from services.ai_service import qualify_and_respond, detect_handover, extract_lead_qualifications
+from services.lead_routing_service import resolve_agency_and_agent
 from utils.response import api_success
 from config import settings
 import logging
@@ -65,6 +66,18 @@ async def property_finder_webhook(request: Request):
         if not phone:
             raise ValueError("No phone number in webhook payload")
 
+        # ── Resolve agency + agent ──
+        agent_phone = lead_data.get("agent_phone") or lead_data.get("listing_agent_phone")
+        agent_email = lead_data.get("agent_email") or lead_data.get("listing_agent_email")
+        agency_id, assigned_agent_id = await resolve_agency_and_agent(
+            source="property_finder",
+            property_ref=property_ref or None,
+            agent_phone=str(agent_phone) if agent_phone else None,
+            agent_email=agent_email,
+        )
+        if not agency_id:
+            raise ValueError("Could not resolve agency for inbound lead")
+
         # ── Deduplication ──
         if external_id and await is_duplicate(external_id):
             logger.info(f"Duplicate lead ignored: {external_id}")
@@ -88,7 +101,7 @@ async def property_finder_webhook(request: Request):
             return api_success(message="Lead with this phone already exists", data={"status": "duplicate"})
 
         # ── Create Lead ──
-        new_lead = sb.table("leads").insert({
+        lead_insert = {
             "external_lead_id": external_id or None,
             "name": name or "Unknown",
             "phone": phone,
@@ -102,7 +115,12 @@ async def property_finder_webhook(request: Request):
             "status": "new",
             "ai_stage": "greeting",
             "is_ai_handling": True,
-        }).execute()
+            "agency_id": agency_id,
+        }
+        if assigned_agent_id:
+            lead_insert["assigned_agent_id"] = assigned_agent_id
+
+        new_lead = sb.table("leads").insert(lead_insert).execute()
         lead = new_lead.data[0]
         lead_id = lead["id"]
 
@@ -120,6 +138,7 @@ async def property_finder_webhook(request: Request):
         # Log greeting as conversation
         sb.table("conversations").insert({
             "lead_id": lead_id,
+            "agency_id": agency_id,
             "direction": "outbound",
             "channel": "whatsapp",
             "message_body": greeting,
@@ -206,6 +225,7 @@ async def whatsapp_inbound(request: Request):
         # Store inbound message
         sb.table("conversations").insert({
             "lead_id": lead_id,
+            "agency_id": lead.get("agency_id"),
             "direction": "inbound",
             "channel": "whatsapp",
             "message_body": message_body,
@@ -245,6 +265,7 @@ async def whatsapp_inbound(request: Request):
             await send_whatsapp_message(from_phone, handover_msg)
             sb.table("conversations").insert({
                 "lead_id": lead_id,
+                "agency_id": lead.get("agency_id"),
                 "direction": "outbound",
                 "channel": "whatsapp",
                 "message_body": handover_msg,
@@ -259,6 +280,7 @@ async def whatsapp_inbound(request: Request):
 
         sb.table("conversations").insert({
             "lead_id": lead_id,
+            "agency_id": lead.get("agency_id"),
             "direction": "outbound",
             "channel": "whatsapp",
             "message_body": ai_reply,

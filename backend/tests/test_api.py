@@ -25,8 +25,8 @@ def test_root_endpoint(client):
     resp = c.get("/")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["service"] == "AndiOS API"
-    assert data["status"] == "operational"
+    assert data["data"]["service"] == "AndiOS API"
+    assert data["data"]["status"] == "operational"
 
 
 # ─── Webhook: Property Finder Deduplication ───────────────────────────────────
@@ -48,21 +48,23 @@ def test_property_finder_webhook_new_lead(client):
             mock_dedup.return_value = False
             with patch("services.dedup_service.get_existing_lead_by_phone", new_callable=AsyncMock) as mock_phone:
                 mock_phone.return_value = None
-                resp = c.post("/webhooks/property-finder", json={
-                    "lead": {
-                        "id": "PF-12345",
-                        "name": "John Doe",
-                        "phone": "+971501234567",
-                        "email": "john@example.com",
-                        "property_ref": "MRN-001",
-                        "property_title": "2BR Marina",
-                        "bedrooms": 2,
-                        "budget": 120000,
-                        "community": "Dubai Marina",
-                    }
-                })
+                with patch("routers.webhooks.resolve_agency_and_agent", new_callable=AsyncMock) as mock_route:
+                    mock_route.return_value = ("test-agency-id", "test-agent-id")
+                    resp = c.post("/webhooks/property-finder", json={
+                        "lead": {
+                            "id": "PF-12345",
+                            "name": "John Doe",
+                            "phone": "+971501234567",
+                            "email": "john@example.com",
+                            "property_ref": "MRN-001",
+                            "property_title": "2BR Marina",
+                            "bedrooms": 2,
+                            "budget": 120000,
+                            "community": "Dubai Marina",
+                        }
+                    })
     assert resp.status_code == 200
-    assert resp.json()["status"] in ("success", "duplicate")
+    assert resp.json()["success"] is True
 
 
 def test_property_finder_webhook_duplicate(client):
@@ -77,7 +79,7 @@ def test_property_finder_webhook_duplicate(client):
             }
         })
     assert resp.status_code == 200
-    assert resp.json()["status"] == "duplicate"
+    assert resp.json()["data"]["status"] == "duplicate"
 
 
 # ─── WhatsApp Webhook Verification ────────────────────────────────────────────
@@ -160,11 +162,16 @@ def test_lead_stats_empty_db(client):
 
     from main import app
     from middleware.auth_middleware import verify_token
-    app.dependency_overrides[verify_token] = lambda: {"sub": "test-user"}
+    app.dependency_overrides[verify_token] = lambda: {
+        "sub": "test-user",
+        "agency_id": "test-agency-id",
+        "role": "owner",
+        "agent_id": "test-agent-id",
+    }
     try:
         resp = c.get("/leads/stats")
         assert resp.status_code == 200
-        data = resp.json()
+        data = resp.json()["data"]
         assert data["total"] == 0
     finally:
         app.dependency_overrides.clear()

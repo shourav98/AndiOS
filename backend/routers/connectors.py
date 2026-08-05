@@ -13,6 +13,7 @@ from services.calendar_service import get_auth_url, exchange_code_for_tokens
 from services.whatsapp_service import send_whatsapp_message
 from middleware.auth_middleware import verify_token
 from utils.response import api_success
+from utils.tenant import require_agency_id, apply_agency_scope
 from config import settings
 import logging
 
@@ -21,10 +22,12 @@ router = APIRouter(prefix="/connectors", tags=["Connectors"])
 
 
 @router.get("")
-async def list_connectors(_: dict = Depends(verify_token)):
-    """List all connectors with their connection status."""
+async def list_connectors(current_user: dict = Depends(verify_token)):
+    """List all connectors with their connection status for the current agency."""
     sb = get_supabase()
-    result = sb.table("connectors").select("id, name, is_connected, last_sync, updated_at").execute()
+    agency_id = require_agency_id(current_user)
+    query = sb.table("connectors").select("id, name, is_connected, last_sync, updated_at")
+    result = apply_agency_scope(query, current_user).execute()
 
     connectors = []
     for c in result.data:
@@ -81,34 +84,37 @@ async def google_calendar_callback(code: str = Query(...), state: str = Query(No
 
 
 @router.post("/google-calendar/disconnect")
-async def google_calendar_disconnect(_: dict = Depends(verify_token)):
-    """Disconnect Google Calendar integration."""
+async def google_calendar_disconnect(current_user: dict = Depends(verify_token)):
+    """Disconnect Google Calendar integration for the current agency."""
     sb = get_supabase()
-    sb.table("connectors").update({
-        "is_connected": False,
-        "auth_data": None,
-    }).eq("name", "google_calendar").execute()
+    apply_agency_scope(
+        sb.table("connectors").update({"is_connected": False, "auth_data": None}),
+        current_user,
+    ).eq("name", "google_calendar").execute()
     return api_success(message="Google Calendar disconnected")
 
 
 @router.post("/google-calendar/test")
-async def test_google_calendar(_: dict = Depends(verify_token)):
+async def test_google_calendar(current_user: dict = Depends(verify_token)):
     """Test Google Calendar connection by listing upcoming events."""
     sb = get_supabase()
+    require_agency_id(current_user)
     connector = (
-        sb.table("connectors")
-        .select("auth_data")
+        apply_agency_scope(
+            sb.table("connectors").select("auth_data"),
+            current_user,
+        )
         .eq("name", "google_calendar")
         .eq("is_connected", True)
-        .single()
+        .limit(1)
         .execute()
     )
-    if not connector.data or not connector.data.get("auth_data"):
+    if not connector.data or not connector.data[0].get("auth_data"):
         raise HTTPException(status_code=400, detail="Google Calendar not connected")
 
     try:
         from services.calendar_service import _build_service
-        service = _build_service(connector.data["auth_data"])
+        service = _build_service(connector.data[0]["auth_data"])
         calendar_id = settings.GOOGLE_SHARED_CALENDAR_ID or "primary"
         cal = service.calendars().get(calendarId=calendar_id).execute()
         return api_success(data={"calendar_name": cal.get("summary"), "calendar_id": calendar_id}, message="Google Calendar connected")

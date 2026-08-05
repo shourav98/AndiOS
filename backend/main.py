@@ -108,9 +108,13 @@ from routers import (
     cheques,
     connectors,
     dashboard,
+    owners,
+    call_campaigns,
+    calls,
 )
 
 app.include_router(auth.router)
+app.include_router(agents.router)
 app.include_router(webhooks.router)
 app.include_router(leads.router)
 app.include_router(conversations.router)
@@ -121,6 +125,9 @@ app.include_router(contracts.router)
 app.include_router(cheques.router)
 app.include_router(connectors.router)
 app.include_router(dashboard.router)
+app.include_router(owners.router)
+app.include_router(call_campaigns.router)
+app.include_router(calls.router)
 
 
 # ─── Health Check ─────────────────────────────────────────────────────────────

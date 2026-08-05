@@ -19,6 +19,7 @@ class AgentCreate(BaseModel):
     role: AgentRole = AgentRole.agent
     calendar_id: Optional[str] = None
     whatsapp_number: Optional[str] = None
+    branch: Optional[str] = None
 
 
 class AgentUpdate(BaseModel):
@@ -27,6 +28,7 @@ class AgentUpdate(BaseModel):
     role: Optional[AgentRole] = None
     calendar_id: Optional[str] = None
     whatsapp_number: Optional[str] = None
+    branch: Optional[str] = None
     is_active: Optional[bool] = None
 
 
@@ -38,6 +40,7 @@ class AgentResponse(BaseModel):
     role: str
     calendar_id: Optional[str]
     whatsapp_number: Optional[str]
+    branch: Optional[str]
     is_active: bool
     created_at: datetime
     updated_at: datetime

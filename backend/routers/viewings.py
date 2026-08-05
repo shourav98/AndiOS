@@ -20,25 +20,44 @@ from services.calendar_service import (
 from services.scheduler import schedule_viewing_jobs, cancel_viewing_jobs
 from middleware.auth_middleware import verify_token
 from utils.response import api_success, ApiResponse
+from utils.tenant import (
+    apply_viewing_scope,
+    verify_viewing_access,
+    verify_lead_access,
+    require_agency_id,
+    is_management_role,
+    require_agent_id,
+)
 import json, logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/viewings", tags=["Viewings"])
 
 
-def _get_calendar_token(sb) -> tuple[str, dict]:
+def _get_calendar_token(sb, agency_id: str) -> tuple[str, dict]:
     """Get Google Calendar token and calendar ID from connectors table."""
     connector = (
         sb.table("connectors")
         .select("auth_data")
         .eq("name", "google_calendar")
+        .eq("agency_id", agency_id)
         .eq("is_connected", True)
-        .single()
+        .limit(1)
         .execute()
     )
-    if not connector.data or not connector.data.get("auth_data"):
+    if not connector.data or not connector.data[0].get("auth_data"):
+        # Fallback: legacy global connector (no agency_id)
+        connector = (
+            sb.table("connectors")
+            .select("auth_data")
+            .eq("name", "google_calendar")
+            .eq("is_connected", True)
+            .limit(1)
+            .execute()
+        )
+    if not connector.data or not connector.data[0].get("auth_data"):
         raise HTTPException(status_code=400, detail="Google Calendar not connected. Go to Connectors to connect.")
-    auth_data = connector.data["auth_data"]
+    auth_data = connector.data[0]["auth_data"]
     from config import settings
     calendar_id = settings.GOOGLE_SHARED_CALENDAR_ID or "primary"
     return calendar_id, auth_data
@@ -51,11 +70,12 @@ async def list_viewings(
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
     limit: int = Query(100, le=500),
-    _: dict = Depends(verify_token),
+    current_user: dict = Depends(verify_token),
 ):
     """List all viewings for the Calendar dashboard page."""
     sb = get_supabase()
     query = sb.table("viewings").select("*").order("viewing_datetime", desc=False)
+    query = apply_viewing_scope(query, current_user)
 
     if agent_id:
         query = query.eq("agent_id", str(agent_id))
@@ -75,12 +95,13 @@ async def available_slots(
     date_to: datetime = Query(...),
     agent_id: Optional[UUID] = Query(None),
     duration_minutes: int = Query(60),
-    _: dict = Depends(verify_token),
+    current_user: dict = Depends(verify_token),
 ):
     """Get free viewing slots from Google Calendar. Used by AI to offer slots to leads."""
     sb = get_supabase()
+    agency_id = require_agency_id(current_user)
     try:
-        calendar_id, token_data = _get_calendar_token(sb)
+        calendar_id, token_data = _get_calendar_token(sb, agency_id)
 
         # Per-agent mode: use agent's calendar
         if agent_id:
@@ -98,7 +119,7 @@ async def available_slots(
 
 
 @router.post("", response_model=ApiResponse[ViewingResponse])
-async def create_viewing(body: ViewingCreate, _: dict = Depends(verify_token)):
+async def create_viewing(body: ViewingCreate, current_user: dict = Depends(verify_token)):
     """
     Book a property viewing:
     1. Creates record in Supabase
@@ -107,16 +128,17 @@ async def create_viewing(body: ViewingCreate, _: dict = Depends(verify_token)):
     4. Updates lead status to viewing_booked
     """
     sb = get_supabase()
+    agency_id = require_agency_id(current_user)
 
-    # Get lead info
-    lead = sb.table("leads").select("name, phone").eq("id", str(body.lead_id)).single().execute()
-    if not lead.data:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    # Verify lead belongs to this agency
+    lead_data = await verify_lead_access(str(body.lead_id), current_user)
+    lead = {"data": {"name": lead_data["name"], "phone": lead_data["phone"]}}
 
     # Get agent info (if specified)
     agent_name = None
-    if body.agent_id:
-        agent = sb.table("agents").select("name").eq("id", str(body.agent_id)).single().execute()
+    assigned_agent_id = body.agent_id or current_user.get("agent_id")
+    if assigned_agent_id:
+        agent = sb.table("agents").select("name").eq("id", str(assigned_agent_id)).eq("agency_id", agency_id).single().execute()
         if agent.data:
             agent_name = agent.data["name"]
 
@@ -124,7 +146,7 @@ async def create_viewing(body: ViewingCreate, _: dict = Depends(verify_token)):
     google_event_id = None
     google_meet_link = None
     try:
-        calendar_id, token_data = _get_calendar_token(sb)
+        calendar_id, token_data = _get_calendar_token(sb, agency_id)
         cal_result = create_viewing_event(
             token_data=token_data,
             calendar_id=calendar_id,
@@ -145,6 +167,7 @@ async def create_viewing(body: ViewingCreate, _: dict = Depends(verify_token)):
     # Insert viewing record
     insert_data = {
         "lead_id": str(body.lead_id),
+        "agency_id": agency_id,
         "property_address": body.property_address,
         "property_ref": body.property_ref,
         "viewing_datetime": body.viewing_datetime.isoformat(),
@@ -152,8 +175,8 @@ async def create_viewing(body: ViewingCreate, _: dict = Depends(verify_token)):
         "status": "scheduled",
         "notes": body.notes,
     }
-    if body.agent_id:
-        insert_data["agent_id"] = str(body.agent_id)
+    if assigned_agent_id:
+        insert_data["agent_id"] = str(assigned_agent_id)
     if google_event_id:
         insert_data["google_event_id"] = google_event_id
     if google_meet_link:
@@ -167,6 +190,7 @@ async def create_viewing(body: ViewingCreate, _: dict = Depends(verify_token)):
         viewing_id=viewing["id"],
         viewing_datetime=body.viewing_datetime,
         lead_id=str(body.lead_id),
+        agency_id=agency_id,
     )
 
     # Update lead status
@@ -186,6 +210,7 @@ async def create_viewing(body: ViewingCreate, _: dict = Depends(verify_token)):
     await send_whatsapp_message(lead.data["phone"], confirm_msg)
     sb.table("conversations").insert({
         "lead_id": str(body.lead_id),
+        "agency_id": agency_id,
         "direction": "outbound",
         "channel": "whatsapp",
         "message_body": confirm_msg,
@@ -197,21 +222,18 @@ async def create_viewing(body: ViewingCreate, _: dict = Depends(verify_token)):
 
 
 @router.get("/{viewing_id}", response_model=ApiResponse[ViewingResponse])
-async def get_viewing(viewing_id: UUID, _: dict = Depends(verify_token)):
-    sb = get_supabase()
-    result = sb.table("viewings").select("*").eq("id", str(viewing_id)).single().execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Viewing not found")
-    return api_success(data=result.data, message="Viewing retrieved successfully")
+async def get_viewing(viewing_id: UUID, current_user: dict = Depends(verify_token)):
+    viewing = await verify_viewing_access(str(viewing_id), current_user)
+    return api_success(data=viewing, message="Viewing retrieved successfully")
 
 
 @router.patch("/{viewing_id}", response_model=ApiResponse[ViewingResponse])
-async def update_viewing(viewing_id: UUID, body: ViewingUpdate, _: dict = Depends(verify_token)):
+async def update_viewing(viewing_id: UUID, body: ViewingUpdate, current_user: dict = Depends(verify_token)):
     """Update or cancel a viewing. Cancels Google Calendar event if status=cancelled."""
     sb = get_supabase()
-    existing = sb.table("viewings").select("*").eq("id", str(viewing_id)).single().execute()
-    if not existing.data:
-        raise HTTPException(status_code=404, detail="Viewing not found")
+    agency_id = require_agency_id(current_user)
+    existing_data = await verify_viewing_access(str(viewing_id), current_user)
+    existing = {"data": existing_data}
 
     update_data = body.model_dump(exclude_none=True)
     if "viewing_datetime" in update_data:
@@ -224,7 +246,7 @@ async def update_viewing(viewing_id: UUID, body: ViewingUpdate, _: dict = Depend
         event_id = existing.data.get("google_event_id")
         if event_id:
             try:
-                calendar_id, token_data = _get_calendar_token(sb)
+                calendar_id, token_data = _get_calendar_token(sb, agency_id)
                 cancel_viewing_event(token_data, calendar_id, event_id)
             except Exception as e:
                 logger.error(f"Failed to cancel calendar event: {e}")

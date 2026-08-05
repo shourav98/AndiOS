@@ -30,7 +30,17 @@ cp .env.example .env
 ### 3. Set Up Supabase Database
 1. Go to your [Supabase](https://supabase.com) project
 2. Open **SQL Editor**
-3. Paste and run the contents of `database/schema.sql`
+3. Run migrations **in this exact order**:
+
+| Order | File | Purpose |
+|---|---|---|
+| 1 | `database/schema.sql` | Core tables (leads, agents, viewings, etc.) |
+| 2 | `database/schema_v2.sql` | Phase 2: documents, contracts, cheques |
+| 3 | `database/schema_v3_multitenancy.sql` | Agencies table + `agency_id` on all tables |
+| 4 | `database/schema_v4_campaigns_owners.sql` | Phase 3: owners, call_campaigns, calls |
+| 5 | `database/schema_v5_rls.sql` | Production JWT-based RLS policies |
+
+> **Note:** The backend uses `service_role` key and enforces tenancy in `middleware/auth_middleware.py` + `utils/tenant.py`. RLS (v5) protects direct Supabase client access from the frontend.
 
 ### 4. Run the Server
 ```bash
@@ -54,6 +64,7 @@ API docs available at: **http://localhost:8000/docs**
 | `GOOGLE_CLIENT_ID` | ⚡ | For Google Calendar OAuth |
 | `GOOGLE_CLIENT_SECRET` | ⚡ | For Google Calendar OAuth |
 | `PROPERTY_FINDER_WEBHOOK_SECRET` | ⚡ | PF webhook signing secret |
+| `DEFAULT_AGENCY_ID` | ⚡ | Default agency for webhook routing (multi-tenant) |
 
 ---
 
@@ -171,7 +182,11 @@ backend/
 ├── pytest.ini
 ├── .env.example
 ├── database/
-│   ├── schema.sql             # Run in Supabase SQL editor
+│   ├── schema.sql             # 1. Core tables
+│   ├── schema_v2.sql          # 2. Contracts & documents
+│   ├── schema_v3_multitenancy.sql  # 3. Multi-tenant agencies
+│   ├── schema_v4_campaigns_owners.sql  # 4. Sami calling
+│   ├── schema_v5_rls.sql      # 5. Production RLS policies
 │   └── supabase_client.py
 ├── routers/
 │   ├── auth.py
@@ -194,7 +209,9 @@ backend/
 │   ├── viewing.py
 │   └── agent.py
 ├── middleware/
-│   └── auth_middleware.py     # JWT verification
+│   └── auth_middleware.py     # JWT verification + agency enrichment
+├── utils/
+│   └── tenant.py              # Multi-tenant scope helpers
 └── tests/
     └── test_api.py
 ```

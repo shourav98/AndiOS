@@ -19,17 +19,27 @@ router = APIRouter(prefix="/agents", tags=["Agents"])
 
 
 @router.get("", response_model=ApiResponse[list[AgentResponse]])
-async def list_agents(_: dict = Depends(verify_token)):
+async def list_agents(current_user: dict = Depends(verify_token)):
     sb = get_supabase()
-    result = sb.table("agents").select("*").eq("is_active", True).order("name").execute()
+    agency_id = current_user.get("agency_id")
+    if not agency_id:
+        raise HTTPException(status_code=400, detail="User not associated with an agency")
+        
+    result = sb.table("agents").select("*").eq("agency_id", agency_id).eq("is_active", True).order("name").execute()
     return api_success(data=result.data, message="Agents retrieved successfully")
 
 
 @router.post("", response_model=ApiResponse[AgentResponse], status_code=201)
-async def create_agent(body: AgentCreate, _: dict = Depends(verify_token)):
+async def create_agent(body: AgentCreate, current_user: dict = Depends(verify_token)):
     sb = get_supabase()
+    agency_id = current_user.get("agency_id")
+    if not agency_id:
+        raise HTTPException(status_code=400, detail="User not associated with an agency")
+
     try:
-        result = sb.table("agents").insert(body.model_dump(exclude_none=True)).execute()
+        agent_data = body.model_dump(exclude_none=True)
+        agent_data["agency_id"] = agency_id
+        result = sb.table("agents").insert(agent_data).execute()
         return api_success(data=result.data[0], message="Agent created successfully", status_code=201)
     except Exception as e:
         if "unique" in str(e).lower():

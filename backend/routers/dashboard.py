@@ -124,3 +124,35 @@ async def get_dashboard_overview(current_user: dict = Depends(verify_token)):
             "todays_viewings": todays_viewings
         }
     )
+
+@router.get("/calling-performance")
+async def get_calling_performance(current_user: dict = Depends(verify_token)):
+    """
+    Returns metrics for the Calling Agent Dashboard.
+    """
+    sb = get_supabase()
+    agency_id = current_user.get("agency_id")
+
+    if not agency_id:
+        raise HTTPException(status_code=400, detail="User not associated with an agency")
+
+    # Mocking real stats for now until the triggers/cron fully populates them
+    data = {
+        "callsThisWeek": "1,245",
+        "answerRate": "42%",
+        "callsToListings": "8.5%",
+        "callsToViewings": "12%",
+        "recentCalls": [
+            { "id": 1, "time": "09:12", "hasAudio": True, "name": "Sarah Miller", "role": "Owner", "location": "Marina Gate 2", "status": "Listing won", "status_value": "listing-won", "duration": "4:20" },
+            { "id": 2, "time": "09:05", "hasAudio": True, "name": "Ahmed Al-Farsi", "role": "Tenant", "location": "Downtown Views", "status": "Callback booked", "status_value": "callback-booked", "duration": "2:15" },
+            { "id": 3, "time": "08:58", "hasAudio": True, "name": "Elena Popova", "role": "Owner", "location": "Palm Jumeirah", "status": "Not interested", "status_value": "not-interested", "duration": "1:05" },
+        ],
+        "funnel": [
+            { "name": 'Total Calls', "value": 1245 },
+            { "name": 'Answered', "value": 522 },
+            { "name": 'Interested', "value": 180 },
+            { "name": 'Listings Won', "value": 45 },
+        ]
+    }
+
+    return api_success(message="Calling performance fetched successfully", data=data)

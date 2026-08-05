@@ -11,6 +11,7 @@ from database.supabase_client import get_supabase
 from services.ai_service import generate_owner_report
 from middleware.auth_middleware import verify_token, get_current_user_id
 from utils.response import api_success
+from utils.tenant import require_agency_id, is_management_role, require_agent_id
 import logging
 
 logger = logging.getLogger(__name__)
@@ -18,12 +19,14 @@ router = APIRouter(prefix="/reports", tags=["Reports"])
 
 
 @router.get("/owner")
-async def list_reports(_: dict = Depends(verify_token)):
+async def list_reports(current_user: dict = Depends(verify_token)):
     """List all AI-generated owner reports."""
     sb = get_supabase()
+    agency_id = require_agency_id(current_user)
     result = (
         sb.table("owner_reports")
         .select("id, generated_at, period_start, period_end, total_leads, closed_deals, total_revenue_aed")
+        .eq("agency_id", agency_id)
         .order("generated_at", desc=True)
         .limit(50)
         .execute()
@@ -35,19 +38,27 @@ async def list_reports(_: dict = Depends(verify_token)):
 async def generate_report(
     period_days: int = Query(30, description="Number of days to cover in the report"),
     user_id: str = Depends(get_current_user_id),
+    current_user: dict = Depends(verify_token),
 ):
     """
     Generate an AI-powered owner report.
     Pulls all metrics from Supabase and runs them through GPT-4o.
     """
     sb = get_supabase()
+    agency_id = require_agency_id(current_user)
     now = datetime.utcnow()
     period_start = now - timedelta(days=period_days)
 
-    # ── Gather all metrics ──
-    leads = sb.table("leads").select("*").gte("created_at", period_start.isoformat()).execute().data
-    viewings = sb.table("viewings").select("*").gte("created_at", period_start.isoformat()).execute().data
-    agents = sb.table("agents").select("id, name").eq("is_active", True).execute().data
+    leads_query = sb.table("leads").select("*").eq("agency_id", agency_id).gte("created_at", period_start.isoformat())
+    viewings_query = sb.table("viewings").select("*").eq("agency_id", agency_id).gte("created_at", period_start.isoformat())
+    if not is_management_role(current_user.get("role")):
+        agent_id = require_agent_id(current_user)
+        leads_query = leads_query.eq("assigned_agent_id", agent_id)
+        viewings_query = viewings_query.eq("agent_id", agent_id)
+
+    leads = leads_query.execute().data
+    viewings = viewings_query.execute().data
+    agents = sb.table("agents").select("id, name").eq("agency_id", agency_id).eq("is_active", True).execute().data
 
     total_leads = len(leads)
     new_leads = sum(1 for l in leads if l["status"] == "new")
@@ -105,6 +116,7 @@ async def generate_report(
 
     # ── Store report ──
     stored = sb.table("owner_reports").insert({
+        "agency_id": agency_id,
         "period_start": period_start.isoformat(),
         "period_end": now.isoformat(),
         "total_leads": total_leads,
@@ -126,10 +138,18 @@ async def generate_report(
 
 
 @router.get("/owner/{report_id}")
-async def get_report(report_id: UUID, _: dict = Depends(verify_token)):
+async def get_report(report_id: UUID, current_user: dict = Depends(verify_token)):
     """Get a specific owner report by ID."""
     sb = get_supabase()
-    result = sb.table("owner_reports").select("*").eq("id", str(report_id)).single().execute()
+    agency_id = require_agency_id(current_user)
+    result = (
+        sb.table("owner_reports")
+        .select("*")
+        .eq("id", str(report_id))
+        .eq("agency_id", agency_id)
+        .single()
+        .execute()
+    )
     if not result.data:
         raise HTTPException(status_code=404, detail="Report not found")
     return api_success(data=result.data, message="Report retrieved successfully")
