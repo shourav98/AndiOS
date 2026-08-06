@@ -56,3 +56,36 @@ async def generate_contract_pdf(contract_id: str, token: dict = Depends(verify_t
         return api_success(data={"url": url}, message="Contract PDF generated successfully")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/{contract_id}")
+def get_contract(contract_id: str, current_user: dict = Depends(verify_token)):
+    """Get details of a single contract."""
+    sb = supabase_client.get_supabase()
+    require_agency_id(current_user)
+
+    query = sb.table("contracts").select("*").eq("id", contract_id)
+    result = apply_agency_scope(query, current_user).single().execute()
+    
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Contract not found")
+        
+    return api_success(data=result.data, message="Contract retrieved successfully")
+
+@router.post("/{contract_id}/send-esign")
+def send_contract_esign(contract_id: str, current_user: dict = Depends(verify_token)):
+    """Mock sending the contract for e-signature via WhatsApp/Email."""
+    sb = supabase_client.get_supabase()
+    require_agency_id(current_user)
+
+    query = sb.table("contracts").select("status").eq("id", contract_id)
+    result = apply_agency_scope(query, current_user).single().execute()
+    
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Contract not found")
+        
+    # Update status to sent
+    update_res = sb.table("contracts").update({"status": "sent"}).eq("id", contract_id).execute()
+    if not update_res.data:
+        raise HTTPException(status_code=500, detail="Failed to update contract status")
+        
+    return api_success(data={"status": "sent"}, message="Contract sent for e-signature successfully")

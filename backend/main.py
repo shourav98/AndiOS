@@ -112,6 +112,7 @@ from routers import (
     call_campaigns,
     calls,
     admin,
+    subscription,
 )
 
 app.include_router(auth.router)
@@ -130,6 +131,7 @@ app.include_router(dashboard.router)
 app.include_router(owners.router)
 app.include_router(call_campaigns.router)
 app.include_router(calls.router)
+app.include_router(subscription.router)
 
 
 # ─── Health Check ─────────────────────────────────────────────────────────────
