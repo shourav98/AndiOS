@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/leads", tags=["Leads"])
 
 
-@router.get("", response_model=ApiResponse[list[LeadResponse]])
+@router.get("", response_model=ApiResponse[list[dict]])
 async def list_leads(
     status: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
@@ -34,7 +34,7 @@ async def list_leads(
     """List all leads with optional filters. Used by the Leads dashboard page."""
     sb = get_supabase()
     current_user = _
-    query = sb.table("leads").select("*, agents(name, avatar_url)").order("created_at", desc=True)
+    query = sb.table("leads").select("*, agents(name)").order("created_at", desc=True)
     query = apply_lead_scope(query, current_user)
 
     if status:
@@ -55,7 +55,7 @@ async def list_leads(
     for row in result.data:
         agent_data = row.get("agents") or {}
         agent_name = agent_data.get("name") if isinstance(agent_data, dict) else None
-        agent_avatar = agent_data.get("avatar_url") if isinstance(agent_data, dict) else None
+        agent_avatar = None
         
         # Determine property type from address/ref or default
         prop_type = "Apartment"

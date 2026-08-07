@@ -63,7 +63,7 @@ def _get_calendar_token(sb, agency_id: str) -> tuple[str, dict]:
     return calendar_id, auth_data
 
 
-@router.get("", response_model=ApiResponse[list[ViewingResponse]])
+@router.get("", response_model=ApiResponse[list[dict]])
 async def list_viewings(
     agent_id: Optional[UUID] = Query(None),
     status: Optional[str] = Query(None),
@@ -74,7 +74,7 @@ async def list_viewings(
 ):
     """List all viewings for the Calendar dashboard page."""
     sb = get_supabase()
-    query = sb.table("viewings").select("*").order("viewing_datetime", desc=False)
+    query = sb.table("viewings").select("*, leads(name, source, bedrooms), agents(name)").order("viewing_datetime", desc=False)
     query = apply_viewing_scope(query, current_user)
 
     if agent_id:
@@ -86,7 +86,32 @@ async def list_viewings(
     if date_to:
         query = query.lte("viewing_datetime", date_to.isoformat())
 
-    return api_success(data=query.limit(limit).execute().data, message="Viewings retrieved successfully")
+    result = query.limit(limit).execute()
+    
+    formatted_viewings = []
+    for row in result.data:
+        lead_data = row.get("leads") or {}
+        agent_data = row.get("agents") or {}
+        
+        prop_type = "Apartment"
+        if row.get("property_address") and "villa" in row["property_address"].lower():
+            prop_type = "Villa"
+            
+        formatted_viewings.append({
+            "id": row["id"],
+            "lead_id": row["lead_id"],
+            "clientName": lead_data.get("name", "Unknown Client"),
+            "propertyDetails": f"{lead_data.get('bedrooms', 1)}BR - {row.get('property_address', '')}",
+            "agentName": agent_data.get("name", "Unassigned"),
+            "source": lead_data.get("source", "Unknown"),
+            "viewing_datetime": row["viewing_datetime"],
+            "duration_minutes": row["duration_minutes"],
+            "status": row["status"],
+            "google_event_id": row.get("google_event_id"),
+            "google_meet_link": row.get("google_meet_link"),
+        })
+
+    return api_success(data=formatted_viewings, message="Viewings retrieved successfully")
 
 
 @router.get("/available-slots")
@@ -132,7 +157,6 @@ async def create_viewing(body: ViewingCreate, current_user: dict = Depends(verif
 
     # Verify lead belongs to this agency
     lead_data = await verify_lead_access(str(body.lead_id), current_user)
-    lead = {"data": {"name": lead_data["name"], "phone": lead_data["phone"]}}
 
     # Get agent info (if specified)
     agent_name = None
@@ -150,8 +174,8 @@ async def create_viewing(body: ViewingCreate, current_user: dict = Depends(verif
         cal_result = create_viewing_event(
             token_data=token_data,
             calendar_id=calendar_id,
-            lead_name=lead.data["name"],
-            lead_phone=lead.data["phone"],
+            lead_name=lead_data["name"],
+            lead_phone=lead_data["phone"],
             property_address=body.property_address,
             start_datetime=body.viewing_datetime,
             duration_minutes=body.duration_minutes,
@@ -207,7 +231,7 @@ async def create_viewing(body: ViewingCreate, current_user: dict = Depends(verif
         f"{'🎥 Google Meet: ' + google_meet_link if google_meet_link else ''}\n\n"
         f"We'll send you a reminder 24 hours before. See you there! 🏠"
     )
-    await send_whatsapp_message(lead.data["phone"], confirm_msg)
+    await send_whatsapp_message(lead_data["phone"], confirm_msg)
     sb.table("conversations").insert({
         "lead_id": str(body.lead_id),
         "agency_id": agency_id,
@@ -233,7 +257,6 @@ async def update_viewing(viewing_id: UUID, body: ViewingUpdate, current_user: di
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
     existing_data = await verify_viewing_access(str(viewing_id), current_user)
-    existing = {"data": existing_data}
 
     update_data = body.model_dump(exclude_none=True)
     if "viewing_datetime" in update_data:
@@ -243,7 +266,7 @@ async def update_viewing(viewing_id: UUID, body: ViewingUpdate, current_user: di
 
     # Handle cancellation
     if body.status and body.status.value == "cancelled":
-        event_id = existing.data.get("google_event_id")
+        event_id = existing_data.get("google_event_id")
         if event_id:
             try:
                 calendar_id, token_data = _get_calendar_token(sb, agency_id)
@@ -253,7 +276,7 @@ async def update_viewing(viewing_id: UUID, body: ViewingUpdate, current_user: di
         cancel_viewing_jobs(str(viewing_id))
 
         # Notify lead
-        lead_id = existing.data["lead_id"]
+        lead_id = existing_data["lead_id"]
         lead = sb.table("leads").select("phone, name").eq("id", lead_id).single().execute()
         if lead.data:
             from services.whatsapp_service import send_whatsapp_message

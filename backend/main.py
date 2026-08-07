@@ -73,7 +73,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
-        content=api_error("Internal server error", 500, data=str(exc) if settings.DEBUG else None),
+        content=api_error("Internal server error", 500, data=str(exc) if settings.APP_ENV == "development" else None),
     )
 
 

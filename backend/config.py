@@ -3,6 +3,10 @@ Central config — reads from .env file.
 """
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+import os
+
+# Allow OAuth over HTTP for localhost
+os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
 
 class Settings(BaseSettings):

@@ -51,11 +51,12 @@ async def list_connectors(current_user: dict = Depends(verify_token)):
 # ─── Google Calendar OAuth ─────────────────────────────────────────────────────
 
 @router.get("/google-calendar/auth")
-async def google_calendar_auth(_: dict = Depends(verify_token)):
+async def google_calendar_auth(current_user: dict = Depends(verify_token)):
     """Initiate Google Calendar OAuth2 flow. Returns the auth URL."""
     if not settings.GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=400, detail="Google OAuth not configured. Set GOOGLE_CLIENT_ID in .env")
-    auth_url = get_auth_url()
+    agency_id = require_agency_id(current_user)
+    auth_url = get_auth_url(state=agency_id)
     return api_success(data={"auth_url": auth_url}, message="Google OAuth URL generated")
 
 
@@ -69,12 +70,26 @@ async def google_calendar_callback(code: str = Query(...), state: str = Query(No
         tokens = exchange_code_for_tokens(code)
         sb = get_supabase()
 
+        agency_id = state
+        if not agency_id:
+            raise ValueError("Agency ID missing from state")
+
         # Store tokens (in production encrypt these!)
-        sb.table("connectors").update({
-            "is_connected": True,
-            "auth_data": tokens,
-            "last_sync": "now()",
-        }).eq("name", "google_calendar").execute()
+        existing = sb.table("connectors").select("id").eq("name", "google_calendar").eq("agency_id", agency_id).execute()
+        if existing.data:
+            sb.table("connectors").update({
+                "is_connected": True,
+                "auth_data": tokens,
+                "last_sync": "now()",
+            }).eq("id", existing.data[0]["id"]).execute()
+        else:
+            sb.table("connectors").insert({
+                "name": "google_calendar",
+                "agency_id": agency_id,
+                "is_connected": True,
+                "auth_data": tokens,
+                "last_sync": "now()",
+            }).execute()
 
         logger.info("Google Calendar connected successfully")
         return RedirectResponse(url=f"{settings.FRONTEND_URL}/connectors?connected=google_calendar")

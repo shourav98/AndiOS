@@ -31,27 +31,43 @@ def get_oauth_flow() -> Flow:
     return flow
 
 
-def get_auth_url() -> str:
-    flow = get_oauth_flow()
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
-    )
-    return auth_url
+import urllib.parse
+import httpx
+
+def get_auth_url(state: str = None) -> str:
+    base_url = "https://accounts.google.com/o/oauth2/auth"
+    params = {
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    if state:
+        params["state"] = state
+    return f"{base_url}?{urllib.parse.urlencode(params)}"
 
 
 def exchange_code_for_tokens(code: str) -> dict:
-    flow = get_oauth_flow()
-    flow.fetch_token(code=code)
-    creds = flow.credentials
+    data = {
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "client_secret": settings.GOOGLE_CLIENT_SECRET,
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+    }
+    resp = httpx.post("https://oauth2.googleapis.com/token", data=data)
+    resp.raise_for_status()
+    token_json = resp.json()
+    
     return {
-        "token": creds.token,
-        "refresh_token": creds.refresh_token,
-        "token_uri": creds.token_uri,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": list(creds.scopes),
+        "token": token_json.get("access_token"),
+        "refresh_token": token_json.get("refresh_token"),
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "client_secret": settings.GOOGLE_CLIENT_SECRET,
+        "scopes": SCOPES,
     }
 
 
@@ -130,6 +146,16 @@ def create_viewing_event(
         service = _build_service(token_data)
         end_datetime = start_datetime + timedelta(minutes=duration_minutes)
 
+        # Ensure datetime is in RFC3339 format for Google Calendar
+        # If timezone-aware, format directly; if naive, treat as UTC and append Z
+        def _format_dt(dt: datetime) -> str:
+            if dt.tzinfo is not None:
+                # Already timezone-aware: convert to UTC ISO string
+                return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt.utcoffset().total_seconds() == 0 else dt.isoformat()
+            else:
+                # Naive: treat as UTC
+                return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
         event = {
             "summary": f"🏠 Viewing: {lead_name} — {property_address}",
             "description": (
@@ -140,11 +166,11 @@ def create_viewing_event(
             ),
             "location": property_address,
             "start": {
-                "dateTime": start_datetime.isoformat() + "Z",
+                "dateTime": _format_dt(start_datetime),
                 "timeZone": "Asia/Dubai",
             },
             "end": {
-                "dateTime": end_datetime.isoformat() + "Z",
+                "dateTime": _format_dt(end_datetime),
                 "timeZone": "Asia/Dubai",
             },
             "reminders": {
@@ -154,34 +180,22 @@ def create_viewing_event(
                     {"method": "popup", "minutes": 30},
                 ],
             },
-            "conferenceData": {
-                "createRequest": {
-                    "requestId": f"andios-{lead_name}-{int(start_datetime.timestamp())}",
-                    "conferenceSolutionKey": {"type": "hangoutsMeet"},
-                }
-            },
         }
 
         created = service.events().insert(
             calendarId=calendar_id,
             body=event,
-            conferenceDataVersion=1,
         ).execute()
-
-        meet_link = None
-        if "conferenceData" in created:
-            for ep in created["conferenceData"].get("entryPoints", []):
-                if ep.get("entryPointType") == "video":
-                    meet_link = ep.get("uri")
 
         return {
             "event_id": created["id"],
             "html_link": created.get("htmlLink"),
-            "meet_link": meet_link,
+            "meet_link": None,
         }
     except Exception as e:
         logger.error(f"Error creating calendar event: {e}")
         return {}
+
 
 
 def cancel_viewing_event(token_data: dict, calendar_id: str, event_id: str) -> bool:

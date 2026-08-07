@@ -172,7 +172,7 @@ def schedule_viewing_jobs(
     Call this immediately after creating a viewing.
     """
     sb = get_supabase()
-    now = datetime.utcnow()
+    now = datetime.now(viewing_datetime.tzinfo) if viewing_datetime.tzinfo else datetime.utcnow()
 
     # Resolve agency_id from lead if not provided
     if not agency_id:
