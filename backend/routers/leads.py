@@ -240,4 +240,25 @@ async def restore_ai_handling(lead_id: UUID, current_user: dict = Depends(verify
     }).eq("id", str(lead_id)).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Lead not found")
+        
     return api_success(message="AI handling restored")
+
+
+@router.post("", status_code=201)
+async def create_lead(lead: LeadCreate, current_user: dict = Depends(verify_token)):
+    """Manually create a new lead."""
+    sb = get_supabase()
+    agency_id = require_agency_id(current_user)
+
+    lead_data = lead.dict(exclude_unset=True)
+    lead_data["agency_id"] = agency_id
+    
+    # Handle the status parameter if passed in the payload for testing, otherwise default to new
+    if "status" not in lead_data:
+        lead_data["status"] = "new"
+
+    result = sb.table("leads").insert(lead_data).execute()
+    if not result.data:
+        raise HTTPException(status_code=400, detail="Failed to create lead")
+
+    return api_success(data=result.data[0], message="Lead created successfully", status_code=201)

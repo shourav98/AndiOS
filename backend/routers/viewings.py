@@ -196,11 +196,15 @@ async def create_viewing(body: ViewingCreate, current_user: dict = Depends(verif
         "property_ref": body.property_ref,
         "viewing_datetime": body.viewing_datetime.isoformat(),
         "duration_minutes": body.duration_minutes,
-        "status": "scheduled",
+        "status": body.status if body.status else "scheduled",
         "notes": body.notes,
+        "google_event_id": google_event_id,
+        "google_meet_link": google_meet_link,
     }
     if assigned_agent_id:
         insert_data["agent_id"] = str(assigned_agent_id)
+    if body.feedback_received:
+        insert_data["feedback_received"] = body.feedback_received
     if google_event_id:
         insert_data["google_event_id"] = google_event_id
     if google_meet_link:

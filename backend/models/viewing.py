@@ -21,6 +21,8 @@ class ViewingCreate(BaseModel):
     viewing_datetime: datetime
     duration_minutes: int = 60
     notes: Optional[str] = None
+    status: Optional[ViewingStatus] = None
+    feedback_received: Optional[str] = None
 
 
 class ViewingUpdate(BaseModel):
