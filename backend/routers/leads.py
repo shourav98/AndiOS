@@ -50,34 +50,66 @@ async def list_leads(
 
     result = query.range(offset, offset + limit - 1).execute()
     
+    # Source display name mapping (lowercase DB value → UI display)
+    SOURCE_LABELS = {
+        "property_finder": "Property Finder",
+        "whatsapp": "WhatsApp",
+        "bayut": "Bayut",
+        "dubizzle": "Dubizzle",
+        "instagram": "Instagram",
+        "referral": "Referral",
+    }
+
     # Map to frontend expected schema
     formatted_leads = []
     for row in result.data:
         agent_data = row.get("agents") or {}
         agent_name = agent_data.get("name") if isinstance(agent_data, dict) else None
-        agent_avatar = None
-        
-        # Determine property type from address/ref or default
-        prop_type = "Apartment"
-        if row.get("property_address") and "villa" in row["property_address"].lower():
-            prop_type = "Villa"
-            
+
+        # Property details: "{bedrooms}BR - {area}" e.g. "2BR - Dubai Marina"
+        bedrooms = row.get("bedrooms")
+        # Use location_pref (area name only) to avoid duplicate bedroom prefix in property_address
+        location = row.get("location_pref") or row.get("property_address") or "Dubai"
+        if bedrooms:
+            property_details = f"{bedrooms}BR - {location}"
+        else:
+            property_details = location
+
+        # Deal value formatting: e.g. "AED 3.2M" for sale, "AED 110k/yr" for rent
+        budget = row.get("budget_max") or row.get("budget_min") or 0
+        purpose = (row.get("purpose") or "rent").lower()
+        if budget >= 1_000_000:
+            amount_str = f"AED {budget / 1_000_000:.1f}M"
+        elif budget >= 1_000:
+            amount_str = f"AED {int(budget / 1_000)}k"
+        else:
+            amount_str = f"AED {int(budget):,}" if budget else "—"
+        if purpose == "rent" and budget:
+            amount_str += "/yr"
+
+        # Source display label
+        raw_source = (row.get("source") or "").lower()
+        source_label = SOURCE_LABELS.get(raw_source, raw_source.replace("_", " ").title())
+
+        # Listing link text: "{Source} listing" e.g. "Property Finder listing"
+        listing_label = f"{source_label} listing" if source_label else "Listing"
+
         formatted_leads.append({
             "id": row["id"],
             "clientName": row["name"],
             "stage": row["status"],
-            "propertyType": f"{row.get('bedrooms', 1)}BR {prop_type}",
-            "location": row.get("property_address") or row.get("location_pref") or "Dubai",
-            "value": {
-                "amount": f"{row.get('budget_max', 0):,}",
-                "type": row.get("purpose", "Rent")
-            },
-            "source": row["source"],
-            "listing": row.get("property_ref", "Off-plan"),
+            "propertyDetails": property_details,
+            "dealValue": amount_str,
+            "source": source_label,
+            "listingLink": listing_label,
+            "listingRef": row.get("property_ref", ""),
             "agent": {
                 "name": agent_name,
-                "avatar": agent_avatar
-            } if agent_name else None
+            } if agent_name else None,
+            # Extra fields for filtering support
+            "sourceRaw": raw_source,
+            "purpose": purpose,
+            "created_at": row.get("created_at"),
         })
 
     return api_success(data=formatted_leads, message="Leads retrieved successfully")
