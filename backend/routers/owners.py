@@ -180,3 +180,100 @@ async def get_owner(owner_id: str, current_user: dict = Depends(verify_token)):
     except Exception as e:
         logger.error(f"Error fetching owner {owner_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch owner")
+
+
+@router.post("/bulk-upload-xlsx", status_code=201)
+async def bulk_upload_owners_xlsx(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(verify_token),
+):
+    """Bulk upload owners via Excel (.xlsx) file using openpyxl."""
+    sb = get_supabase()
+    agency_id = current_user.get("agency_id")
+
+    if not agency_id:
+        raise HTTPException(status_code=400, detail="User is not associated with any agency")
+
+    if not file.filename.endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="File must be an Excel file (.xlsx)")
+
+    try:
+        from openpyxl import load_workbook
+
+        contents = await file.read()
+        wb = load_workbook(filename=io.BytesIO(contents), read_only=True)
+        ws = wb.active
+
+        # Read header row
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            raise HTTPException(status_code=400, detail="Empty spreadsheet")
+
+        headers = [str(h).lower().strip() if h else "" for h in rows[0]]
+
+        # Map common header variations
+        col_map = {}
+        for i, h in enumerate(headers):
+            if h in ("name", "owner name", "owner_name", "full name"):
+                col_map["name"] = i
+            elif h in ("phone", "phone number", "mobile", "phone_number"):
+                col_map["phone"] = i
+            elif h in ("email", "email address"):
+                col_map["email"] = i
+            elif h in ("property_group", "group", "property group", "building", "community"):
+                col_map["property_group"] = i
+            elif h in ("property_unit", "unit", "unit no", "unit number", "property unit"):
+                col_map["property_unit"] = i
+
+        if "name" not in col_map or "phone" not in col_map:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Excel must have 'name' and 'phone' columns. Found: {headers}",
+            )
+
+        insert_data = []
+        skipped = 0
+        for row in rows[1:]:  # skip header
+            if not row or len(row) <= max(col_map.values()):
+                skipped += 1
+                continue
+            name = str(row[col_map["name"]] or "").strip()
+            phone = str(row[col_map["phone"]] or "").strip()
+            if not name or not phone:
+                skipped += 1
+                continue
+
+            data = {
+                "name": name,
+                "phone": phone,
+                "email": str(row[col_map["email"]]).strip() if "email" in col_map and row[col_map["email"]] else None,
+                "property_group": str(row[col_map["property_group"]]).strip() if "property_group" in col_map and row[col_map["property_group"]] else None,
+                "property_unit": str(row[col_map["property_unit"]]).strip() if "property_unit" in col_map and row[col_map["property_unit"]] else None,
+                "call_status": "Not called",
+                "agency_id": agency_id,
+            }
+            insert_data.append(data)
+
+        wb.close()
+
+        if not insert_data:
+            raise HTTPException(status_code=400, detail=f"No valid rows found in Excel ({skipped} rows skipped)")
+
+        result = sb.table("owners").insert(insert_data).execute()
+
+        return api_success(
+            data={"count": len(result.data), "skipped": skipped},
+            message=f"{len(result.data)} owners uploaded via Excel successfully ({skipped} rows skipped)",
+            status_code=201,
+        )
+    except HTTPException:
+        raise
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="openpyxl package not installed. Run: pip install openpyxl",
+        )
+    except Exception as e:
+        logger.error(f"Error bulk uploading owners via Excel: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to parse Excel: {str(e)}")
+

@@ -6,6 +6,10 @@ Phase 1: AI Lead Management, WhatsApp Automation,
 
 Run with: uvicorn main:app --reload
 """
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -88,9 +92,15 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    cleaned_errors = []
+    for err in exc.errors():
+        err_copy = dict(err)
+        if isinstance(err_copy.get("input"), bytes):
+            err_copy["input"] = err_copy["input"].decode("utf-8", errors="ignore")
+        cleaned_errors.append(err_copy)
     return JSONResponse(
         status_code=422,
-        content=api_error("Validation error", 422, data=exc.errors()),
+        content=api_error("Validation error", 422, data=cleaned_errors),
     )
 
 

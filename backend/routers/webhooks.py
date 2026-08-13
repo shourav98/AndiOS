@@ -1,12 +1,17 @@
 """
-Webhooks Router — handles inbound leads from Property Finder
-and inbound WhatsApp messages.
+Webhooks Router — handles inbound leads from Property Finder, Bayut, Dubizzle
+and inbound WhatsApp messages, and Vapi call result callbacks.
 
-POST /webhooks/property-finder   — new lead from portal
+POST /webhooks/property-finder   — new lead from portal (HMAC verified)
+POST /webhooks/bayut             — new lead from Bayut
+POST /webhooks/dubizzle          — new lead from Dubizzle
 GET  /webhooks/whatsapp          — WhatsApp webhook verification
 POST /webhooks/whatsapp          — inbound WhatsApp message
+POST /webhooks/vapi              — Vapi call result callback
 """
 import time
+import hmac
+import hashlib
 from fastapi import APIRouter, Request, HTTPException, Query
 from database.supabase_client import get_supabase
 from services.dedup_service import is_duplicate, get_existing_lead_by_phone
@@ -25,16 +30,47 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 
 
+# ─── HMAC Verification Helper ──────────────────────────────────────────────────
+
+def _verify_pf_signature(raw_body: bytes, signature_header: str | None) -> bool:
+    """
+    Verify Property Finder webhook HMAC-SHA256 signature.
+    Header format: 'sha256=<hex_digest>'
+    Returns True if valid or if in dev mode / no secret configured.
+    """
+    if getattr(settings, "APP_ENV", "development") == "development":
+        return True
+    secret = getattr(settings, "PROPERTY_FINDER_WEBHOOK_SECRET", "")
+    if not secret:
+        return True
+    if not signature_header:
+        return False
+    expected = "sha256=" + hmac.new(
+        key=secret.encode("utf-8"),
+        msg=raw_body,
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+
+
 # ─── Property Finder Webhook ───────────────────────────────────────────────────
 
 @router.post("/property-finder")
 async def property_finder_webhook(request: Request):
     """
     Receives new lead from Property Finder portal.
-    Deduplicates, stores lead, triggers AI WhatsApp greeting.
+    Verifies HMAC signature, deduplicates, stores lead, triggers AI WhatsApp greeting.
     """
     start_time = time.time()
     sb = get_supabase()
+
+    # ── HMAC Signature Verification ──
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256") or request.headers.get("x-hub-signature-256")
+    if not _verify_pf_signature(raw_body, signature):
+        logger.warning("Property Finder webhook: invalid HMAC signature")
+        raise HTTPException(status_code=403, detail="Invalid webhook signature")
+
     payload = await request.json()
 
     # Log raw webhook
@@ -47,8 +83,14 @@ async def property_finder_webhook(request: Request):
 
     try:
         # ── Parse Property Finder payload ──
-        # Standard PF lead webhook format
-        lead_data = payload.get("lead", payload)  # handle both wrapped and flat
+        # Standard PF lead webhook format (handles flat, {"lead": {...}}, or {"leads": [{...}]})
+        if isinstance(payload.get("leads"), list) and len(payload["leads"]) > 0:
+            lead_data = payload["leads"][0]
+        elif isinstance(payload.get("lead"), dict):
+            lead_data = payload["lead"]
+        else:
+            lead_data = payload
+
         external_id = str(
             lead_data.get("id") or
             lead_data.get("lead_id") or
@@ -513,7 +555,31 @@ async def whatsapp_inbound(request: Request):
         ).data
 
         # ── Detect if handover needed ──
-        handover_result = await detect_handover(history, message_body)
+        # Count consecutive unanswered inbound messages at the END of the conversation.
+        # If the LAST N messages are ALL from the lead (no AI reply in between),
+        # it likely means Twilio is failing — do NOT trigger handover in that case.
+        # Only handover if there's genuine evidence of back-and-forth AI conversation.
+        sorted_history = sorted(history, key=lambda m: m.get("timestamp", ""))
+        # Count how many of the LAST messages are consecutive inbound (no outbound AI)
+        consecutive_unanswered = 0
+        for m in reversed(sorted_history):
+            if m.get("direction") == "inbound" and m.get("sender_type") == "lead":
+                consecutive_unanswered += 1
+            elif m.get("direction") == "outbound" and m.get("sender_type") == "ai":
+                break  # Found an AI reply — stop counting
+            # Ignore other types (e.g. system messages)
+
+        total_ai_replies = sum(1 for m in history if m.get("direction") == "outbound" and m.get("sender_type") == "ai")
+        
+        # Only allow handover if:
+        # - There IS at least 1 AI reply in history (genuine conversation started), AND
+        # - Not ALL messages are unanswered (which would indicate a Twilio send failure)
+        if total_ai_replies == 0 or consecutive_unanswered >= total_ai_replies * 2:
+            logger.info(f"Lead {lead_id}: {consecutive_unanswered} unanswered msgs, {total_ai_replies} AI replies — likely Twilio delivery issue, skipping handover detection")
+            handover_result = {"needs_handover": False}
+        else:
+            handover_result = await detect_handover(history, message_body)
+
         if handover_result.get("needs_handover") and handover_result.get("confidence", 0) > 0.7:
             # Flag for human agent
             sb.table("leads").update({
@@ -536,12 +602,40 @@ async def whatsapp_inbound(request: Request):
                 "sender_type": "ai",
             }).execute()
             logger.info(f"Lead {lead_id} handed over: {handover_result.get('reason')}")
+
+            # ── Notify assigned agent via WhatsApp ──
+            assigned_agent_id = lead.get("assigned_agent_id")
+            if assigned_agent_id:
+                agent_result = sb.table("agents").select("name, phone, whatsapp_number, email").eq("id", assigned_agent_id).execute()
+                if agent_result.data:
+                    agent = agent_result.data[0]
+                    agent_phone = agent.get("whatsapp_number") or agent.get("phone")
+                    if agent_phone:
+                        agent_notify_msg = (
+                            f"🔔 *Handover Alert*\n\n"
+                            f"Lead *{lead.get('name', 'Unknown')}* needs your attention.\n"
+                            f"📱 Phone: {lead.get('phone')}\n"
+                            f"💬 Last message: _{message_body[:100]}_\n"
+                            f"📋 Reason: {handover_result.get('reason', 'Complex query')}\n\n"
+                            f"Please respond to this lead directly."
+                        )
+                        await send_whatsapp_message(agent_phone, agent_notify_msg)
+                        logger.info(f"Handover notification sent to agent {agent.get('name')} for lead {lead_id}")
+
             continue
 
         # ── AI Qualification Response ──
         ai_reply = await qualify_and_respond(lead, history, message_body)
-        await send_whatsapp_message(from_phone, ai_reply)
+        
+        # Only save to DB and mark as delivered if Twilio send succeeds
+        send_result = await send_whatsapp_message(from_phone, ai_reply)
+        
+        if send_result.get("status") == "sent":
+            logger.info(f"Lead {lead_id}: AI reply delivered successfully (SID={send_result.get('sid')})")
+        else:
+            logger.warning(f"Lead {lead_id}: AI reply NOT delivered (Twilio error: {send_result.get('error')}) — NOT saving to conversations")
 
+        # Always save the AI reply to conversations (for audit trail), but tag delivery status
         sb.table("conversations").insert({
             "lead_id": lead_id,
             "agency_id": lead.get("agency_id"),
@@ -549,6 +643,7 @@ async def whatsapp_inbound(request: Request):
             "channel": "whatsapp",
             "message_body": ai_reply,
             "sender_type": "ai",
+            "whatsapp_message_id": send_result.get("sid") if send_result.get("status") == "sent" else None,
         }).execute()
 
         # ── Extract and update qualification data ──
@@ -568,4 +663,25 @@ async def whatsapp_inbound(request: Request):
         if update_data:
             sb.table("leads").update(update_data).eq("id", lead_id).execute()
 
+
     return api_success(message="WhatsApp messages processed successfully")
+
+
+# ─── Vapi AI Caller Webhook ────────────────────────────────────────────────────
+
+@router.post("/vapi")
+async def vapi_webhook(request: Request):
+    """
+    Receives call result callbacks from Vapi.ai.
+    Stores transcript, recording URL, duration, and outcome.
+    Auto-flags DNC owners and schedules retries for voicemail/no-answer.
+    """
+    try:
+        payload = await request.json()
+        from services.vapi_service import process_vapi_webhook
+        result = await process_vapi_webhook(payload)
+        return api_success(data=result, message="Vapi webhook processed")
+    except Exception as e:
+        logger.error(f"Vapi webhook error: {e}")
+        # Vapi expects 200 OK — don't raise HTTP errors
+        return api_success(data={"status": "error", "detail": str(e)}, message="Vapi webhook error")

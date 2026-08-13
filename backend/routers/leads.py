@@ -203,7 +203,19 @@ async def update_lead(lead_id: UUID, body: LeadUpdate, current_user: dict = Depe
     result = sb.table("leads").update(update_data).eq("id", str(lead_id)).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Lead not found")
-    return api_success(data=result.data[0], message="Lead updated successfully")
+
+    # ── Smart AI Restore: if re-enabling AI handling, reset status from 'handover' ──
+    lead = result.data[0]
+    if update_data.get("is_ai_handling") is True and lead.get("status") == "handover":
+        restore_result = sb.table("leads").update({
+            "status": "qualifying",
+            "handover_reason": None,
+        }).eq("id", str(lead_id)).execute()
+        if restore_result.data:
+            lead = restore_result.data[0]
+        logger.info(f"Lead {lead_id}: AI handling restored, status reset to 'qualifying'")
+
+    return api_success(data=lead, message="Lead updated successfully")
 
 
 @router.post("/{lead_id}/handover")

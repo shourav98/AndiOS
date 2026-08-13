@@ -47,14 +47,23 @@ async def _send_360dialog(to_phone: str, message: str) -> dict:
             return {"status": "error", "error": str(e)}
 
 
+import os
+
 async def _send_twilio(to_phone: str, message: str) -> dict:
     """Send via Twilio WhatsApp API."""
     from twilio.rest import Client  # type: ignore
-    twilio = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
+    account_sid = (os.getenv("TWILIO_ACCOUNT_SID") or settings.TWILIO_ACCOUNT_SID).strip()
+    auth_token = (os.getenv("TWILIO_AUTH_TOKEN") or settings.TWILIO_AUTH_TOKEN).strip()
+    whatsapp_from = (os.getenv("TWILIO_WHATSAPP_NUMBER") or settings.TWILIO_WHATSAPP_NUMBER).strip()
+    
+    masked_token = f"{auth_token[:4]}...{auth_token[-4:]}" if len(auth_token) >= 8 else "(too short)"
+    logger.info(f"Twilio Attempt: SID={account_sid}, Token={masked_token} (len={len(auth_token)}), From={whatsapp_from}")
+
+    twilio = Client(account_sid, auth_token)
     try:
         msg = twilio.messages.create(
             body=message,
-            from_=settings.TWILIO_WHATSAPP_NUMBER,
+            from_=whatsapp_from,
             to=f"whatsapp:{to_phone}",
         )
         return {"status": "sent", "sid": msg.sid}

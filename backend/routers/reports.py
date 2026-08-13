@@ -144,10 +144,10 @@ async def get_owner_dashboard(owner_id: UUID, current_user: dict = Depends(verif
     agency_id = require_agency_id(current_user)
     
     # 1. Fetch Owner details
-    owner_result = sb.table("owners").select("*").eq("id", str(owner_id)).eq("agency_id", agency_id).single().execute()
+    owner_result = sb.table("owners").select("*").eq("id", str(owner_id)).eq("agency_id", agency_id).execute()
     if not owner_result.data:
         raise HTTPException(status_code=404, detail="Owner not found")
-    owner = owner_result.data
+    owner = owner_result.data[0]
     property_group = owner.get("property_group") or ""
     
     # 2. Fetch Leads matching owner's property group

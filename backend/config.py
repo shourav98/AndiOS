@@ -5,6 +5,10 @@ from pydantic_settings import BaseSettings
 from functools import lru_cache
 import os
 
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
 # Allow OAuth over HTTP for localhost
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
@@ -41,6 +45,14 @@ class Settings(BaseSettings):
 
     # Multi-tenant webhook routing (set in production when multiple agencies exist)
     DEFAULT_AGENCY_ID: str = ""
+
+    # Vapi AI Calling
+    VAPI_API_KEY: str = ""
+    VAPI_PHONE_NUMBER_ID: str = ""
+    VAPI_ASSISTANT_ID: str = ""
+
+    # Supabase Storage
+    SUPABASE_STORAGE_BUCKET: str = "contracts"
 
     # App
     APP_ENV: str = "development"

@@ -284,22 +284,86 @@ async def weekly_reengagement_job():
 
 
 async def landlord_weekly_report_job():
-    """Job: runs every Friday to send AI-generated reports to landlords."""
+    """Job: runs every Friday to send AI-generated reports to landlords with real data."""
     try:
         sb = get_supabase()
+        seven_days_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        now = datetime.utcnow()
+
         owners = sb.table("owners").select("*").execute()
         for owner in owners.data:
-            # Mock data for owner report - in a real app, query viewings and leads for the owner's properties
+            owner_id = owner["id"]
+            agency_id = owner.get("agency_id")
+            property_group = owner.get("property_group", "")
+
+            # Skip owners without agency
+            if not agency_id:
+                continue
+
+            # Query real leads for this owner's property group
+            leads_result = (
+                sb.table("leads")
+                .select("id, status, source, created_at")
+                .eq("agency_id", agency_id)
+                .gte("created_at", seven_days_ago)
+                .execute()
+            )
+            # Filter leads relevant to this owner's property group (by property_ref or location)
+            leads = leads_result.data if leads_result.data else []
+
+            # Query real viewings for this period
+            viewings_result = (
+                sb.table("viewings")
+                .select("id, status, property_address, viewing_datetime, feedback_received")
+                .eq("agency_id", agency_id)
+                .gte("viewing_datetime", seven_days_ago)
+                .execute()
+            )
+            viewings = viewings_result.data if viewings_result.data else []
+
+            # Filter viewings matching owner's property group
+            relevant_viewings = []
+            for v in viewings:
+                addr = (v.get("property_address") or "").lower()
+                if property_group and property_group.lower() in addr:
+                    relevant_viewings.append(v)
+            # If no property_group match, use all viewings (small agency)
+            if not relevant_viewings:
+                relevant_viewings = viewings
+
+            # Aggregate feedback
+            feedback_list = []
+            for v in relevant_viewings:
+                if v.get("feedback_received"):
+                    feedback_list.append(str(v["feedback_received"]))
+
+            completed_viewings = sum(1 for v in relevant_viewings if v.get("status") == "completed")
+            cancelled_viewings = sum(1 for v in relevant_viewings if v.get("status") == "cancelled")
+
             report_data = {
-                "period_start": (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d"),
-                "period_end": datetime.utcnow().strftime("%Y-%m-%d"),
-                "leads_generated": 15,
-                "viewings_conducted": 4,
-                "feedback": ["Great location", "Price slightly above budget"],
+                "period_start": (now - timedelta(days=7)).strftime("%Y-%m-%d"),
+                "period_end": now.strftime("%Y-%m-%d"),
+                "owner_name": owner.get("name", "Owner"),
+                "property_group": property_group,
+                "leads_generated": len(leads),
+                "leads_by_source": {},
+                "viewings_scheduled": len(relevant_viewings),
+                "viewings_completed": completed_viewings,
+                "viewings_cancelled": cancelled_viewings,
+                "feedback": feedback_list[:5],  # limit to 5 most recent
             }
+
+            # Count leads by source
+            for lead in leads:
+                src = lead.get("source", "unknown")
+                report_data["leads_by_source"][src] = report_data["leads_by_source"].get(src, 0) + 1
+
+            # Generate AI report
             report_msg = await generate_owner_report(report_data)
-            await send_whatsapp_message(owner.get("phone", ""), f"📊 *Your Weekly Property Report*\n\n{report_msg}")
-            logger.info(f"Sent weekly report to owner {owner['id']}")
+            phone = owner.get("phone", "")
+            if phone:
+                await send_whatsapp_message(phone, f"📊 *Your Weekly Property Report*\n\n{report_msg}")
+                logger.info(f"Sent weekly report to owner {owner_id} ({owner.get('name')})")
     except Exception as e:
         logger.error(f"Error in landlord weekly report job: {e}")
 

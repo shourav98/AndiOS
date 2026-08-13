@@ -56,13 +56,12 @@ async def verify_lead_access(lead_id: str, current_user: dict) -> dict:
         .select("*")
         .eq("id", lead_id)
         .eq("agency_id", require_agency_id(current_user))
-        .single()
         .execute()
     )
     if not result.data:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    lead = result.data
+    lead = result.data[0]
     if not is_management_role(current_user.get("role")):
         if lead.get("assigned_agent_id") != current_user.get("agent_id"):
             raise HTTPException(status_code=403, detail="Access denied")
@@ -77,13 +76,12 @@ async def verify_viewing_access(viewing_id: str, current_user: dict) -> dict:
         .select("*")
         .eq("id", viewing_id)
         .eq("agency_id", require_agency_id(current_user))
-        .single()
         .execute()
     )
     if not result.data:
         raise HTTPException(status_code=404, detail="Viewing not found")
 
-    viewing = result.data
+    viewing = result.data[0]
     if not is_management_role(current_user.get("role")):
         if viewing.get("agent_id") != current_user.get("agent_id"):
             raise HTTPException(status_code=403, detail="Access denied")

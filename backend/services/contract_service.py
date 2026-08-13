@@ -1,93 +1,324 @@
 import logging
+import os
+import uuid
+import secrets
+from datetime import datetime, timedelta
+from typing import Any, Optional
 from database import supabase_client
-from typing import Any
+from config import settings
 
 logger = logging.getLogger(__name__)
 
-import os
-from datetime import datetime
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
+try:
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import cm
+    HAS_REPORTLAB = True
+except ImportError:
+    HAS_REPORTLAB = False
+    logger.warning("ReportLab not installed — PDF generation disabled")
 
-async def _generate_pdf(contract: dict, lead: dict, filepath: str):
-    """Internal function to generate the DLD standard PDF using ReportLab."""
-    c = canvas.Canvas(filepath, pagesize=A4)
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(100, 800, "DUBAI UNIFIED TENANCY CONTRACT")
-    c.setFont("Helvetica", 12)
-    c.drawString(100, 750, f"Contract ID: {contract['id']}")
-    c.drawString(100, 730, f"Date: {datetime.now().strftime('%Y-%m-%d')}")
-    
-    c.drawString(100, 680, "1. LANDLORD DETAILS")
-    c.drawString(120, 660, f"Name: {contract.get('landlord_name', 'TBD')}")
-    
-    c.drawString(100, 610, "2. TENANT DETAILS")
-    c.drawString(120, 590, f"Name: {lead.get('name', 'Unknown')}")
-    c.drawString(120, 570, f"Phone: {lead.get('phone', 'Unknown')}")
-    c.drawString(120, 550, f"Email: {lead.get('email', 'Unknown')}")
-    
-    c.drawString(100, 500, "3. PROPERTY DETAILS")
-    c.drawString(120, 480, f"Address: {contract.get('property_address', 'TBD')}")
-    
-    c.drawString(100, 430, "4. CONTRACT TERMS")
-    c.drawString(120, 410, f"Rent Amount: AED {contract.get('rent_amount', 0)}")
-    c.drawString(120, 390, f"Number of Cheques: {contract.get('cheques_count', 1)}")
-    
-    c.save()
 
-async def send_docusign_envelope(contract_id: str, tenant_email: str, landlord_email: str):
-    """Internal function to trigger DocuSign signature request."""
-    # In a real app, this would use the DocuSign REST API with the generated PDF.
-    logger.info(f"Sending DocuSign envelope for contract {contract_id} to tenant {tenant_email} and landlord {landlord_email}")
-    return "sent"
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "contracts")
+
+
+async def _generate_pdf(contract: dict, lead: dict) -> str:
+    """Generate Dubai Unified Tenancy Contract PDF and upload to Supabase Storage.
+    Returns the public URL of the uploaded PDF."""
+    if not HAS_REPORTLAB:
+        raise RuntimeError("ReportLab not installed")
+
+    filename = f"contract_{contract['id']}_{uuid.uuid4().hex[:8]}.pdf"
+    filepath = os.path.join(os.getcwd(), filename)
+
+    try:
+        c = canvas.Canvas(filepath, pagesize=A4)
+        width, height = A4
+
+        # Header
+        c.setFont("Helvetica-Bold", 18)
+        c.drawCentredString(width / 2, height - 2 * cm, "DUBAI UNIFIED TENANCY CONTRACT")
+        c.setFont("Helvetica", 10)
+        c.drawCentredString(width / 2, height - 2.8 * cm, "Dubai Land Department — Standard Form")
+
+        c.setFont("Helvetica", 11)
+        y = height - 4.5 * cm
+        line_height = 0.7 * cm
+
+        def draw_field(label: str, value: str):
+            nonlocal y
+            c.setFont("Helvetica-Bold", 11)
+            c.drawString(2 * cm, y, label)
+            c.setFont("Helvetica", 11)
+            c.drawString(7 * cm, y, str(value or "—"))
+            y -= line_height
+
+        def draw_section(title: str):
+            nonlocal y
+            y -= 0.4 * cm
+            c.setFont("Helvetica-Bold", 13)
+            c.drawString(2 * cm, y, title)
+            y -= line_height
+
+        draw_field("Contract Ref:", f"TC-{str(contract['id'])[-6:].upper()}")
+        draw_field("Date:", datetime.now().strftime("%d %B %Y"))
+
+        draw_section("1. LESSOR (Landlord) DETAILS")
+        draw_field("Name:", contract.get("owner_name", ""))
+        draw_field("Emirates ID:", contract.get("owner_emirates_id", ""))
+        draw_field("Phone:", contract.get("owner_phone", ""))
+
+        draw_section("2. LESSEE (Tenant) DETAILS")
+        draw_field("Name:", contract.get("tenant_name") or lead.get("name", ""))
+        draw_field("Phone:", lead.get("phone", ""))
+        draw_field("Email:", lead.get("email", ""))
+        draw_field("Passport/EID:", contract.get("tenant_emirates_id", ""))
+
+        draw_section("3. PROPERTY DETAILS")
+        draw_field("Address:", contract.get("property_address") or contract.get("property_unit", ""))
+        draw_field("Area/Community:", contract.get("area_community", ""))
+        draw_field("Title Deed No:", contract.get("title_deed_number", ""))
+
+        draw_section("4. CONTRACT TERMS")
+        draw_field("Annual Rent:", f"AED {contract.get('rent_amount', 0):,.2f}")
+        draw_field("No. of Cheques:", str(contract.get("cheques_count", 1)))
+        draw_field("Start Date:", contract.get("start_date", ""))
+        draw_field("End Date:", contract.get("end_date", ""))
+        draw_field("Security Deposit:", f"AED {contract.get('security_deposit', 0):,.2f}")
+
+        if contract.get("addendum"):
+            draw_section("5. ADDITIONAL TERMS (Addendum)")
+            c.setFont("Helvetica", 10)
+            for i, line in enumerate(str(contract["addendum"]).split("\n")):
+                c.drawString(2 * cm, y, line[:90])
+                y -= 0.5 * cm
+                if i > 10:
+                    break
+
+        # Signature blocks
+        y -= 1.5 * cm
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(2 * cm, y, "Lessor Signature: ___________________")
+        c.drawString(11 * cm, y, "Lessee Signature: ___________________")
+        y -= 0.8 * cm
+        c.setFont("Helvetica", 9)
+        c.drawString(2 * cm, y, "Date: _______________")
+        c.drawString(11 * cm, y, "Date: _______________")
+
+        # Footer
+        c.setFont("Helvetica", 8)
+        c.drawCentredString(width / 2, 1.5 * cm, "Generated by AndiOS Platform — Dubai Unified Tenancy Contract")
+
+        c.save()
+
+        # Upload to Supabase Storage
+        sb = supabase_client.get_supabase()
+        try:
+            with open(filepath, "rb") as f:
+                file_bytes = f.read()
+            storage_path = f"contracts/{filename}"
+            sb.storage.from_(SUPABASE_STORAGE_BUCKET).upload(
+                path=storage_path,
+                file=file_bytes,
+                file_options={"content-type": "application/pdf"},
+            )
+            pdf_url = sb.storage.from_(SUPABASE_STORAGE_BUCKET).get_public_url(storage_path)
+            logger.info(f"PDF uploaded to Supabase Storage: {pdf_url}")
+            return pdf_url
+        except Exception as storage_err:
+            logger.warning(f"Supabase Storage upload failed, using local path: {storage_err}")
+            return f"{settings.API_BASE_URL}/static/{filename}"
+    finally:
+        # Clean up local file
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+
+
+def _generate_sign_token() -> str:
+    """Generate a secure random token for e-signature links."""
+    return secrets.token_urlsafe(48)
+
 
 async def generate_tenancy_agreement(contract_id: str) -> str:
     """
-    Generates a PDF tenancy agreement based on the lead, property, and extracted documents.
-    Returns a URL to the generated PDF.
+    Generates a PDF tenancy agreement and uploads to storage.
+    Creates e-signature tokens for landlord and tenant.
+    Returns the PDF URL.
     """
-    try:
-        sb = supabase_client.get_supabase()
-        
-        # Fetch Contract
-        contract_result = sb.table("contracts").select("*, leads(*)").eq("id", contract_id).execute()
-        if not contract_result.data:
-            raise ValueError("Contract not found")
-            
-        contract = contract_result.data[0]
-        lead = contract.get("leads", {})
-        
-        # Generate PDF using ReportLab
-        filename = f"contract_{contract_id}.pdf"
-        filepath = os.path.join(os.getcwd(), filename) # Saving locally for now
-        await _generate_pdf(contract, lead, filepath)
-        logger.info(f"Generated PDF tenancy agreement for {lead.get('name')} at {contract.get('property_address')}")
-        
-        # In a real app we'd upload the PDF to Supabase Storage:
-        # with open(filepath, 'rb') as f:
-        #     sb.storage.from_("contracts").upload(filename, f)
-        # pdf_url = sb.storage.from_("contracts").get_public_url(filename)
-        
-        mock_pdf_url = f"https://storage.andios.com/contracts/{filename}"
-        
-        # Trigger E-Signature (DocuSign/HelloSign)
-        await send_docusign_envelope(
-            contract_id,
-            tenant_email=lead.get("email", "tenant@example.com"),
-            landlord_email="landlord@example.com"
+    sb = supabase_client.get_supabase()
+
+    contract_result = sb.table("contracts").select("*, leads(*)").eq("id", contract_id).execute()
+    if not contract_result.data:
+        raise ValueError("Contract not found")
+
+    contract = contract_result.data[0]
+    lead = contract.get("leads") or {}
+
+    # Generate PDF
+    pdf_url = await _generate_pdf(contract, lead)
+
+    # Generate e-sign tokens
+    landlord_token = _generate_sign_token()
+    tenant_token = _generate_sign_token()
+    expires_at = (datetime.utcnow() + timedelta(days=7)).isoformat()
+
+    # Update contract with PDF URL and sign tokens
+    sb.table("contracts").update({
+        "document_url": pdf_url,
+        "status": "generated",
+        "landlord_sign_token": landlord_token,
+        "tenant_sign_token": tenant_token,
+        "sign_token_expires_at": expires_at,
+    }).eq("id", contract_id).execute()
+
+    logger.info(f"Tenancy agreement generated for contract {contract_id}")
+    return pdf_url
+
+
+async def send_contract_for_esign(contract_id: str) -> dict:
+    """
+    Send e-signature links to landlord and tenant via WhatsApp and email.
+    """
+    sb = supabase_client.get_supabase()
+    contract_result = sb.table("contracts").select("*, leads(*)").eq("id", contract_id).execute()
+    if not contract_result.data:
+        raise ValueError("Contract not found")
+
+    contract = contract_result.data[0]
+    lead = contract.get("leads") or {}
+
+    landlord_token = contract.get("landlord_sign_token")
+    tenant_token = contract.get("tenant_sign_token")
+    pdf_url = contract.get("document_url")
+
+    if not landlord_token or not tenant_token:
+        raise ValueError("Contract must be generated first — sign tokens missing")
+
+    base_url = settings.FRONTEND_URL
+    landlord_sign_url = f"{base_url}/contracts/{contract_id}/sign?token={landlord_token}&role=landlord"
+    tenant_sign_url = f"{base_url}/contracts/{contract_id}/sign?token={tenant_token}&role=tenant"
+
+    from services.whatsapp_service import send_whatsapp_message
+
+    # Send to landlord
+    owner_phone = contract.get("owner_phone", "")
+    owner_name = contract.get("owner_name", "Landlord")
+    if owner_phone:
+        landlord_msg = (
+            f"Dear {owner_name},\n\n"
+            f"Your tenancy contract for {contract.get('property_address', 'the property')} is ready for your signature.\n\n"
+            f"📄 View Contract: {pdf_url}\n"
+            f"✍️ Sign here: {landlord_sign_url}\n\n"
+            f"This link expires in 7 days.\n"
+            f"— AndiOS Platform"
         )
-        
-        # Update Contract
-        sb.table("contracts").update({
-            "status": "sent",
-            "document_url": mock_pdf_url
-        }).eq("id", contract_id).execute()
-        
-        return mock_pdf_url
-        
-    except Exception as e:
-        logger.error(f"Failed to generate tenancy agreement: {e}")
-        raise e
+        await send_whatsapp_message(owner_phone, landlord_msg)
+
+    # Send to tenant
+    tenant_phone = lead.get("phone", "")
+    tenant_name = contract.get("tenant_name") or lead.get("name", "Tenant")
+    if tenant_phone:
+        tenant_msg = (
+            f"Dear {tenant_name},\n\n"
+            f"Your tenancy contract for {contract.get('property_address', 'the property')} is ready for your signature.\n\n"
+            f"📄 View Contract: {pdf_url}\n"
+            f"✍️ Sign here: {tenant_sign_url}\n\n"
+            f"This link expires in 7 days.\n"
+            f"— AndiOS Platform"
+        )
+        await send_whatsapp_message(tenant_phone, tenant_msg)
+
+    # Update status
+    sb.table("contracts").update({"status": "sent"}).eq("id", contract_id).execute()
+
+    logger.info(f"E-sign links sent for contract {contract_id}")
+    return {
+        "landlord_sign_url": landlord_sign_url,
+        "tenant_sign_url": tenant_sign_url,
+        "pdf_url": pdf_url,
+    }
+
+
+async def verify_and_record_signature(contract_id: str, token: str, role: str) -> dict:
+    """
+    Verify e-sign token and record signature.
+    Role must be 'landlord' or 'tenant'.
+    """
+    sb = supabase_client.get_supabase()
+    contract_result = sb.table("contracts").select("*").eq("id", contract_id).execute()
+    if not contract_result.data:
+        raise ValueError("Contract not found")
+
+    contract = contract_result.data[0]
+
+    # Check expiry
+    expires_at = contract.get("sign_token_expires_at")
+    if expires_at and datetime.fromisoformat(expires_at) < datetime.utcnow():
+        raise ValueError("Signature link has expired")
+
+    # Verify token
+    if role == "landlord":
+        if token != contract.get("landlord_sign_token"):
+            raise ValueError("Invalid signature token")
+        update = {"landlord_signed_at": datetime.utcnow().isoformat()}
+    elif role == "tenant":
+        if token != contract.get("tenant_sign_token"):
+            raise ValueError("Invalid signature token")
+        update = {"tenant_signed_at": datetime.utcnow().isoformat()}
+    else:
+        raise ValueError("Invalid role — must be 'landlord' or 'tenant'")
+
+    # Check if both parties have now signed
+    landlord_signed = contract.get("landlord_signed_at") or (role == "landlord")
+    tenant_signed = contract.get("tenant_signed_at") or (role == "tenant")
+
+    if landlord_signed and tenant_signed:
+        update["status"] = "signed"
+
+    sb.table("contracts").update(update).eq("id", contract_id).execute()
+
+    logger.info(f"Signature recorded for contract {contract_id} by {role}")
+    return {
+        "contract_id": contract_id,
+        "role": role,
+        "signed_at": update.get("landlord_signed_at") or update.get("tenant_signed_at"),
+        "fully_signed": update.get("status") == "signed",
+    }
+
+
+async def close_contract_with_cheque(contract_id: str, cheque_image_url: str) -> dict:
+    """Mark contract as closed after agency fee cheque is uploaded."""
+    sb = supabase_client.get_supabase()
+    contract_result = sb.table("contracts").select("status").eq("id", contract_id).execute()
+    if not contract_result.data:
+        raise ValueError("Contract not found")
+
+    if contract_result.data[0].get("status") != "signed":
+        raise ValueError("Contract must be signed before closing")
+
+    sb.table("contracts").update({
+        "status": "closed",
+        "agency_fee_cheque_url": cheque_image_url,
+        "closed_at": datetime.utcnow().isoformat(),
+    }).eq("id", contract_id).execute()
+
+    # Also update the associated lead to closed
+    contract_full = sb.table("contracts").select("lead_id").eq("id", contract_id).execute()
+    if contract_full.data and contract_full.data[0].get("lead_id"):
+        sb.table("leads").update({"status": "closed"}).eq("id", contract_full.data[0]["lead_id"]).execute()
+
+    logger.info(f"Contract {contract_id} closed with agency fee cheque")
+    return {"contract_id": contract_id, "status": "closed"}
+
+
+async def perform_ocr_on_document(document_id: str) -> dict:
+    """OCR via OpenAI Vision — delegates to document_service."""
+    from services.document_service import extract_document_data
+    return await extract_document_data(document_id)
+
 
 async def log_cheque(contract_id: str, cheque_data: dict[str, Any]) -> dict:
     """Logs a new post-dated cheque for a contract."""
@@ -95,30 +326,3 @@ async def log_cheque(contract_id: str, cheque_data: dict[str, Any]) -> dict:
     cheque_data["contract_id"] = contract_id
     result = sb.table("cheques").insert(cheque_data).execute()
     return result.data[0] if result.data else {}
-
-async def perform_ocr_on_document(document_id: str) -> dict:
-    """
-    Uses an OCR service (e.g. Google Cloud Vision or AWS Textract) to extract ID/Passport or Title Deed info.
-    """
-    sb = supabase_client.get_supabase()
-    doc_result = sb.table("documents").select("*").eq("id", document_id).execute()
-    if not doc_result.data:
-        raise ValueError("Document not found")
-    
-    doc = doc_result.data[0]
-    logger.info(f"Performing OCR on document {document_id} of type {doc.get('document_type')}")
-    
-    # Mock OCR extraction
-    extracted_data = {}
-    if doc.get("document_type") in ["passport", "emirates_id"]:
-        extracted_data = {"name": "MOCK TENANT NAME", "id_number": "784-1234-5678901-1"}
-    elif doc.get("document_type") == "title_deed":
-        extracted_data = {"owner_name": "MOCK LANDLORD NAME", "property_number": "12345"}
-    
-    # Update document with extracted data
-    sb.table("documents").update({
-        "status": "extracted",
-        "extracted_data": extracted_data
-    }).eq("id", document_id).execute()
-    
-    return extracted_data
