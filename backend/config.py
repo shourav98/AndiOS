@@ -54,6 +54,25 @@ class Settings(BaseSettings):
     # Supabase Storage
     SUPABASE_STORAGE_BUCKET: str = "contracts"
 
+    # ─── Stripe Billing ──────────────────────────────────────────────────────
+    STRIPE_SECRET_KEY: str = ""             # sk_test_... or sk_live_...
+    STRIPE_WEBHOOK_SECRET: str = ""         # whsec_... from stripe CLI or dashboard
+    STRIPE_PORTAL_RETURN_URL: str = "http://localhost:3000/owner-dashboard/plan-billing"
+
+    # Stripe Price IDs — create these once in Stripe Dashboard
+    STRIPE_PRICE_BASIC: str = ""            # AED 1,400/mo — Basic plan
+    STRIPE_PRICE_GROW: str = ""             # AED 2,800/mo — Grow plan
+    STRIPE_PRICE_PRO: str = ""              # AED 5,600/mo — Pro plan
+
+    # Add-on call pack price IDs (recurring)
+    STRIPE_PRICE_ADDON_P1000: str = ""      # AED 2,000/mo — +1,000 calls
+    STRIPE_PRICE_ADDON_P2000: str = ""      # AED 4,000/mo — +2,000 calls
+    STRIPE_PRICE_ADDON_P5000: str = ""      # AED 10,000/mo — +5,000 calls
+    STRIPE_PRICE_ADDON_P10000: str = ""     # AED 20,000/mo — +10,000 calls
+
+    # Overage price (metered — AED 2.00 per call)
+    STRIPE_PRICE_OVERAGE: str = ""          # Metered price for pay-as-you-go overage
+
     # App
     APP_ENV: str = "development"
     SECRET_KEY: str = "change-me-in-production"

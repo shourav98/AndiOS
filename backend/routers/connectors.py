@@ -33,10 +33,10 @@ router = APIRouter(prefix="/connectors", tags=["Connectors"])
 
 CONNECTOR_NAMES = {"property_finder", "bayut", "dubizzle", "whatsapp", "google_calendar"}
 
+# Property portal connectors shown on the Connectors page
+# WhatsApp and Google Calendar are managed separately (env/OAuth) and excluded here
 CONNECTOR_DISPLAY = {
     "property_finder": "Property Finder",
-    "whatsapp": "WhatsApp Business",
-    "google_calendar": "Google Calendar",
     "bayut": "Bayut",
     "dubizzle": "Dubizzle",
 }

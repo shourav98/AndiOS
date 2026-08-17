@@ -685,3 +685,74 @@ async def vapi_webhook(request: Request):
         logger.error(f"Vapi webhook error: {e}")
         # Vapi expects 200 OK — don't raise HTTP errors
         return api_success(data={"status": "error", "detail": str(e)}, message="Vapi webhook error")
+
+
+# ─── Stripe Billing Webhook ───────────────────────────────────────────────────
+
+@router.post("/stripe")
+async def stripe_webhook(request: Request):
+    """
+    Handles Stripe subscription and invoice lifecycle webhooks.
+    Keeps Supabase subscriptions and invoices tables in sync.
+    """
+    import stripe
+    from services.billing_service import (
+        sync_subscription_from_stripe,
+        sync_invoice_from_stripe,
+        _to_dict_safe,
+    )
+
+    payload_bytes = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    webhook_secret = getattr(settings, "STRIPE_WEBHOOK_SECRET", "")
+
+    event = None
+    if webhook_secret and sig_header:
+        try:
+            event = stripe.Webhook.construct_event(
+                payload_bytes, sig_header, webhook_secret
+            )
+        except stripe.error.SignatureVerificationError as e:
+            logger.warning(f"Stripe signature verification failed: {e}")
+            raise HTTPException(status_code=400, detail="Invalid Stripe signature")
+        except Exception as e:
+            logger.error(f"Error parsing Stripe webhook: {e}")
+            raise HTTPException(status_code=400, detail=str(e))
+    else:
+        # Fallback for dev / unverified payloads
+        try:
+            import json
+            event = json.loads(payload_bytes.decode("utf-8"))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+    event_dict = _to_dict_safe(event)
+    event_type = event_dict.get("type", "")
+    event_data = event_dict.get("data", {}).get("object", {})
+    logger.info(f"Received Stripe webhook event: {event_type}")
+
+    try:
+        if event_type in ["customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"]:
+            await sync_subscription_from_stripe(event_data)
+
+        elif event_type in ["invoice.created", "invoice.payment_succeeded", "invoice.payment_failed", "invoice.finalized", "invoice.paid"]:
+            await sync_invoice_from_stripe(event_data)
+
+            # If payment failed, send alert to agency owner
+            if event_type == "invoice.payment_failed":
+                logger.warning(f"Invoice {event_data.get('id')} payment failed for customer {event_data.get('customer')}")
+
+        elif event_type == "checkout.session.completed":
+            sub_id = event_data.get("subscription")
+            if sub_id and getattr(settings, "STRIPE_SECRET_KEY", None):
+                stripe.api_key = settings.STRIPE_SECRET_KEY
+                stripe_sub = stripe.Subscription.retrieve(sub_id)
+                await sync_subscription_from_stripe(stripe_sub)
+
+        return api_success(data={"received": True, "event": event_type}, message="Stripe webhook processed")
+    except Exception as e:
+        logger.error(f"Error processing Stripe event {event_type}: {e}")
+        # Always return 200 to Stripe so it doesn't repeatedly retry failing webhooks
+        return api_success(data={"status": "error", "error": str(e)}, message="Stripe event handled with errors")
+
+

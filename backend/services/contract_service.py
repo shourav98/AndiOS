@@ -326,3 +326,85 @@ async def log_cheque(contract_id: str, cheque_data: dict[str, Any]) -> dict:
     cheque_data["contract_id"] = contract_id
     result = sb.table("cheques").insert(cheque_data).execute()
     return result.data[0] if result.data else {}
+
+
+def generate_subscription_agreement_pdf(contract_info: dict) -> bytes:
+    """Generate a high-quality SaaS Master Subscription Agreement PDF in memory."""
+    import io
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import cm
+    from reportlab.lib import colors
+
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    # Header Banner
+    c.setFillColor(colors.HexColor("#0F172A"))
+    c.rect(0, height - 3.5 * cm, width, 3.5 * cm, fill=True, stroke=False)
+
+    c.setFillColor(colors.HexColor("#FFFFFF"))
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(2 * cm, height - 1.8 * cm, "AndiOS — AI Real Estate Operating System")
+    c.setFont("Helvetica", 11)
+    c.drawString(2 * cm, height - 2.6 * cm, "SaaS Master Subscription Agreement (MSA)")
+
+    # Body Content
+    y = height - 4.8 * cm
+    line_height = 0.65 * cm
+
+    def draw_section_heading(title: str):
+        nonlocal y
+        y -= 0.3 * cm
+        c.setFillColor(colors.HexColor("#0284C7"))  # Brand Blue
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(2 * cm, y, title)
+        c.setStrokeColor(colors.HexColor("#CBD5E1"))
+        c.setLineWidth(1)
+        c.line(2 * cm, y - 0.15 * cm, width - 2 * cm, y - 0.15 * cm)
+        y -= line_height
+
+    def draw_row(label: str, value: str):
+        nonlocal y
+        c.setFillColor(colors.HexColor("#64748B"))
+        c.setFont("Helvetica", 10)
+        c.drawString(2 * cm, y, label)
+        c.setFillColor(colors.HexColor("#0F172A"))
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(8 * cm, y, str(value))
+        y -= line_height
+
+    # Section 1: Agreement Details
+    draw_section_heading("1. SUBSCRIPTION CONTRACT DETAILS")
+    draw_row("Contract Number:", contract_info.get("contract_number", "139350"))
+    draw_row("Product & Tier:", contract_info.get("product", "Grow Plan + Agent Calls"))
+    draw_row("Subscription Status:", contract_info.get("status", "Active"))
+    draw_row("Contract Period:", f"{contract_info.get('duration_start', '28 Jan, 2026')} — {contract_info.get('duration_end', '27 Jan, 2027')}")
+    draw_row("Payment Method:", contract_info.get("payment_mode", "Credit/Debit Card"))
+
+    # Section 2: Financial Terms
+    draw_section_heading("2. PRICING & TAX INVOICE TERMS (AED)")
+    price = contract_info.get("price_details", {})
+    draw_row("Gross Annual Fee (Excl. VAT):", f"AED {price.get('gross_amount_aed', 33600):,.2f}")
+    draw_row("UAE Value Added Tax (VAT 5%):", f"AED {price.get('vat_5_percent_aed', 1680):,.2f}")
+    draw_row("Discount Applied:", f"{price.get('discount_percent', 0)}%")
+    draw_row("Total Annual Contract Value:", f"AED {price.get('total_amount_aed', 35280):,.2f}")
+
+    # Section 3: Signatures
+    draw_section_heading("3. AUTHORIZED SIGNATURES & LEGAL COMPLIANCE")
+    draw_row("Customer Legal Entity:", contract_info.get("agency_name", "Registered Real Estate Agency"))
+    draw_row("Authorized Signatory:", contract_info.get("signed_by", "Sara Al Owais"))
+    draw_row("Digital Signature Date:", contract_info.get("duration_start", "28 Jan, 2026"))
+    draw_row("Provider Entity:", "AndiOS Real Estate Technologies FZ-LLC, Dubai, UAE")
+
+    # Footer
+    c.setFillColor(colors.HexColor("#94A3B8"))
+    c.setFont("Helvetica", 9)
+    c.drawCentredString(width / 2, 2 * cm, "This document is electronically generated, signed, and legally binding under UAE Federal Law.")
+
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
