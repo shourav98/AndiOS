@@ -1,9 +1,9 @@
-"""
-JWT Auth Middleware — verifies Supabase-issued JWTs and enriches with tenant context.
-"""
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from database.supabase_client import get_supabase
+from config import settings
+from jose import jwt, JWTError
+from datetime import datetime
 import logging
 
 logger = logging.getLogger(__name__)
@@ -13,10 +13,22 @@ security = HTTPBearer()
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     """
-    FastAPI dependency — validates JWT via Supabase and returns enriched user payload
-    with agency_id, role, and agent_id from the agents table.
+    FastAPI dependency — validates JWT (local 24h JWT or Supabase token)
+    and returns enriched user payload with agency_id, role, and agent_id.
     """
     token = credentials.credentials
+
+    # 1. Fast local 24-hour JWT decoding
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        if payload and payload.get("sub"):
+            return payload
+    except JWTError:
+        pass
+    except Exception as e:
+        logger.debug(f"Local JWT decode note: {e}")
+
+    # 2. Fallback to Supabase Auth get_user
     try:
         sb = get_supabase()
         response = sb.auth.get_user(token)
@@ -70,6 +82,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
 
 
 def get_current_user_id(current_user: dict = Depends(verify_token)) -> str:

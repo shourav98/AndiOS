@@ -17,10 +17,37 @@ from typing import Optional
 from database.supabase_client import get_supabase
 from middleware.auth_middleware import verify_token, get_current_user_id
 from utils.response import api_success
+from config import settings
+from jose import jwt
+from datetime import datetime, timedelta
 import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Auth"])
+
+# 24 Hours Token Expiration in Seconds
+JWT_EXPIRY_SECONDS = 86400  # 24 hours (24 * 60 * 60)
+
+
+def _generate_24h_jwt(
+    user_id: str,
+    email: str,
+    agency_id: Optional[str] = None,
+    role: Optional[str] = None,
+    agent_id: Optional[str] = None
+) -> str:
+    """Generate a custom 24-hour JWT access token for API requests."""
+    now = datetime.utcnow()
+    payload = {
+        "sub": str(user_id),
+        "email": email,
+        "agency_id": str(agency_id) if agency_id else None,
+        "role": role or "owner",
+        "agent_id": str(agent_id) if agent_id else None,
+        "iat": now,
+        "exp": now + timedelta(seconds=JWT_EXPIRY_SECONDS),
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
 
 
 def _sync_user_app_metadata(user_id: str, agency_id: str, role: str, agent_id: str) -> None:
@@ -36,6 +63,7 @@ def _sync_user_app_metadata(user_id: str, agency_id: str, role: str, agent_id: s
             }
         },
     )
+
 
 
 # ─── Request / Response Models ──────────────────────────────────────────────────
@@ -176,6 +204,7 @@ async def verify_otp(body: VerifyOTPRequest):
             raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
 
         # Sync tenant context into JWT app_metadata after email verification
+        agent = None
         if response.user and body.type == "email":
             agent_result = (
                 sb.table("agents")
@@ -196,12 +225,21 @@ async def verify_otp(body: VerifyOTPRequest):
                 except Exception as meta_err:
                     logger.warning(f"Could not sync app_metadata on verify-otp: {meta_err}")
 
+        token_24h = _generate_24h_jwt(
+            user_id=response.user.id if response.user else "",
+            email=body.email,
+            agency_id=agent.get("agency_id") if agent else None,
+            role=agent.get("role") if agent else "owner",
+            agent_id=agent.get("id") if agent else None,
+        )
+
         return api_success(
             message="Email verified successfully.",
             data={
-                "access_token": response.session.access_token,
+                "access_token": token_24h,
+                "supabase_token": response.session.access_token,
                 "refresh_token": response.session.refresh_token,
-                "expires_in": response.session.expires_in,
+                "expires_in": JWT_EXPIRY_SECONDS,
                 "token_type": "Bearer",
             }
         )
@@ -235,7 +273,7 @@ async def resend_otp(body: ResendOTPRequest):
 async def login(body: LoginRequest):
     """
     Login via Supabase Auth.
-    Returns access_token (JWT) to use in Authorization: Bearer header.
+    Returns 24-hour access_token (JWT) to use in Authorization: Bearer header.
     """
     sb = get_supabase()
     try:
@@ -264,12 +302,21 @@ async def login(body: LoginRequest):
             except Exception as meta_err:
                 logger.warning(f"Could not sync app_metadata on login: {meta_err}")
 
+        token_24h = _generate_24h_jwt(
+            user_id=user.id,
+            email=user.email,
+            agency_id=agent.get("agency_id") if agent else None,
+            role=agent.get("role") if agent else "owner",
+            agent_id=agent.get("id") if agent else None,
+        )
+
         return api_success(
             message="User logged in successfully",
             data={
-                "access_token": response.session.access_token,
+                "access_token": token_24h,
+                "supabase_token": response.session.access_token,
                 "refresh_token": response.session.refresh_token,
-                "expires_in": response.session.expires_in,
+                "expires_in": JWT_EXPIRY_SECONDS,
                 "token_type": "Bearer",
                 "user": {
                     "id": user.id,
@@ -339,18 +386,39 @@ async def refresh_token(body: RefreshRequest):
     sb = get_supabase()
     try:
         response = sb.auth.refresh_session(body.refresh_token)
-        if not response.session:
+        if not response.session or not response.user:
             raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+        user = response.user
+        agent_result = (
+            sb.table("agents")
+            .select("id, agency_id, role")
+            .eq("email", user.email)
+            .maybe_single()
+            .execute()
+        )
+        agent = agent_result.data if agent_result and agent_result.data else None
+
+        token_24h = _generate_24h_jwt(
+            user_id=user.id,
+            email=user.email,
+            agency_id=agent.get("agency_id") if agent else None,
+            role=agent.get("role") if agent else "owner",
+            agent_id=agent.get("id") if agent else None,
+        )
+
         return api_success(
             message="Token refreshed successfully",
             data={
-                "access_token": response.session.access_token,
+                "access_token": token_24h,
+                "supabase_token": response.session.access_token,
                 "refresh_token": response.session.refresh_token,
-                "expires_in": response.session.expires_in,
+                "expires_in": JWT_EXPIRY_SECONDS,
             }
         )
     except Exception as e:
         raise HTTPException(status_code=401, detail="Token refresh failed")
+
 
 
 # ─── FORGOT PASSWORD ──────────────────────────────────────────────────────────────
