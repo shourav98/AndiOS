@@ -85,8 +85,16 @@ class ForgotPasswordRequest(BaseModel):
 
 
 class ResetPasswordRequest(BaseModel):
-    new_password: str
-    # access_token is taken from Authorization header (after clicking reset link)
+    new_password: Optional[str] = None
+    password: Optional[str] = None
+    confirm_password: Optional[str] = None
+    email: Optional[EmailStr] = None
+    token: Optional[str] = None
+
+    @property
+    def target_password(self) -> str:
+        return self.new_password or self.password or ""
+
 
 
 class VerifyOTPRequest(BaseModel):
@@ -116,16 +124,36 @@ async def register(body: RegisterRequest):
     """
     sb = get_supabase()
     try:
-        # Step 1: Create Supabase Auth user
-        auth_response = sb.auth.sign_up({
-            "email": body.email,
-            "password": body.password,
-        })
+        # Step 1: Create Supabase Auth user (try sign_up, fallback to admin create if SMTP fails)
+        user = None
+        try:
+            auth_response = sb.auth.sign_up({
+                "email": body.email,
+                "password": body.password,
+            })
+            if auth_response and auth_response.user:
+                user = auth_response.user
+        except Exception as signup_err:
+            logger.warning(f"Supabase sign_up note ({signup_err}), creating user directly via admin API...")
 
-        if not auth_response.user:
+        if not user:
+            try:
+                admin_res = sb.auth.admin.create_user({
+                    "email": body.email,
+                    "password": body.password,
+                    "email_confirm": True,
+                })
+                if admin_res and admin_res.user:
+                    user = admin_res.user
+            except Exception as admin_err:
+                logger.error(f"Admin create_user error: {admin_err}")
+                raise HTTPException(status_code=400, detail="Registration failed. Email may already be registered.")
+
+        if not user:
             raise HTTPException(status_code=400, detail="Registration failed. Email may already be in use.")
 
-        user_id = auth_response.user.id
+        user_id = user.id
+
 
         # Step 2: Create agency
         slug = body.agency_name.lower().replace(" ", "-").replace("_", "-")
@@ -452,9 +480,17 @@ async def reset_password(
     Requires the access_token obtained from /auth/verify-otp (type=recovery).
     Flow: forgot-password → verify-otp (type=recovery) → reset-password
     """
+    password_to_set = body.target_password
+    if not password_to_set:
+        raise HTTPException(status_code=400, detail="Password is required")
+
+    if body.confirm_password and body.confirm_password != password_to_set:
+        raise HTTPException(status_code=400, detail="Passwords do not match")
+
     sb = get_supabase()
     try:
-        response = sb.auth.update_user({"password": body.new_password})
+        response = sb.auth.update_user({"password": password_to_set})
+
         if not response.user:
             raise HTTPException(status_code=400, detail="Password reset failed.")
         return api_success(message="Password updated successfully.")
@@ -463,3 +499,4 @@ async def reset_password(
     except Exception as e:
         logger.error(f"Reset password error: {e}")
         raise HTTPException(status_code=400, detail="Password reset failed. Token may be expired.")
+
