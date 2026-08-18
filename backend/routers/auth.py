@@ -11,8 +11,9 @@ POST /auth/reset-password  — Set new password (after OTP/link)
 POST /auth/verify-otp      — Verify 6-digit email OTP
 POST /auth/resend-otp      — Resend OTP verification email
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr
+
 from typing import Optional
 from database.supabase_client import get_supabase
 from middleware.auth_middleware import verify_token, get_current_user_id
@@ -105,6 +106,7 @@ class VerifyOTPRequest(BaseModel):
 
 class ResendOTPRequest(BaseModel):
     email: EmailStr
+    type: str = "signup"  # "signup" for registration, "recovery" for forgot-password
 
 
 class RefreshRequest(BaseModel):
@@ -282,17 +284,27 @@ async def verify_otp(body: VerifyOTPRequest):
 
 @router.post("/resend-otp")
 async def resend_otp(body: ResendOTPRequest):
-    """Resend email verification OTP."""
+    """
+    Resend OTP to user's email.
+    type = "signup"   → registration email confirmation
+    type = "recovery" → forgot password OTP
+    """
     sb = get_supabase()
     try:
-        sb.auth.resend({
-            "type": "signup",
-            "email": body.email,
-        })
+        if body.type == "recovery":
+            # For forgot-password flow: resend a new recovery OTP
+            sb.auth.reset_password_email(body.email)
+        else:
+            # For registration flow: resend signup confirmation OTP
+            sb.auth.resend({
+                "type": "signup",
+                "email": body.email,
+            })
         return api_success(message="Verification code resent to your email.")
     except Exception as e:
         logger.error(f"Resend OTP error: {e}")
-        raise HTTPException(status_code=400, detail="Could not resend OTP.")
+        # Always return success to avoid email enumeration
+        return api_success(message="If this email exists, a code has been resent.")
 
 
 # ─── LOGIN ────────────────────────────────────────────────────────────────────────
@@ -473,30 +485,88 @@ async def forgot_password(body: ForgotPasswordRequest):
 @router.post("/reset-password")
 async def reset_password(
     body: ResetPasswordRequest,
-    user_id: str = Depends(get_current_user_id),
+    request: Request,
 ):
     """
-    Set a new password.
-    Requires the access_token obtained from /auth/verify-otp (type=recovery).
-    Flow: forgot-password → verify-otp (type=recovery) → reset-password
+    Set a new password after OTP verification.
+
+    Industry-standard flow:
+      1. POST /auth/forgot-password  → email with 6-digit OTP sent (type=recovery)
+      2. POST /auth/verify-otp       → {email, token, type="recovery"} → returns access_token
+      3. POST /auth/reset-password   → Authorization: Bearer <access_token> + new password
+
+    Alternative (one-step): provide {email, token, password, confirm_password} in body.
+    The OTP is verified inline and password is updated in one call.
     """
     password_to_set = body.target_password
     if not password_to_set:
-        raise HTTPException(status_code=400, detail="Password is required")
+        raise HTTPException(status_code=400, detail="Password is required.")
 
     if body.confirm_password and body.confirm_password != password_to_set:
-        raise HTTPException(status_code=400, detail="Passwords do not match")
+        raise HTTPException(status_code=400, detail="Passwords do not match.")
 
     sb = get_supabase()
-    try:
-        response = sb.auth.update_user({"password": password_to_set})
+    user_id = None
 
-        if not response.user:
-            raise HTTPException(status_code=400, detail="Password reset failed.")
+    # ── Method 1: Bearer token from Authorization header ──────────────────────────
+    # This is the standard flow: frontend passes the access_token received from
+    # /auth/verify-otp (type=recovery) as a Bearer token.
+    auth_header = request.headers.get("authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        # Try our custom 24h JWT first
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+            if payload and payload.get("sub"):
+                user_id = payload["sub"]
+        except Exception:
+            pass
+
+        # Fallback: try Supabase session token
+        if not user_id:
+            try:
+                user_res = sb.auth.get_user(token)
+                if user_res and user_res.user:
+                    user_id = user_res.user.id
+            except Exception:
+                pass
+
+    # ── Method 2: One-step inline OTP verification + password reset ────────────────
+    # Requires both email AND token (OTP) in body. This verifies the OTP before
+    # updating the password — still secure, just one fewer API call from frontend.
+    if not user_id and body.email and body.token:
+        try:
+            v_res = sb.auth.verify_otp({
+                "email": body.email,
+                "token": body.token,
+                "type": "recovery",
+            })
+            if v_res and v_res.user:
+                user_id = v_res.user.id
+        except Exception as e:
+            logger.warning(f"Inline OTP verification failed: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or expired OTP. Please request a new code."
+            )
+
+    # ── No valid authentication provided ──────────────────────────────────────────
+    if not user_id:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Authentication required. "
+                "Provide Authorization: Bearer <token> header (from /auth/verify-otp), "
+                "or provide email + otp_token in the request body."
+            )
+        )
+
+    # ── Update the password ───────────────────────────────────────────────────────
+    try:
+        sb.auth.admin.update_user_by_id(user_id, {"password": password_to_set})
         return api_success(message="Password updated successfully.")
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Reset password error: {e}")
-        raise HTTPException(status_code=400, detail="Password reset failed. Token may be expired.")
+        raise HTTPException(status_code=400, detail="Password reset failed. Please try again.")
+
 
