@@ -26,8 +26,9 @@ import logging
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
-# 24 Hours Token Expiration in Seconds
-JWT_EXPIRY_SECONDS = 86400  # 24 hours (24 * 60 * 60)
+# Token Expiration in Seconds
+JWT_EXPIRY_SECONDS = 86400         # 24 hours for normal login
+RESET_TOKEN_EXPIRY_SECONDS = 600   # 10 minutes strictly for password reset (Industry Standard)
 
 
 def _generate_24h_jwt(
@@ -45,8 +46,22 @@ def _generate_24h_jwt(
         "agency_id": str(agency_id) if agency_id else None,
         "role": role or "owner",
         "agent_id": str(agent_id) if agent_id else None,
+        "purpose": "session",
         "iat": now,
         "exp": now + timedelta(seconds=JWT_EXPIRY_SECONDS),
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
+
+
+def _generate_reset_token(user_id: str, email: str) -> str:
+    """Generate a short-lived (10 min) single-purpose JWT strictly for password reset."""
+    now = datetime.utcnow()
+    payload = {
+        "sub": str(user_id),
+        "email": email,
+        "purpose": "password_reset",
+        "iat": now,
+        "exp": now + timedelta(seconds=RESET_TOKEN_EXPIRY_SECONDS),
     }
     return jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
 
@@ -259,7 +274,24 @@ async def verify_otp(body: VerifyOTPRequest):
         if not response.session:
             raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
 
-        # Sync tenant context into JWT app_metadata after email verification
+        # ── Recovery flow (Forgot Password) ──────────────────────────────────
+        if not is_registration:
+            reset_token = _generate_reset_token(
+                user_id=response.user.id if response.user else "",
+                email=body.email,
+            )
+            return api_success(
+                message="OTP verified. Please set your new password within 10 minutes.",
+                data={
+                    "access_token": reset_token,        # for Authorization: Bearer header
+                    "reset_token": reset_token,         # explicit reset token field
+                    "expires_in": RESET_TOKEN_EXPIRY_SECONDS, # 600 seconds (10 minutes)
+                    "token_type": "Bearer",
+                    "purpose": "password_reset",
+                }
+            )
+
+        # ── Registration flow (Signup Confirmation) ───────────────────────────
         agent = None
         if response.user and is_registration:
             agent_result = (

@@ -18,11 +18,19 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
     """
     token = credentials.credentials
 
-    # 1. Fast local 24-hour JWT decoding
+    # 1. Fast local JWT decoding
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
         if payload and payload.get("sub"):
+            # Block single-purpose password reset tokens from accessing CRM endpoints
+            if payload.get("purpose") == "password_reset":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="This token is strictly for password reset and cannot access application data."
+                )
             return payload
+    except HTTPException:
+        raise
     except JWTError:
         pass
     except Exception as e:
