@@ -106,7 +106,11 @@ class VerifyOTPRequest(BaseModel):
 
 class ResendOTPRequest(BaseModel):
     email: EmailStr
-    type: str = "signup"  # "signup" for registration, "recovery" for forgot-password
+    type: str  # Required: "signup" (registration) | "recovery" (forgot-password)
+
+    def validate_type(self) -> None:
+        if self.type not in ("signup", "recovery"):
+            raise ValueError(f'type must be "signup" or "recovery", got "{self.type}"')
 
 
 class RefreshRequest(BaseModel):
@@ -286,25 +290,48 @@ async def verify_otp(body: VerifyOTPRequest):
 async def resend_otp(body: ResendOTPRequest):
     """
     Resend OTP to user's email.
-    type = "signup"   → registration email confirmation
+    type = "signup"   → registration email confirmation OTP
     type = "recovery" → forgot password OTP
+
+    The 'type' field is REQUIRED. Returns 400 if missing or invalid.
     """
+    # Validate type
+    if body.type not in ("signup", "recovery"):
+        raise HTTPException(
+            status_code=400,
+            detail=f'Invalid type "{body.type}". Must be "signup" (registration) or "recovery" (forgot-password).'
+        )
+
     sb = get_supabase()
     try:
         if body.type == "recovery":
-            # For forgot-password flow: resend a new recovery OTP
+            # For forgot-password flow: send a fresh 6-digit recovery OTP
             sb.auth.reset_password_email(body.email)
+            message = "Password reset code resent to your email."
         else:
             # For registration flow: resend signup confirmation OTP
             sb.auth.resend({
                 "type": "signup",
                 "email": body.email,
             })
-        return api_success(message="Verification code resent to your email.")
+            message = "Verification code resent to your email."
+
+        return api_success(
+            message=message,
+            data={
+                "email": body.email,
+                "type": body.type,
+                "note": "Check your inbox for the new OTP code."
+            }
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Resend OTP error: {e}")
-        # Always return success to avoid email enumeration
-        return api_success(message="If this email exists, a code has been resent.")
+        raise HTTPException(
+            status_code=400,
+            detail="Failed to resend OTP. Please ensure your email is registered and try again."
+        )
 
 
 # ─── LOGIN ────────────────────────────────────────────────────────────────────────
