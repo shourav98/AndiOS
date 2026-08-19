@@ -105,11 +105,20 @@ class ResetPasswordRequest(BaseModel):
     password: Optional[str] = None
     confirm_password: Optional[str] = None
     email: Optional[EmailStr] = None
-    token: Optional[str] = None
+    token: Optional[str] = None          # 6-digit OTP code OR JWT token
+    reset_token: Optional[str] = None    # JWT reset token from verify-otp
+    access_token: Optional[str] = None   # JWT access token from verify-otp
 
     @property
     def target_password(self) -> str:
         return self.new_password or self.password or ""
+
+    @property
+    def candidate_jwt(self) -> Optional[str]:
+        for t in (self.reset_token, self.access_token, self.token):
+            if t and t.strip().startswith("eyJ"):
+                return t.strip()
+        return None
 
 
 
@@ -619,20 +628,29 @@ async def reset_password(
 
     sb = get_supabase()
     user_id = None
+    user_email = body.email
 
-    # ── Method 1: Bearer token from Authorization header ──────────────────────────
-    # This is the standard flow: frontend passes the access_token received from
-    # /auth/verify-otp (type=recovery) as a Bearer token.
+    # ── Method 1: JWT Token from Authorization Header OR Request Body ───────────
+    # Accepts:
+    #   - Header: Authorization: Bearer <reset_token>
+    #   - Body: { "reset_token": "..." } or { "access_token": "..." } or { "token": "eyJ..." }
+    token = None
     auth_header = request.headers.get("authorization")
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header[7:].strip()
-        # Try our custom 24h JWT first
+    elif body.candidate_jwt:
+        token = body.candidate_jwt
+
+    if token:
+        # Try our custom JWT first (150s reset token or 24h session token)
         try:
             payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
             if payload and payload.get("sub"):
                 user_id = payload["sub"]
-        except Exception:
-            pass
+                if not user_email and payload.get("email"):
+                    user_email = payload["email"]
+        except Exception as e:
+            logger.debug(f"JWT decode error on reset-password: {e}")
 
         # Fallback: try Supabase session token
         if not user_id:
@@ -640,36 +658,40 @@ async def reset_password(
                 user_res = sb.auth.get_user(token)
                 if user_res and user_res.user:
                     user_id = user_res.user.id
+                    if not user_email:
+                        user_email = user_res.user.email
             except Exception:
                 pass
 
-    # ── Method 2: One-step inline OTP verification + password reset ────────────────
-    # Requires both email AND token (OTP) in body. This verifies the OTP before
-    # updating the password — still secure, just one fewer API call from frontend.
+    # ── Method 2: Inline 6-digit OTP verification + password reset ────────────────
+    # Requires both email AND 6-digit OTP code in body.
     if not user_id and body.email and body.token:
-        try:
-            v_res = sb.auth.verify_otp({
-                "email": body.email,
-                "token": body.token,
-                "type": "recovery",
-            })
-            if v_res and v_res.user:
-                user_id = v_res.user.id
-        except Exception as e:
-            logger.warning(f"Inline OTP verification failed: {e}")
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid or expired OTP. Please request a new code."
-            )
+        otp_candidate = body.token.strip()
+        if not otp_candidate.startswith("eyJ"):
+            try:
+                v_res = sb.auth.verify_otp({
+                    "email": body.email,
+                    "token": otp_candidate,
+                    "type": "recovery",
+                })
+                if v_res and v_res.user:
+                    user_id = v_res.user.id
+                    if not user_email:
+                        user_email = v_res.user.email
+            except Exception as e:
+                logger.warning(f"Inline OTP verification failed: {e}")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid or expired OTP code. Please request a new code."
+                )
 
     # ── No valid authentication provided ──────────────────────────────────────────
     if not user_id:
         raise HTTPException(
             status_code=401,
             detail=(
-                "Authentication required. "
-                "Provide Authorization: Bearer <token> header (from /auth/verify-otp), "
-                "or provide email + otp_token in the request body."
+                "Authentication required. Provide Authorization: Bearer <reset_token> header, "
+                "or pass 'reset_token' / 'token' in the request body, or pass 'email' + 'token' (OTP)."
             )
         )
 
@@ -678,7 +700,6 @@ async def reset_password(
         sb.auth.admin.update_user_by_id(user_id, {"password": password_to_set})
 
         # Resolve user email for rich response data
-        user_email = body.email
         if not user_email:
             try:
                 user_record = sb.auth.admin.get_user_by_id(user_id)
