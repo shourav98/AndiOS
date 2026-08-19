@@ -381,10 +381,16 @@ async def resend_otp(body: ResendOTPRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Resend OTP error: {e}")
+        err_msg = str(e)
+        logger.error(f"Resend OTP error: {err_msg}")
+        if "security purposes" in err_msg.lower() or "rate" in err_msg.lower() or "seconds" in err_msg.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests. Please wait 60 seconds before requesting another code."
+            )
         raise HTTPException(
             status_code=400,
-            detail="Failed to resend OTP. Please ensure your email is registered and try again."
+            detail="Failed to resend OTP. Please ensure your email is correct and try again."
         )
 
 
@@ -458,13 +464,22 @@ async def login(body: LoginRequest):
 @router.post("/logout")
 async def logout(current_user: dict = Depends(verify_token)):
     """Invalidate the current session."""
+    user_id = current_user.get("sub")
+    email = current_user.get("email")
     try:
         sb = get_supabase()
         sb.auth.sign_out()
-        return api_success(message="Logged out successfully")
     except Exception as e:
         logger.error(f"Logout error: {e}")
-        return api_success(message="Logged out successfully")  # Always succeed on logout
+
+    return api_success(
+        message="Logged out successfully",
+        data={
+            "user_id": user_id,
+            "email": email,
+            "status": "logged_out"
+        }
+    )
 
 
 # ─── ME (Current User) ───────────────────────────────────────────────────────────
@@ -554,11 +569,27 @@ async def forgot_password(body: ForgotPasswordRequest):
     try:
         # This sends a 6-digit OTP to the email (type=recovery)
         sb.auth.reset_password_email(body.email)
-        return api_success(message="Password reset code sent to your email.")
+        return api_success(
+            message="Password reset code sent to your email.",
+            data={
+                "email": body.email,
+                "type": "recovery",
+                "status": "otp_sent",
+                "note": "A 6-digit password recovery OTP has been sent to your email."
+            }
+        )
     except Exception as e:
         logger.error(f"Forgot password error: {e}")
         # Always return success to prevent email enumeration
-        return api_success(message="If this email exists, a reset code has been sent.")
+        return api_success(
+            message="If this email exists, a reset code has been sent.",
+            data={
+                "email": body.email,
+                "type": "recovery",
+                "status": "otp_sent",
+                "note": "If an account exists with this email, a verification code was dispatched."
+            }
+        )
 
 
 # ─── RESET PASSWORD ───────────────────────────────────────────────────────────────
@@ -645,7 +676,26 @@ async def reset_password(
     # ── Update the password ───────────────────────────────────────────────────────
     try:
         sb.auth.admin.update_user_by_id(user_id, {"password": password_to_set})
-        return api_success(message="Password updated successfully.")
+
+        # Resolve user email for rich response data
+        user_email = body.email
+        if not user_email:
+            try:
+                user_record = sb.auth.admin.get_user_by_id(user_id)
+                if user_record and user_record.user:
+                    user_email = user_record.user.email
+            except Exception:
+                pass
+
+        return api_success(
+            message="Password updated successfully.",
+            data={
+                "user_id": str(user_id),
+                "email": user_email,
+                "status": "password_updated",
+                "next_step": "login_with_new_password"
+            }
+        )
     except Exception as e:
         logger.error(f"Reset password error: {e}")
         raise HTTPException(status_code=400, detail="Password reset failed. Please try again.")
