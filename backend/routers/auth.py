@@ -100,8 +100,12 @@ class ResetPasswordRequest(BaseModel):
 
 class VerifyOTPRequest(BaseModel):
     email: EmailStr
-    token: str          # 6-digit OTP from email
-    type: str = "email" # "email" | "recovery"
+    token: str  # 6-digit OTP from email
+    # Frontend sends:
+    #   "signup"   → registration verification (mapped to Supabase "email" internally)
+    #   "recovery" → forgot password verification
+    # "email" is also accepted for backward compatibility
+    type: str = "signup"
 
 
 class ResendOTPRequest(BaseModel):
@@ -223,15 +227,33 @@ async def register(body: RegisterRequest):
 async def verify_otp(body: VerifyOTPRequest):
     """
     Verify the 6-digit OTP sent to the user's email.
-    Type = 'email' for registration, 'recovery' for forgot password.
-    Returns a session (access_token) on success.
+
+    Frontend sends:
+      type = "signup"   → registration email confirmation (Supabase: "email")
+      type = "recovery" → forgot password OTP
+
+    Note: "email" is also accepted as an alias for "signup" (backward compat).
+    Returns access_token on success.
     """
+    # Validate type
+    if body.type not in ("signup", "email", "recovery"):
+        raise HTTPException(
+            status_code=400,
+            detail=f'Invalid type "{body.type}". Must be "signup" or "recovery".'
+        )
+
+    # Map frontend-friendly type → Supabase internal type
+    # Frontend always sends "signup" or "recovery".
+    # Supabase verify_otp uses "email" for registration, "recovery" for password reset.
+    supabase_type = "email" if body.type in ("signup", "email") else "recovery"
+    is_registration = supabase_type == "email"
+
     sb = get_supabase()
     try:
         response = sb.auth.verify_otp({
             "email": body.email,
             "token": body.token,
-            "type": body.type,
+            "type": supabase_type,
         })
 
         if not response.session:
@@ -239,7 +261,7 @@ async def verify_otp(body: VerifyOTPRequest):
 
         # Sync tenant context into JWT app_metadata after email verification
         agent = None
-        if response.user and body.type == "email":
+        if response.user and is_registration:
             agent_result = (
                 sb.table("agents")
                 .select("id, agency_id, role")
