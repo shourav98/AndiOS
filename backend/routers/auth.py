@@ -28,7 +28,7 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 
 # Token Expiration in Seconds
 JWT_EXPIRY_SECONDS = 86400         # 24 hours for normal login
-RESET_TOKEN_EXPIRY_SECONDS = 600   # 10 minutes strictly for password reset (Industry Standard)
+RESET_TOKEN_EXPIRY_SECONDS = 150   # 2.5 minutes strictly for password reset (Industry Standard)
 
 
 def _generate_24h_jwt(
@@ -281,11 +281,11 @@ async def verify_otp(body: VerifyOTPRequest):
                 email=body.email,
             )
             return api_success(
-                message="OTP verified. Please set your new password within 10 minutes.",
+                message="OTP verified. Please set your new password before the token expires.",
                 data={
                     "access_token": reset_token,        # for Authorization: Bearer header
                     "reset_token": reset_token,         # explicit reset token field
-                    "expires_in": RESET_TOKEN_EXPIRY_SECONDS, # 600 seconds (10 minutes)
+                    "expires_in": RESET_TOKEN_EXPIRY_SECONDS, # 150 seconds (2.5 minutes)
                     "token_type": "Bearer",
                     "purpose": "password_reset",
                 }
