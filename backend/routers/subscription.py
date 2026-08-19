@@ -89,6 +89,7 @@ async def list_available_plans(_: dict = Depends(verify_token)):
             "agents_included": val["agents"],
             "calls_included": val["included_calls"],
             "portals": val["portals"],
+            "features": val.get("features", []),
         })
 
     addons = []

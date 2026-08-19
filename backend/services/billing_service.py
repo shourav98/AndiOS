@@ -31,29 +31,50 @@ if getattr(settings, "STRIPE_SECRET_KEY", None):
 PLANS_METADATA = {
     "basic": {
         "display_name": "Basic",
-        "tagline": "For a solo agent getting started with AI",
+        "tagline": "For a solo agent getting started with AI.",
         "price_aed": 1400,
         "agents": 1,
         "included_calls": 1000,
         "portals": 1,
+        "features": [
+            "1 AI agent (Andi or Sami)",
+            "1,000 Agent Calls / month",
+            "1 connected portal",
+            "WhatsApp lead replies",
+            "Email support"
+        ],
         "price_id_env": "STRIPE_PRICE_BASIC",
     },
     "grow": {
         "display_name": "Grow",
-        "tagline": "For a growing team across one or two branches",
+        "tagline": "For a growing team across one or two branches.",
         "price_aed": 2800,
         "agents": 3,
         "included_calls": 3000,
         "portals": "All",
+        "features": [
+            "3 AI agents",
+            "3,000 Agent Calls / month",
+            "All portals connected",
+            "Calling campaigns + owner DB",
+            "Priority support"
+        ],
         "price_id_env": "STRIPE_PRICE_GROW",
     },
     "pro": {
         "display_name": "Pro",
-        "tagline": "For a multi-branch agency running at full scale",
+        "tagline": "For a multi-branch agency running at full scale.",
         "price_aed": 5600,
         "agents": 10,
         "included_calls": 8000,
         "portals": "All + multi-branch",
+        "features": [
+            "10 AI agents",
+            "8,000 Agent Calls / month",
+            "All portals + multi-branch",
+            "Advanced reports & exports",
+            "Dedicated success manager"
+        ],
         "price_id_env": "STRIPE_PRICE_PRO",
     },
 }
