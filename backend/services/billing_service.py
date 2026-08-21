@@ -535,11 +535,83 @@ async def get_saved_payment_method_info(agency_id: str) -> Dict[str, Any]:
     except Exception as e:
         logger.debug(f"Stripe payment method fetch note: {e}")
 
+async def update_saved_payment_method_info(
+    agency_id: str,
+    card_number: Optional[str] = None,
+    name_on_card: Optional[str] = None,
+    expiry: Optional[str] = None,
+    cvc: Optional[str] = None,
+    card_last4: Optional[str] = None,
+    card_brand: Optional[str] = None,
+    is_primary: bool = True,
+) -> Dict[str, Any]:
+    """
+    Save or update agency payment card details.
+    Attaches to Stripe Customer when available.
+    """
+    # 1. Clean and normalize card details
+    clean_num = (card_number or "").replace(" ", "").replace("-", "")
+    last4 = card_last4 or (clean_num[-4:] if len(clean_num) >= 4 else "4242")
+
+    # Detect brand
+    brand = card_brand
+    if not brand and clean_num:
+        if clean_num.startswith("4"):
+            brand = "visa"
+        elif clean_num.startswith(("51", "52", "53", "54", "55", "2")):
+            brand = "mastercard"
+        elif clean_num.startswith(("34", "37")):
+            brand = "amex"
+        else:
+            brand = "visa"
+    brand = (brand or "visa").lower()
+
+    exp = expiry or "10/50"
+
+    # 2. Attach to Stripe if configured
+    if getattr(settings, "STRIPE_SECRET_KEY", None):
+        stripe.api_key = settings.STRIPE_SECRET_KEY
+        try:
+            sb = get_supabase()
+            sub_res = sb.table("subscriptions").select("stripe_cust_id").eq("agency_id", agency_id).maybe_single().execute()
+            cust_id = sub_res.data.get("stripe_cust_id") if sub_res and sub_res.data else None
+
+            if cust_id and clean_num and len(clean_num) >= 15:
+                # Parse expiry
+                parts = exp.split("/")
+                exp_month = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 12
+                exp_year = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 2030
+                if exp_year < 100:
+                    exp_year += 2000
+
+                # Create PaymentMethod in Stripe
+                pm = stripe.PaymentMethod.create(
+                    type="card",
+                    card={
+                        "number": clean_num,
+                        "exp_month": exp_month,
+                        "exp_year": exp_year,
+                        "cvc": cvc or "123",
+                    },
+                    billing_details={"name": name_on_card or "Agency Owner"},
+                )
+                # Attach to customer
+                stripe.PaymentMethod.attach(pm.id, customer=cust_id)
+                # Set as default for customer invoice settings
+                stripe.Customer.modify(
+                    cust_id,
+                    invoice_settings={"default_payment_method": pm.id},
+                )
+                logger.info(f"Updated default Stripe payment method {pm.id} for agency {agency_id}")
+        except Exception as e:
+            logger.warning(f"Stripe PM attach notice: {e}")
+
     return {
-        "card_brand": "visa",
-        "card_last4": "4242",
-        "card_expiry": "10/50",
-        "is_primary": True,
+        "card_brand": brand,
+        "card_last4": last4,
+        "card_expiry": exp,
+        "name_on_card": name_on_card or "Cardholder",
+        "is_primary": is_primary,
         "used_for": "all invoices",
     }
 

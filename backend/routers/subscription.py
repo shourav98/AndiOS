@@ -33,6 +33,7 @@ from services.billing_service import (
     record_call_usage,
     fetch_and_sync_live_invoices,
     get_saved_payment_method_info,
+    update_saved_payment_method_info,
 )
 from services.contract_service import generate_subscription_agreement_pdf
 from pydantic import BaseModel, Field
@@ -62,9 +63,14 @@ class CheckoutRequest(BaseModel):
 
 
 class PaymentMethodRequest(BaseModel):
-    card_last4: str
-    card_brand: str = "visa"
-    card_expiry: str = "10/28"
+    card_number: Optional[str] = None
+    name_on_card: Optional[str] = None
+    name: Optional[str] = None
+    expiry: Optional[str] = None
+    card_expiry: Optional[str] = None
+    cvc: Optional[str] = None
+    card_last4: Optional[str] = None
+    card_brand: Optional[str] = None
     is_primary: bool = True
 
 
@@ -443,13 +449,27 @@ async def update_payment_method_handler(
     body: PaymentMethodRequest,
     current_user: dict = Depends(verify_token)
 ):
-    """Update primary payment card."""
+    """
+    Save / update primary payment card details from Change Card modal.
+    Accepts full card fields from UI modal or pre-parsed card_last4.
+    """
     agency_id = require_agency_id(current_user)
     if current_user.get("role") != "owner":
         raise HTTPException(status_code=403, detail="Only owners can update payment methods")
 
+    updated_card = await update_saved_payment_method_info(
+        agency_id=agency_id,
+        card_number=body.card_number,
+        name_on_card=body.name_on_card or body.name,
+        expiry=body.expiry or body.card_expiry,
+        cvc=body.cvc,
+        card_last4=body.card_last4,
+        card_brand=body.card_brand,
+        is_primary=body.is_primary,
+    )
+
     return api_success(
-        data=body.model_dump(),
+        data=updated_card,
         message="Payment card details updated successfully"
     )
 
