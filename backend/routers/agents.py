@@ -201,6 +201,21 @@ async def update_agent(agent_id: UUID, body: AgentUpdate, current_user: dict = D
     update_data = body.model_dump(exclude_none=True)
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
+
+    management = is_management_role(current_user.get("role"))
+    privileged_fields = {"role", "is_active"}
+
+    # Only owners and managers can change roles or activation status
+    if not management and privileged_fields & set(update_data.keys()):
+        raise HTTPException(
+            status_code=403,
+            detail="Only owners and managers can change agent roles or activation status",
+        )
+
+    # Regular agents can only edit their own profile
+    if not management and str(agent_id) != str(current_user.get("agent_id")):
+        raise HTTPException(status_code=403, detail="You can only edit your own profile")
+
     result = sb.table("agents").update(update_data).eq("id", str(agent_id)).eq("agency_id", agency_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Agent not found")

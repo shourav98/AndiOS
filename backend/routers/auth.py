@@ -642,26 +642,25 @@ async def reset_password(
         token = body.candidate_jwt
 
     if token:
-        # Try our custom JWT first (150s reset token or 24h session token)
+        # Single-purpose enforcement: only password-reset tokens may reset passwords.
         try:
             payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
             if payload and payload.get("sub"):
+                if payload.get("purpose") != "password_reset":
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Invalid token for password reset. Request a fresh reset code.",
+                    )
                 user_id = payload["sub"]
                 if not user_email and payload.get("email"):
                     user_email = payload["email"]
+        except HTTPException:
+            raise
         except Exception as e:
             logger.debug(f"JWT decode error on reset-password: {e}")
 
-        # Fallback: try Supabase session token
-        if not user_id:
-            try:
-                user_res = sb.auth.get_user(token)
-                if user_res and user_res.user:
-                    user_id = user_res.user.id
-                    if not user_email:
-                        user_email = user_res.user.email
-            except Exception:
-                pass
+        # NOTE: deliberately no Supabase get_user(token) fallback here — an ordinary
+        # Supabase session/access token must never be able to change a password.
 
     # ── Method 2: Inline 6-digit OTP verification + password reset ────────────────
     # Requires both email AND 6-digit OTP code in body.

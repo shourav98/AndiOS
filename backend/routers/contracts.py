@@ -76,7 +76,15 @@ def list_contracts(current_user: dict = Depends(verify_token)):
 @router.post("/{contract_id}/generate")
 async def generate_contract_pdf(contract_id: str, current_user: dict = Depends(verify_token)):
     """Generates the physical PDF for a contract and uploads to Supabase Storage."""
+    sb = supabase_client.get_supabase()
     require_agency_id(current_user)
+
+    # Tenant ownership check — foreign/non-existent contracts are indistinguishable (404)
+    query = sb.table("contracts").select("id").eq("id", contract_id)
+    result = apply_agency_scope(query, current_user).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
     try:
         url = await generate_tenancy_agreement(contract_id)
         return api_success(data={"url": url}, message="Contract PDF generated and uploaded successfully")
@@ -142,7 +150,15 @@ async def sign_contract(contract_id: str, body: SignRequest):
 @router.post("/{contract_id}/close")
 async def close_contract(contract_id: str, body: CloseContractRequest, current_user: dict = Depends(verify_token)):
     """Close a signed contract by uploading the 5% agency fee cheque."""
+    sb = supabase_client.get_supabase()
     require_agency_id(current_user)
+
+    # Tenant ownership check — foreign/non-existent contracts are indistinguishable (404)
+    query = sb.table("contracts").select("id").eq("id", contract_id)
+    result = apply_agency_scope(query, current_user).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
     try:
         result = await close_contract_with_cheque(contract_id, body.cheque_image_url)
         return api_success(data=result, message="Contract closed successfully — deal won!")

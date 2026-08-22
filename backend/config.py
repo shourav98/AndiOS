@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     WHATSAPP_API_KEY: str = ""
     WHATSAPP_PHONE_NUMBER_ID: str = ""
     WHATSAPP_VERIFY_TOKEN: str = "andios_verify_token"
+    # Shared secret required on INBOUND WhatsApp webhooks (header 'X-Webhook-Token'
+    # or '?token=' query param). Mandatory in production — requests are rejected
+    # without it (fail closed). Configure the callback URL accordingly in 360dialog.
+    WHATSAPP_WEBHOOK_TOKEN: str = ""
     # Twilio (optional)
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""

@@ -53,6 +53,121 @@ def _verify_pf_signature(raw_body: bytes, signature_header: str | None) -> bool:
     return hmac.compare_digest(expected, signature_header)
 
 
+# ─── WhatsApp Inbound Authentication ──────────────────────────────────────────
+
+def _verify_360dialog_request(request: Request) -> bool:
+    """
+    Authenticate inbound 360dialog webhook requests.
+
+    360dialog does not sign webhook deliveries with an HMAC we can key on in
+    this integration, so we require an operator-configured shared secret
+    (WHATSAPP_WEBHOOK_TOKEN) delivered as either the 'X-Webhook-Token' header
+    or a '?token=' query parameter embedded in the callback URL configured in
+    the 360dialog dashboard. Comparison is constant-time.
+
+    Fails closed outside development when the token is unconfigured.
+    """
+    secret = getattr(settings, "WHATSAPP_WEBHOOK_TOKEN", "")
+    provided = request.headers.get("x-webhook-token") or request.query_params.get("token")
+    if not secret:
+        if getattr(settings, "APP_ENV", "development") != "development":
+            logger.critical(
+                "WHATSAPP_WEBHOOK_TOKEN is not configured — rejecting inbound "
+                "WhatsApp webhook (fail closed)"
+            )
+            return False
+        logger.warning(
+            "WHATSAPP_WEBHOOK_TOKEN not set — accepting unauthenticated "
+            "WhatsApp webhook in development only"
+        )
+        return True
+    return bool(provided) and hmac.compare_digest(str(provided), str(secret))
+
+
+def _verify_twilio_request(request: Request, params: dict) -> bool:
+    """
+    Validate X-Twilio-Signature for inbound Twilio webhooks using the account
+    auth token and the exact request URL + POST parameters Twilio signed.
+
+    Fails closed outside development when TWILIO_AUTH_TOKEN is unconfigured.
+    Note: Twilio signs the PUBLIC request URL — reverse proxies must forward
+    the correct scheme/host (X-Forwarded-*) for validation to succeed.
+    """
+    from twilio.request_validator import RequestValidator
+
+    auth_token = (getattr(settings, "TWILIO_AUTH_TOKEN", "") or "").strip()
+    signature = request.headers.get("x-twilio-signature")
+    if not auth_token:
+        if getattr(settings, "APP_ENV", "development") != "development":
+            logger.critical(
+                "TWILIO_AUTH_TOKEN is not configured — rejecting inbound "
+                "WhatsApp webhook (fail closed)"
+            )
+            return False
+        logger.warning(
+            "TWILIO_AUTH_TOKEN not set — accepting unauthenticated Twilio "
+            "webhook in development only"
+        )
+        return True
+    if not signature:
+        return False
+    validator = RequestValidator(auth_token)
+    str_params = {str(k): str(v) for k, v in params.items()}
+    return validator.validate(str(request.url), str_params, signature)
+
+
+# ─── Safe Lead Resolution ─────────────────────────────────────────────────────
+
+def _normalize_phone(phone: str) -> str:
+    """Digits-only normalization for sender/lead comparison."""
+    return "".join(ch for ch in str(phone or "") if ch.isdigit())
+
+
+def _find_lead_by_sender_phone(sb, from_phone: str):
+    """
+    Resolve which stored lead sent an inbound WhatsApp message.
+
+    Matching strategy (safest-first):
+      1. Exact digit-normalized match on the FULL phone number.
+      2. Legacy tolerance only when no exact match exists: a UNIQUE suffix
+         match (handles leads stored without country codes).
+
+    Any ambiguity — multiple exact matches (e.g. the same person is a lead at
+    two agencies) or multiple suffix matches — fails safe: nothing is mutated,
+    no conversation injected, no AI reply triggered.
+    Returns (lead | None, reason) where reason ∈ matched|ambiguous|unknown|invalid.
+    """
+    digits = _normalize_phone(from_phone)
+    if len(digits) < 7:
+        return None, "invalid"
+
+    candidates = (
+        sb.table("leads")
+        .select("*")
+        .ilike("phone", f"%{digits[-9:]}")
+        .execute()
+        .data or []
+    )
+
+    exact = [c for c in candidates if _normalize_phone(c.get("phone")) == digits]
+    pool = exact if exact else [
+        c for c in candidates
+        if _normalize_phone(c.get("phone", "")).endswith(digits[-9:])
+    ]
+
+    if not pool:
+        return None, "unknown"
+    if len(pool) > 1:
+        # Fail safe on cross-tenant / ambiguous collisions. Log enough to
+        # investigate without exposing phone numbers or names.
+        logger.warning(
+            "Ambiguous WhatsApp sender match (phone ending ***%s): %d candidate leads %s — skipping",
+            digits[-3:], len(pool), [c.get("id") for c in pool],
+        )
+        return None, "ambiguous"
+    return pool[0], "matched"
+
+
 # ─── Property Finder Webhook ───────────────────────────────────────────────────
 
 @router.post("/property-finder")
@@ -491,15 +606,23 @@ async def whatsapp_verify(
 async def whatsapp_inbound(request: Request):
     """
     Receives inbound WhatsApp messages.
+    Requests are authenticated per provider before any processing:
+      - Twilio: X-Twilio-Signature validated against URL + POST params
+      - 360dialog: shared-secret token (header or callback-URL query param)
     Routes to AI for qualification, or flags for agent handover.
     """
     sb = get_supabase()
-    # Parse provider-specific format
+
+    # ── Provider authentication — reject forged/unauthenticated requests ──
     if settings.WHATSAPP_PROVIDER == "360dialog":
+        if not _verify_360dialog_request(request):
+            raise HTTPException(status_code=403, detail="Invalid webhook authentication")
         payload = await request.json()
         messages = parse_360dialog_inbound(payload)
     else:
         form = await request.form()
+        if not _verify_twilio_request(request, dict(form)):
+            raise HTTPException(status_code=403, detail="Invalid webhook signature")
         messages = [parse_twilio_inbound(dict(form))]
 
     for msg in messages:
@@ -510,22 +633,13 @@ async def whatsapp_inbound(request: Request):
         if not from_phone or not message_body:
             continue
 
-        # Find lead by phone
-        clean_phone = from_phone.replace("+", "").replace(" ", "")
-        lead_result = (
-            sb.table("leads")
-            .select("*")
-            .ilike("phone", f"%{clean_phone[-9:]}")
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-
-        if not lead_result.data:
-            logger.warning(f"Inbound WhatsApp from unknown number: {from_phone}")
+        # Find lead by sender phone (exact-first, fail-safe on ambiguity)
+        lead, match_reason = _find_lead_by_sender_phone(sb, from_phone)
+        if lead is None:
+            if match_reason in ("unknown", "invalid"):
+                masked = f"***{_normalize_phone(from_phone)[-3:]}" if from_phone else "(empty)"
+                logger.warning(f"Inbound WhatsApp from unmatched number {masked} ({match_reason})")
             continue
-
-        lead = lead_result.data[0]
         lead_id = lead["id"]
 
         # Store inbound message
