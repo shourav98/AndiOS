@@ -339,16 +339,53 @@ async def property_finder_webhook(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─── Portal Webhook Authentication (Bayut / Dubizzle) ─────────────────────────
+
+def _verify_portal_webhook(request: Request, setting_name: str, provider: str) -> bool:
+    """
+    Authenticate inbound portal lead webhooks (Bayut / Dubizzle).
+
+    These portals do not sign webhook deliveries with HMAC in this
+    integration, so an operator-provisioned shared token is required —
+    delivered as the 'X-Webhook-Token' header or a '?token=' query parameter
+    embedded in the callback URL agreed with the portal's integration team.
+    Comparison is constant-time.
+
+    Fails closed outside development when the token is unconfigured.
+    """
+    secret = getattr(settings, setting_name, "")
+    provided = request.headers.get("x-webhook-token") or request.query_params.get("token")
+    if not secret:
+        if getattr(settings, "APP_ENV", "development") != "development":
+            logger.critical(
+                "%s is not configured — rejecting %s webhook (fail closed)",
+                setting_name, provider,
+            )
+            return False
+        logger.warning(
+            "%s not set — accepting unauthenticated %s webhook in development only",
+            setting_name, provider,
+        )
+        return True
+    return bool(provided) and hmac.compare_digest(str(provided), str(secret))
+
+
 # ─── Bayut Webhook ─────────────────────────────────────────────────────────────
 
 @router.post("/bayut")
 async def bayut_webhook(request: Request):
     """
     Receives new lead from Bayut portal.
+    Requests are authenticated via a shared-secret token before any processing.
     Deduplicates, stores lead, triggers AI WhatsApp greeting.
     """
     start_time = time.time()
     sb = get_supabase()
+
+    # ── Authentication — reject forged/unauthenticated requests ──
+    if not _verify_portal_webhook(request, "BAYUT_WEBHOOK_TOKEN", "bayut"):
+        raise HTTPException(status_code=403, detail="Invalid webhook authentication")
+
     payload = await request.json()
 
     # Log raw webhook
@@ -477,10 +514,16 @@ async def bayut_webhook(request: Request):
 async def dubizzle_webhook(request: Request):
     """
     Receives new lead from Dubizzle portal.
+    Requests are authenticated via a shared-secret token before any processing.
     Deduplicates, stores lead, triggers AI WhatsApp greeting.
     """
     start_time = time.time()
     sb = get_supabase()
+
+    # ── Authentication — reject forged/unauthenticated requests ──
+    if not _verify_portal_webhook(request, "DUBIZZLE_WEBHOOK_TOKEN", "dubizzle"):
+        raise HTTPException(status_code=403, detail="Invalid webhook authentication")
+
     payload = await request.json()
 
     # Log raw webhook

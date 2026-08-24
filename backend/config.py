@@ -47,6 +47,14 @@ class Settings(BaseSettings):
     # Property Finder
     PROPERTY_FINDER_WEBHOOK_SECRET: str = ""
 
+    # Portal lead webhooks (Bayut / Dubizzle): shared-secret token required as
+    # 'X-Webhook-Token' header or '?token=' query param embedded in the
+    # callback URL provisioned with each portal's integration team (these
+    # portals do not sign deliveries with HMAC in this integration).
+    # Mandatory in production — rejected without them (fail closed).
+    BAYUT_WEBHOOK_TOKEN: str = ""
+    DUBIZZLE_WEBHOOK_TOKEN: str = ""
+
     # Multi-tenant webhook routing (set in production when multiple agencies exist)
     DEFAULT_AGENCY_ID: str = ""
 
