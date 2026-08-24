@@ -697,3 +697,95 @@ async def test_conversation_send_foreign_lead_blocked_before_provider_call():
             )
     assert e.value.status_code == 403
     mock_send.assert_not_called()                     # provider never touched cross-tenant
+
+# --- INVOICE SUMMARY: global counts regardless of ?status= filter -------------
+
+def _inv(num, status):
+    return {"invoice_number": num, "status": status, "amount": 100, "due_date": "2026-01-01"}
+
+UNPAID_ROWS = [_inv("U1", "unpaid"), _inv("U2", "unpaid"), _inv("U3", "upcoming")]
+PAID_ROWS = [_inv("P1", "paid")]
+ALL_STATUS_ROWS = [{"status": "paid"}] + [{"status": r["status"]} for r in UNPAID_ROWS]
+
+
+async def _run_invoice_list(status, sb, user=None):
+    from routers.subscription import list_invoices
+    with patch.object(settings, "STRIPE_SECRET_KEY", ""), \
+         patch("routers.subscription.get_supabase", return_value=sb), \
+         patch("routers.subscription.require_agency_id", return_value="ag-1"), \
+         patch("routers.subscription.get_saved_payment_method_info", new_callable=AsyncMock) as mock_pm:
+        mock_pm.return_value = {"saved": True, "pm": "sentinel"}
+        return await list_invoices(status=status, refresh=False, current_user=user or OWNER)
+
+
+def _summary_nodes(sb):
+    """A = builder node after the shared agency_id eq (used by BOTH queries):
+      filtered list: A -> eq(status) -> order -> execute
+      global summary: A -> execute
+    """
+    return sb.table.return_value.select.return_value.eq.return_value
+
+
+@pytest.mark.asyncio
+async def test_invoice_summary_global_on_unpaid_filter():
+    sb = _sb()
+    A = _summary_nodes(sb)
+    A.eq.return_value.order.return_value.execute.return_value.data = UNPAID_ROWS  # filtered list
+    A.execute.return_value.data = ALL_STATUS_ROWS                                 # global summary
+
+    result = await _run_invoice_list("unpaid", sb)
+    d = result["data"]
+    assert d["total"] == 3 and len(d["invoices"]) == 3
+    assert all(i["status"] in ("unpaid", "upcoming") for i in d["invoices"])
+    assert d["summary"] == {"paid_count": 1, "unpaid_count": 3}   # GLOBAL, not filtered
+
+
+@pytest.mark.asyncio
+async def test_invoice_summary_global_on_paid_filter():
+    sb = _sb()
+    A = _summary_nodes(sb)
+    A.eq.return_value.order.return_value.execute.return_value.data = PAID_ROWS
+    A.execute.return_value.data = ALL_STATUS_ROWS
+
+    result = await _run_invoice_list("paid", sb)
+    d = result["data"]
+    assert d["total"] == 1 and len(d["invoices"]) == 1
+    assert d["invoices"][0]["status"] == "paid"
+    assert d["summary"] == {"paid_count": 1, "unpaid_count": 3}
+
+
+@pytest.mark.asyncio
+async def test_invoice_summary_matches_full_list_when_unfiltered():
+    sb = _sb()
+    A = _summary_nodes(sb)
+    A.order.return_value.execute.return_value.data = PAID_ROWS + UNPAID_ROWS   # no status eq applied
+    A.execute.return_value.data = ALL_STATUS_ROWS
+
+    result = await _run_invoice_list(None, sb)
+    d = result["data"]
+    assert d["total"] == 4
+    assert d["summary"] == {"paid_count": 1, "unpaid_count": 3}
+
+
+@pytest.mark.asyncio
+async def test_invoice_summary_degrades_to_filtered_counts_on_query_error():
+    sb = _sb()
+    A = _summary_nodes(sb)
+    A.eq.return_value.order.return_value.execute.return_value.data = UNPAID_ROWS
+    A.execute.side_effect = Exception("summary db hiccup")                      # summary query fails
+
+    result = await _run_invoice_list("unpaid", sb)
+    d = result["data"]
+    assert d["total"] == 3
+    assert d["summary"] == {"paid_count": 0, "unpaid_count": 3}  # graceful fallback
+
+
+@pytest.mark.asyncio
+async def test_invoice_payment_method_passthrough_untouched():
+    sb = _sb()
+    A = _summary_nodes(sb)
+    A.order.return_value.execute.return_value.data = []
+    A.execute.return_value.data = []
+
+    result = await _run_invoice_list(None, sb)
+    assert result["data"]["payment_method"] == {"saved": True, "pm": "sentinel"}

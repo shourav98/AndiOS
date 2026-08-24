@@ -394,8 +394,30 @@ async def list_invoices(
         invoices = await fetch_and_sync_live_invoices(agency_id, status)
         # No mock fallback — an agency with no invoices sees an honest empty list
 
-    paid_count = sum(1 for inv in invoices if inv.get("status") == "paid")
-    unpaid_count = sum(1 for inv in invoices if inv.get("status") in ["unpaid", "upcoming"])
+    # Summary counts are GLOBAL for the agency (all invoices), independent of
+    # the requested ?status= filter on the returned list.
+    try:
+        status_rows = (
+            sb.table("invoices")
+            .select("status")
+            .eq("agency_id", agency_id)
+            .execute()
+            .data or []
+        )
+        global_paid = sum(1 for inv in status_rows if inv.get("status") == "paid")
+        global_unpaid = sum(1 for inv in status_rows if inv.get("status") in ["unpaid", "upcoming"])
+    except Exception as e:
+        logger.warning(f"Invoice summary query failed: {e}")
+        # Degrade gracefully to filtered-list counts rather than failing the request
+        global_paid = None
+        global_unpaid = None
+
+    if global_paid is None:
+        paid_count = sum(1 for inv in invoices if inv.get("status") == "paid")
+        unpaid_count = sum(1 for inv in invoices if inv.get("status") in ["unpaid", "upcoming"])
+    else:
+        paid_count = global_paid
+        unpaid_count = global_unpaid
 
 
     pm_info = await get_saved_payment_method_info(agency_id)
