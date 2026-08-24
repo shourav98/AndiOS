@@ -13,6 +13,7 @@ import time
 import hmac
 import hashlib
 from fastapi import APIRouter, Request, HTTPException, Query
+from fastapi.responses import JSONResponse
 from database.supabase_client import get_supabase
 from services.dedup_service import is_duplicate, get_existing_lead_by_phone
 from services.whatsapp_service import (
@@ -22,7 +23,7 @@ from services.whatsapp_service import (
 )
 from services.ai_service import qualify_and_respond, detect_handover, extract_lead_qualifications
 from services.lead_routing_service import resolve_agency_and_agent
-from utils.response import api_success
+from utils.response import api_success, api_error
 from config import settings
 import logging
 
@@ -808,7 +809,20 @@ async def stripe_webhook(request: Request):
     """
     Handles Stripe subscription and invoice lifecycle webhooks.
     Keeps Supabase subscriptions and invoices tables in sync.
+
+    Authentication:
+      - Production (APP_ENV != development): a valid Stripe-Signature is
+        mandatory; STRIPE_WEBHOOK_SECRET must be configured. Missing secret,
+        missing header or invalid signature are rejected with 4xx.
+      - Development: unsigned JSON is accepted ONLY when APP_ENV explicitly
+        indicates development AND no webhook secret is configured
+        (local `stripe listen`-style testing).
+
+    Retry semantics: signature/auth failures return 4xx (Stripe retries);
+    genuine processing failures return 500 without internal details so
+    Stripe retries them; unknown event types are acknowledged with 200.
     """
+    import json as _json
     import stripe
     from services.billing_service import (
         sync_subscription_from_stripe,
@@ -816,29 +830,41 @@ async def stripe_webhook(request: Request):
         _to_dict_safe,
     )
 
+    is_production = getattr(settings, "APP_ENV", "development") != "development"
     payload_bytes = await request.body()
     sig_header = request.headers.get("stripe-signature")
     webhook_secret = getattr(settings, "STRIPE_WEBHOOK_SECRET", "")
 
-    event = None
-    if webhook_secret and sig_header:
-        try:
-            event = stripe.Webhook.construct_event(
-                payload_bytes, sig_header, webhook_secret
+    # ── Authentication / signature verification ────────────────────────────
+    if not webhook_secret:
+        if is_production:
+            logger.critical(
+                "STRIPE_WEBHOOK_SECRET is not configured — rejecting Stripe "
+                "webhook (fail closed)"
             )
-        except stripe.error.SignatureVerificationError as e:
-            logger.warning(f"Stripe signature verification failed: {e}")
-            raise HTTPException(status_code=400, detail="Invalid Stripe signature")
-        except Exception as e:
-            logger.error(f"Error parsing Stripe webhook: {e}")
-            raise HTTPException(status_code=400, detail=str(e))
-    else:
-        # Fallback for dev / unverified payloads
+            raise HTTPException(status_code=400, detail="Stripe webhook is not configured")
+
+        logger.warning(
+            "STRIPE_WEBHOOK_SECRET not set — accepting UNSIGNED Stripe payload "
+            "(development only)"
+        )
         try:
-            import json
-            event = json.loads(payload_bytes.decode("utf-8"))
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+            event = _json.loads(payload_bytes.decode("utf-8"))
+        except Exception:
+            logger.warning("Stripe webhook body is not valid JSON")
+            raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    elif not sig_header:
+        logger.warning("Stripe webhook received without Stripe-Signature header")
+        raise HTTPException(status_code=400, detail="Missing Stripe signature")
+    else:
+        try:
+            event = stripe.Webhook.construct_event(payload_bytes, sig_header, webhook_secret)
+        except stripe.error.SignatureVerificationError:
+            logger.warning("Stripe signature verification failed")
+            raise HTTPException(status_code=400, detail="Invalid Stripe signature")
+        except Exception:
+            logger.error("Error parsing Stripe webhook payload")
+            raise HTTPException(status_code=400, detail="Invalid Stripe payload")
 
     event_dict = _to_dict_safe(event)
     event_type = event_dict.get("type", "")
@@ -864,9 +890,13 @@ async def stripe_webhook(request: Request):
                 await sync_subscription_from_stripe(stripe_sub)
 
         return api_success(data={"received": True, "event": event_type}, message="Stripe webhook processed")
-    except Exception as e:
-        logger.error(f"Error processing Stripe event {event_type}: {e}")
-        # Always return 200 to Stripe so it doesn't repeatedly retry failing webhooks
-        return api_success(data={"status": "error", "error": str(e)}, message="Stripe event handled with errors")
+    except Exception:
+        # Genuine processing failure — do NOT report success. Return 5xx with
+        # no internal details so Stripe retries this delivery with backoff.
+        logger.exception(f"Error processing Stripe event {event_type}")
+        return JSONResponse(
+            status_code=500,
+            content=api_error("Stripe webhook processing failed"),
+        )
 
 
