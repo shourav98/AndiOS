@@ -21,7 +21,7 @@ from services.calendar_service import get_auth_url, exchange_code_for_tokens
 from services.whatsapp_service import send_whatsapp_message
 from middleware.auth_middleware import verify_token
 from utils.response import api_success
-from utils.tenant import require_agency_id, apply_agency_scope
+from utils.tenant import require_agency_id, apply_agency_scope, is_management_role
 from config import settings
 import logging
 
@@ -352,23 +352,35 @@ async def test_google_calendar(current_user: dict = Depends(verify_token)):
         cal = service.calendars().get(calendarId=calendar_id).execute()
         return api_success(data={"calendar_name": cal.get("summary"), "calendar_id": calendar_id}, message="Google Calendar connected")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Calendar test failed: {str(e)}")
+        logger.error(f"Google Calendar test failed: {e}")
+        raise HTTPException(status_code=500, detail="Calendar test failed — check connector credentials")
 
 
 # ─── WhatsApp ─────────────────────────────────────────────────────────────────
 
 @router.post("/whatsapp/test")
-async def test_whatsapp(to_phone: str = Query(...), _: dict = Depends(verify_token)):
-    """Send a test WhatsApp message to verify the connection."""
+async def test_whatsapp(to_phone: str = Query(...), current_user: dict = Depends(verify_token)):
+    """Send a test WhatsApp message to verify the connection. Management only."""
+    if not is_management_role(current_user.get("role")):
+        raise HTTPException(status_code=403, detail="Only owners and managers can test connectors")
+
     result = await send_whatsapp_message(
         to_phone,
         "✅ AndiOS WhatsApp integration is working! This is a test message from your AI assistant."
     )
     if result.get("status") == "error":
-        raise HTTPException(status_code=502, detail=f"WhatsApp test failed: {result.get('error')}")
+        raise HTTPException(status_code=502, detail="WhatsApp test failed — check provider credentials")
 
     sb = get_supabase()
-    sb.table("connectors").update({"is_connected": True, "last_sync": "now()"}).eq("name", "whatsapp").execute()
+    agency_id = require_agency_id(current_user)
+    # Tenant isolation: only update THIS agency's connector row
+    (
+        sb.table("connectors")
+        .update({"is_connected": True, "last_sync": "now()"})
+        .eq("name", "whatsapp")
+        .eq("agency_id", agency_id)
+        .execute()
+    )
 
     return api_success(data={"provider": settings.WHATSAPP_PROVIDER}, message="WhatsApp test message sent")
 

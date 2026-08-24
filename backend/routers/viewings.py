@@ -35,7 +35,10 @@ router = APIRouter(prefix="/viewings", tags=["Viewings"])
 
 
 def _get_calendar_token(sb, agency_id: str) -> tuple[str, dict]:
-    """Get Google Calendar token and calendar ID from connectors table."""
+    """Get Google Calendar token and calendar ID from THIS agency's connector.
+
+    Tenant isolation: never falls back to another agency's connector.
+    """
     connector = (
         sb.table("connectors")
         .select("auth_data")
@@ -45,16 +48,6 @@ def _get_calendar_token(sb, agency_id: str) -> tuple[str, dict]:
         .limit(1)
         .execute()
     )
-    if not connector.data or not connector.data[0].get("auth_data"):
-        # Fallback: legacy global connector (no agency_id)
-        connector = (
-            sb.table("connectors")
-            .select("auth_data")
-            .eq("name", "google_calendar")
-            .eq("is_connected", True)
-            .limit(1)
-            .execute()
-        )
     if not connector.data or not connector.data[0].get("auth_data"):
         raise HTTPException(status_code=400, detail="Google Calendar not connected. Go to Connectors to connect.")
     auth_data = connector.data[0]["auth_data"]
@@ -128,10 +121,18 @@ async def available_slots(
     try:
         calendar_id, token_data = _get_calendar_token(sb, agency_id)
 
-        # Per-agent mode: use agent's calendar
+        # Per-agent mode: use agent's calendar (agent must belong to caller's agency)
         if agent_id:
-            agent = sb.table("agents").select("calendar_id, name").eq("id", str(agent_id)).execute()
-            if agent.data and agent.data[0].get("calendar_id"):
+            agent = (
+                sb.table("agents")
+                .select("calendar_id, name")
+                .eq("id", str(agent_id))
+                .eq("agency_id", agency_id)
+                .execute()
+            )
+            if not agent.data:
+                raise HTTPException(status_code=404, detail="Agent not found in your agency")
+            if agent.data[0].get("calendar_id"):
                 calendar_id = agent.data[0]["calendar_id"]
 
         slots = get_available_slots(token_data, calendar_id, date_from, date_to, duration_minutes)
@@ -140,7 +141,7 @@ async def available_slots(
         raise
     except Exception as e:
         logger.error(f"Error getting slots: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to retrieve available slots")
 
 
 @router.post("", response_model=ApiResponse[ViewingResponse])

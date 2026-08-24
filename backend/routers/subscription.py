@@ -19,6 +19,7 @@ POST   /subscription/payment-method   — update card / redirect to Stripe Custo
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, BackgroundTasks
 from database.supabase_client import get_supabase
 from middleware.auth_middleware import verify_token
+from config import settings
 from utils.response import api_success
 from utils.tenant import require_agency_id, apply_agency_scope
 from services.billing_service import (
@@ -34,6 +35,7 @@ from services.billing_service import (
     fetch_and_sync_live_invoices,
     get_saved_payment_method_info,
     update_saved_payment_method_info,
+    cancel_subscription,
 )
 from services.contract_service import generate_subscription_agreement_pdf
 from pydantic import BaseModel, Field
@@ -72,6 +74,11 @@ class PaymentMethodRequest(BaseModel):
     card_last4: Optional[str] = None
     card_brand: Optional[str] = None
     is_primary: bool = True
+    payment_method_id: Optional[str] = None  # preferred: Stripe.js pm_… token
+
+
+class CancelSubscriptionRequest(BaseModel):
+    at_period_end: bool = True
 
 
 # ─── 1. Plans & Pricing ─────────────────────────────────────────────────────────
@@ -170,7 +177,8 @@ async def get_current_agency_plan(
     vat_amount = round(monthly_subtotal * VAT_RATE, 2)
     total_monthly_aed = round(monthly_subtotal + vat_amount, 2)
 
-    cycle_end = sub_data.get("billing_cycle_end", "2027-01-27T00:00:00Z")
+    cycle_end = sub_data.get("billing_cycle_end")
+    cycle_start = sub_data.get("billing_cycle_start")
     contract_doc_url = f"{str(request.base_url).rstrip('/')}/subscription/contract/pdf"
 
     return api_success(
@@ -194,13 +202,13 @@ async def get_current_agency_plan(
                 "overage_calls": max(0, used_calls - total_quota),
             },
             "contract": {
-                "contract_number": "139350",
+                "contract_number": sub_data.get("stripe_sub_id"),
                 "product": f"{plan_info['display_name']} Plan + Agent Calls",
                 "status": status.capitalize(),
-                "duration_start": "28 Jan, 2026",
-                "duration_end": "27 Jan, 2027",
-                "payment_mode": "Credit/Debit Card",
-                "signed_by": "Sara Al Owais",
+                "duration_start": cycle_start,
+                "duration_end": cycle_end,
+                "payment_mode": "Credit/Debit Card" if getattr(settings, "STRIPE_SECRET_KEY", None) else None,
+                "signed_by": None,
                 "gross_amount_aed": base_price * 12,
                 "discount_percent": 0,
                 "total_amount_aed": total_monthly_aed * 12,
@@ -339,9 +347,11 @@ async def get_customer_portal_url(
     try:
         portal_url = await create_billing_portal_session(agency_id, return_url)
         return api_success(data={"portal_url": portal_url}, message="Stripe customer portal session generated")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Failed to generate portal URL: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to generate billing portal session")
 
 
 # ─── 6. Invoices & Payments History ────────────────────────────────────────────
@@ -382,8 +392,7 @@ async def list_invoices(
     # Fallback to cold-start initial sync if DB table was completely empty
     if not invoices and not refresh:
         invoices = await fetch_and_sync_live_invoices(agency_id, status)
-        if not invoices:
-            invoices = _get_default_mock_invoices(status)
+        # No mock fallback — an agency with no invoices sees an honest empty list
 
     paid_count = sum(1 for inv in invoices if inv.get("status") == "paid")
     unpaid_count = sum(1 for inv in invoices if inv.get("status") in ["unpaid", "upcoming"])
@@ -412,8 +421,12 @@ async def get_single_invoice(
     current_user: dict = Depends(verify_token)
 ):
     """
-    Get detailed breakdown of a single invoice.
+    Get detailed breakdown of a single invoice. Owners/managers only.
     """
+    role = current_user.get("role")
+    if role not in ["owner", "manager", "super_admin"]:
+        raise HTTPException(status_code=403, detail="Only owners and managers can view billing details")
+
     agency_id = require_agency_id(current_user)
     sb = get_supabase()
     try:
@@ -423,10 +436,6 @@ async def get_single_invoice(
     except Exception as e:
         logger.debug(f"Single invoice query note: {e}")
 
-    # Fallback check
-    mock_inv = next((i for i in _get_default_mock_invoices() if i["invoice_number"] == invoice_id), None)
-    if mock_inv:
-        return api_success(data=mock_inv, message="Invoice details retrieved")
     raise HTTPException(status_code=404, detail=f"Invoice '{invoice_id}' not found")
 
 
@@ -434,7 +443,11 @@ async def get_single_invoice(
 
 @router.get("/payment-method")
 async def get_saved_payment_method(current_user: dict = Depends(verify_token)):
-    """Get active payment card summary."""
+    """Get active payment card summary. Owners/managers only."""
+    role = current_user.get("role")
+    if role not in ["owner", "manager", "super_admin"]:
+        raise HTTPException(status_code=403, detail="Only owners and managers can view payment details")
+
     agency_id = require_agency_id(current_user)
     pm_info = await get_saved_payment_method_info(agency_id)
     return api_success(
@@ -457,6 +470,18 @@ async def update_payment_method_handler(
     if current_user.get("role") != "owner":
         raise HTTPException(status_code=403, detail="Only owners can update payment methods")
 
+    # PCI-DSS: raw card numbers are only tolerated for local development.
+    # Production must use Stripe.js tokenization (payment_method_id).
+    if (
+        getattr(settings, "APP_ENV", "development") != "development"
+        and not body.payment_method_id
+        and body.card_number
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Raw card data is not accepted. Use Stripe.js to tokenize the card first.",
+        )
+
     updated_card = await update_saved_payment_method_info(
         agency_id=agency_id,
         card_number=body.card_number,
@@ -466,6 +491,7 @@ async def update_payment_method_handler(
         card_last4=body.card_last4,
         card_brand=body.card_brand,
         is_primary=body.is_primary,
+        payment_method_id=body.payment_method_id,
     )
 
     return api_success(
@@ -479,14 +505,20 @@ async def get_subscription_contract_overview(
     request: Request,
     current_user: dict = Depends(verify_token)
 ):
-    """Subscription screen contract details."""
+    """Subscription screen contract details. Owners/managers only."""
+    role = current_user.get("role")
+    if role not in ["owner", "manager", "super_admin"]:
+        raise HTTPException(status_code=403, detail="Only owners and managers can view contract details")
+
     agency_id = require_agency_id(current_user)
     sb = get_supabase()
     plan_tier = "grow"
+    sub_row = {}
     try:
         sub_res = sb.table("subscriptions").select("*").eq("agency_id", agency_id).maybe_single().execute()
         if sub_res and sub_res.data:
-            plan_tier = sub_res.data.get("plan_tier", "grow")
+            sub_row = sub_res.data
+            plan_tier = sub_row.get("plan_tier", "grow")
         else:
             agency = sb.table("agencies").select("subscription_plan").eq("id", agency_id).maybe_single().execute()
             if agency and agency.data:
@@ -494,28 +526,58 @@ async def get_subscription_contract_overview(
     except Exception as e:
         logger.debug(f"Contract overview note: {e}")
 
-    plan_info = PLANS_METADATA.get(plan_tier.lower(), PLANS_METADATA["grow"])
+    plan_info = PLANS_METADATA.get(str(plan_tier).lower(), PLANS_METADATA["grow"])
     doc_url = f"{str(request.base_url).rstrip('/')}/subscription/contract/pdf"
+
+    # Derive real financials from the active plan — no fabricated constants.
+    gross_annual = float(plan_info["price_aed"]) * 12
+    vat_amount = round(gross_annual * VAT_RATE, 2)
+    duration_start = sub_row.get("billing_cycle_start")
+    duration_end = sub_row.get("billing_cycle_end")
 
     return api_success(
         data={
-            "contract_number": "139350",
+            "contract_number": str(sub_row.get("stripe_sub_id") or "") or None,
             "product": f"{plan_info['display_name']} Plan + Agent Calls",
-            "status": "Active",
-            "duration_start": "28 Jan, 2026",
-            "duration_end": "27 Jan, 2027",
-            "payment_mode": "Credit/Debit Card",
-            "signed_by": "Sara Al Owais",
+            "status": str(sub_row.get("status") or "inactive").title(),
+            "duration_start": duration_start,
+            "duration_end": duration_end,
+            "payment_mode": "Credit/Debit Card" if getattr(settings, "STRIPE_SECRET_KEY", None) else None,
+            "signed_by": None,
             "price_details": {
-                "gross_amount_aed": 33600.00,
-                "vat_5_percent_aed": 1680.00,
+                "gross_amount_aed": gross_annual,
+                "vat_5_percent_aed": vat_amount,
                 "discount_percent": 0,
-                "total_amount_aed": 35280.00,
+                "total_amount_aed": round(gross_annual + vat_amount, 2),
             },
             "document_url": doc_url,
         },
         message="Subscription contract retrieved successfully"
     )
+
+
+@router.post("/cancel")
+async def cancel_subscription_handler(
+    body: CancelSubscriptionRequest,
+    current_user: dict = Depends(verify_token)
+):
+    """
+    Cancel the agency subscription. Owners only.
+    By default cancels at period end (access retained until cycle end).
+    """
+    if current_user.get("role") != "owner":
+        raise HTTPException(status_code=403, detail="Only owners can cancel the subscription")
+
+    agency_id = require_agency_id(current_user)
+    try:
+        result = await cancel_subscription(agency_id, at_period_end=body.at_period_end)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Subscription cancellation failed for {agency_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to cancel subscription")
+
+    return api_success(data=result, message="Subscription cancellation processed")
 
 
 @router.get("/contract/pdf")
@@ -563,48 +625,46 @@ async def download_subscription_contract_pdf(
 
     plan_info = PLANS_METADATA.get(plan_tier.lower(), PLANS_METADATA["grow"])
 
+    # Derive contract values from the real subscription row — no fabricated constants.
+    sub_row = {}
+    if agency_id:
+        try:
+            sub_res = sb.table("subscriptions").select("*").eq("agency_id", agency_id).maybe_single().execute()
+            if sub_res and sub_res.data:
+                sub_row = sub_res.data
+        except Exception as e:
+            logger.debug(f"Contract PDF sub note: {e}")
+
+    gross_annual = float(plan_info["price_aed"]) * 12
+    vat_amount = round(gross_annual * VAT_RATE, 2)
+
     contract_info = {
-        "contract_number": "139350",
+        "contract_number": sub_row.get("stripe_sub_id"),
         "product": f"{plan_info['display_name']} Plan + Agent Calls",
-        "status": "Active",
-        "duration_start": "28 Jan, 2026",
-        "duration_end": "27 Jan, 2027",
-        "payment_mode": "Credit/Debit Card",
-        "signed_by": "Sara Al Owais",
+        "status": str(sub_row.get("status") or "inactive"),
+        "duration_start": sub_row.get("billing_cycle_start"),
+        "duration_end": sub_row.get("billing_cycle_end"),
+        "payment_mode": "Credit/Debit Card" if getattr(settings, "STRIPE_SECRET_KEY", None) else None,
+        "signed_by": None,
         "agency_name": agency_name,
         "price_details": {
-            "gross_amount_aed": 33600.00,
-            "vat_5_percent_aed": 1680.00,
+            "gross_amount_aed": gross_annual,
+            "vat_5_percent_aed": vat_amount,
             "discount_percent": 0,
-            "total_amount_aed": 35280.00,
+            "total_amount_aed": round(gross_annual + vat_amount, 2),
         },
     }
 
     pdf_bytes = generate_subscription_agreement_pdf(contract_info)
+    safe_number = str(contract_info["contract_number"] or "draft").replace("/", "-")
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": "inline; filename=AndiOS_Subscription_Contract_139350.pdf"
+            "Content-Disposition": f"inline; filename=AndiOS_Subscription_Contract_{safe_number}.pdf"
         }
     )
 
 
 
-
-# ─── Mock Fallback Data ────────────────────────────────────────────────────────
-
-def _get_default_mock_invoices(status_filter: Optional[str] = None) -> List[Dict[str, Any]]:
-    invoices = [
-        {"id": "1", "invoice_number": "139350-01", "contract_number": "139350", "frequency": "Monthly", "mode": "Card", "due_date": "2026-01-28", "status": "paid", "amount": 12180.00, "vat_amount": 580.00, "pdf_url": "#"},
-        {"id": "2", "invoice_number": "139350-02", "contract_number": "139350", "frequency": "Monthly", "mode": "Card", "due_date": "2026-02-28", "status": "paid", "amount": 12180.00, "vat_amount": 580.00, "pdf_url": "#"},
-        {"id": "3", "invoice_number": "139350-03", "contract_number": "139350", "frequency": "Monthly", "mode": "Card", "due_date": "2026-03-28", "status": "paid", "amount": 12180.00, "vat_amount": 580.00, "pdf_url": "#"},
-        {"id": "4", "invoice_number": "139350-04", "contract_number": "139350", "frequency": "Monthly", "mode": "Card", "due_date": "2026-04-28", "status": "paid", "amount": 12180.00, "vat_amount": 580.00, "pdf_url": "#"},
-        {"id": "5", "invoice_number": "139350-05", "contract_number": "139350", "frequency": "Monthly", "mode": "Card", "due_date": "2026-05-28", "status": "paid", "amount": 12180.00, "vat_amount": 580.00, "pdf_url": "#"},
-        {"id": "6", "invoice_number": "139350-06", "contract_number": "139350", "frequency": "Monthly", "mode": "Card", "due_date": "2026-06-28", "status": "unpaid", "amount": 12180.00, "vat_amount": 580.00, "pdf_url": "#"},
-        {"id": "7", "invoice_number": "139350-07", "contract_number": "139350", "frequency": "Monthly", "mode": "Card", "due_date": "2026-07-28", "status": "unpaid", "amount": 12180.00, "vat_amount": 580.00, "pdf_url": "#"},
-        {"id": "8", "invoice_number": "139350-08", "contract_number": "139350", "frequency": "Monthly", "mode": "Card", "due_date": "2026-08-28", "status": "unpaid", "amount": 12180.00, "vat_amount": 580.00, "pdf_url": "#"},
-    ]
-    if status_filter:
-        return [inv for inv in invoices if inv["status"] == status_filter.lower()]
-    return invoices
+# Mock invoice fallback data removed — billing surfaces return only real records.

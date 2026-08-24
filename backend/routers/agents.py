@@ -44,7 +44,9 @@ async def list_agents(
     query = sb.table("agents").select("*").eq("agency_id", agency_id).eq("is_active", True)
 
     if search:
-        query = query.or_(f"name.ilike.%{search}%,email.ilike.%{search}%")
+        clean = search.replace(",", "").replace("(", "").replace(")", "").replace("%", "").strip()
+        if clean:
+            query = query.or_(f"name.ilike.%{clean}%,email.ilike.%{clean}%")
     if branch and branch != "All branches":
         query = query.eq("branch", branch)
     if role and role != "All agents":

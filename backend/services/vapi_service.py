@@ -6,6 +6,7 @@ from typing import Optional
 import pytz
 from config import settings
 from database.supabase_client import get_supabase
+from services.billing_service import record_call_usage
 
 logger = logging.getLogger(__name__)
 
@@ -156,16 +157,20 @@ async def run_campaign_batch(campaign_id: str, agency_id: str, batch_size: int =
         }
         sb.table("calls").insert(call_record).execute()
 
+        # Meter billable usage against the agency's plan quota
+        if call_result.get("status") == "initiated":
+            try:
+                await record_call_usage(agency_id)
+            except Exception as usage_err:
+                logger.warning(f"Usage recording failed for agency {agency_id}: {usage_err}")
+
         # Update owner call status
         sb.table("owners").update({"call_status": "Called"}).eq("id", owner["id"]).execute()
 
-    # Update campaign counters
+    # total_owners was set accurately at campaign creation; do not clobber it
+    # with this batch's over-fetched page size.
     total_called = len(called_ids) + len(to_call)
-    sb.table("call_campaigns").update({
-        "total_owners": len(owners),
-    }).eq("id", campaign_id).execute()
-
-    logger.info(f"Campaign {campaign_id}: dialed {len(to_call)} owners (total: {total_called})")
+    logger.info(f"Campaign {campaign_id}: dialed {len(to_call)} owners (total so far: {total_called})")
 
 
 async def process_vapi_webhook(payload: dict) -> dict:

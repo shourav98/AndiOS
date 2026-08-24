@@ -29,9 +29,36 @@ logger = logging.getLogger("andios")
 
 
 # ─── Startup / Shutdown ───────────────────────────────────────────────────────
+
+def _validate_production_config() -> None:
+    """Loudly report production configuration gaps at boot (does not block)."""
+    if settings.APP_ENV == "development":
+        return
+    required = {
+        "FRONTEND_URL": settings.FRONTEND_URL,
+        "STRIPE_SECRET_KEY": settings.STRIPE_SECRET_KEY,
+        "STRIPE_WEBHOOK_SECRET": settings.STRIPE_WEBHOOK_SECRET,
+        "PROPERTY_FINDER_WEBHOOK_SECRET": settings.PROPERTY_FINDER_WEBHOOK_SECRET,
+        "WHATSAPP_WEBHOOK_TOKEN": settings.WHATSAPP_WEBHOOK_TOKEN,
+        "VAPI_WEBHOOK_SECRET": settings.VAPI_WEBHOOK_SECRET,
+        "BAYUT_WEBHOOK_TOKEN": settings.BAYUT_WEBHOOK_TOKEN,
+        "DUBIZZLE_WEBHOOK_TOKEN": settings.DUBIZZLE_WEBHOOK_TOKEN,
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        logger.critical(
+            "PRODUCTION CONFIGURATION INCOMPLETE — missing: %s. "
+            "Related endpoints will reject requests (fail closed).",
+            ", ".join(missing),
+        )
+    if not str(settings.FRONTEND_URL or "").startswith("https://"):
+        logger.critical("FRONTEND_URL should use HTTPS in production (CORS/cookies depend on it).")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 AndiOS Backend starting up...")
+    _validate_production_config()
     scheduler.start()
     logger.info("⏰ Scheduler started")
     yield
@@ -53,14 +80,30 @@ app = FastAPI(
 )
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
+# Production: only the configured FRONTEND_URL is allowed.
+# Development: localhost dev servers are also permitted.
+
+def _cors_allow_origins() -> list[str]:
+    origins = []
+    if settings.FRONTEND_URL:
+        fe = settings.FRONTEND_URL.rstrip("/")
+        origins.append(fe)
+    api = (settings.API_BASE_URL or "").rstrip("/")
+    if api and api.startswith("http"):
+        # same-origin API calls don't need CORS, but harmless to allow
+        pass
+    if settings.APP_ENV == "development":
+        origins += [
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+        ]
+    return list(dict.fromkeys(o for o in origins if o))
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        settings.FRONTEND_URL,
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=_cors_allow_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -168,15 +211,14 @@ async def health():
         sb.table("leads").select("id").limit(1).execute()
         db_status = "connected"
     except Exception as e:
-        db_status = f"error: {str(e)}"
+        logger.error(f"Health check DB error: {e}")
+        db_status = "error"
 
     return api_success(
         data={
             "status": "ok" if db_status == "connected" else "degraded",
             "database": db_status,
             "scheduler": "running" if scheduler.running else "stopped",
-            "whatsapp_provider": settings.WHATSAPP_PROVIDER,
-            "ai_model": settings.OPENAI_MODEL,
         },
         message="Health check completed"
     )

@@ -241,19 +241,37 @@ async def get_dashboard_overview(
     for v in todays_viewings:
         v["agent_name"] = all_agents_map.get(v.get("agent_id"), "Unknown")
 
-    # Funnel and AI Stats
+    # Funnel and AI Stats — computed from real call records (no fabricated data)
     funnel_data = [
         { "name": 'Leads', "count": total_leads, "percentage": 100 },
         { "name": 'Viewings', "count": leads_with_viewings, "percentage": lead_to_viewing_pct },
         { "name": 'Closings', "count": closed_leads, "percentage": close_rate }
     ]
 
+    try:
+        calls_q = sb.table("calls").select("status_value").eq("agency_id", agency_id)
+        if start_date:
+            calls_q = calls_q.gte("call_time", start_date)
+        if end_date:
+            calls_q = calls_q.lte("call_time", f"{end_date}T23:59:59")
+        call_rows = calls_q.execute().data or []
+    except Exception as e:
+        logger.warning(f"Calls stats query failed: {e}")
+        call_rows = []
+
+    outbound_dials = len(call_rows)
+    ANSWERED_VALUES = ("listing-won", "callback-booked", "interested", "not-interested")
+    answered_dials = sum(1 for c in call_rows if c.get("status_value") in ANSWERED_VALUES)
+    listings_won = sum(1 for c in call_rows if c.get("status_value") == "listing-won")
+    answer_rate_pct = round((answered_dials / outbound_dials * 100), 1) if outbound_dials else 0
+    calls_to_listings_pct = round((listings_won / answered_dials * 100), 1) if answered_dials else 0
+
     ai_agent_stats = {
-        "outbound_dials": 1310,
-        "answer_rate": "42%",
-        "calls_to_listings": "6.5%",
-        "conversations": 318,
-        "new_listings_won": 21
+        "outbound_dials": outbound_dials,
+        "answer_rate": f"{answer_rate_pct}%",
+        "calls_to_listings": f"{calls_to_listings_pct}%",
+        "conversations": answered_dials,
+        "new_listings_won": listings_won
     }
 
     return api_success(
@@ -262,10 +280,11 @@ async def get_dashboard_overview(
             "role": role,
             "metrics": {
                 "avg_response_time": {
-                    "value": "1m 12s",
+                    # Not yet measurable (requires message-timestamp analytics) — null, not fabricated
+                    "value": None,
                     "subtext": ai_handled_subtext,
-                    "trend": "down",
-                    "trend_value": "34%"
+                    "trend": None,
+                    "trend_value": None
                 },
                 "lead_to_viewing": {
                     "value": lead_to_viewing_pct,
@@ -302,7 +321,8 @@ async def get_dashboard_overview(
 @router.get("/calling-performance")
 async def get_calling_performance(current_user: dict = Depends(verify_token)):
     """
-    Returns metrics for the Calling Agent Dashboard.
+    Returns metrics for the Calling Agent Dashboard — computed from real call
+    records for the last 7 days. No mock data.
     """
     sb = get_supabase()
     agency_id = current_user.get("agency_id")
@@ -310,22 +330,67 @@ async def get_calling_performance(current_user: dict = Depends(verify_token)):
     if not agency_id:
         raise HTTPException(status_code=400, detail="User not associated with an agency")
 
-    # Mocking real stats for now until the triggers/cron fully populates them
+    week_start = (datetime.utcnow() - timedelta(days=7)).isoformat()
+
+    try:
+        rows = (
+            sb.table("calls")
+            .select("id, owner_name, property_location, status, status_value, duration_seconds, audio_url, call_time")
+            .eq("agency_id", agency_id)
+            .gte("call_time", week_start)
+            .order("call_time", desc=True)
+            .limit(500)
+            .execute()
+            .data or []
+        )
+    except Exception as e:
+        logger.error(f"Calling performance query failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load calling performance")
+
+    total_calls = len(rows)
+    ANSWERED_VALUES = ("listing-won", "callback-booked", "interested", "not-interested")
+    answered_rows = [r for r in rows if r.get("status_value") in ANSWERED_VALUES]
+    answered = len(answered_rows)
+    listings_won = sum(1 for r in rows if r.get("status_value") == "listing-won")
+    callbacks_booked = sum(1 for r in rows if r.get("status_value") == "callback-booked")
+
+    def pct(part: int, whole: int) -> str:
+        return f"{round((part / whole * 100), 1)}%" if whole else "0%"
+
+    def fmt_duration(seconds) -> str:
+        try:
+            s = int(seconds or 0)
+            return f"{s // 60}:{s % 60:02d}"
+        except (TypeError, ValueError):
+            return "0:00"
+
+    recent_calls = [
+        {
+            "id": r.get("id"),
+            "time": (r.get("call_time") or "")[11:16],
+            "hasAudio": bool(r.get("audio_url")),
+            "name": r.get("owner_name") or "Unknown",
+            "role": "Owner",
+            "location": r.get("property_location") or "",
+            "status": r.get("status") or "No answer",
+            "status_value": r.get("status_value") or "no-answer",
+            "duration": fmt_duration(r.get("duration_seconds")),
+        }
+        for r in rows[:5]
+    ]
+
     data = {
-        "callsThisWeek": "1,245",
-        "answerRate": "42%",
-        "callsToListings": "8.5%",
-        "callsToViewings": "12%",
-        "recentCalls": [
-            { "id": 1, "time": "09:12", "hasAudio": True, "name": "Sarah Miller", "role": "Owner", "location": "Marina Gate 2", "status": "Listing won", "status_value": "listing-won", "duration": "4:20" },
-            { "id": 2, "time": "09:05", "hasAudio": True, "name": "Ahmed Al-Farsi", "role": "Tenant", "location": "Downtown Views", "status": "Callback booked", "status_value": "callback-booked", "duration": "2:15" },
-            { "id": 3, "time": "08:58", "hasAudio": True, "name": "Elena Popova", "role": "Owner", "location": "Palm Jumeirah", "status": "Not interested", "status_value": "not-interested", "duration": "1:05" },
-        ],
+        "period_start": week_start,
+        "callsThisWeek": str(total_calls),
+        "answerRate": pct(answered, total_calls),
+        "callsToListings": pct(listings_won, answered),
+        "callsToViewings": pct(callbacks_booked, total_calls),
+        "recentCalls": recent_calls,
         "funnel": [
-            { "name": 'Total Calls', "value": 1245 },
-            { "name": 'Answered', "value": 522 },
-            { "name": 'Interested', "value": 180 },
-            { "name": 'Listings Won', "value": 45 },
+            { "name": 'Total Calls', "value": total_calls },
+            { "name": 'Answered', "value": answered },
+            { "name": 'Interested', "value": sum(1 for r in rows if r.get("status_value") in ("interested", "listing-won", "callback-booked")) },
+            { "name": 'Listings Won', "value": listings_won },
         ]
     }
 

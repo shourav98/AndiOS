@@ -173,39 +173,28 @@ async def get_owner_dashboard(owner_id: UUID, current_user: dict = Depends(verif
         prop = l.get("property_address") or l.get("location_pref") or "Unknown Property"
         if prop not in listings_dict:
             listings_dict[prop] = {
-                "name": prop, 
-                "insight": "Best performer, fast enquiries", # Default mock insight
-                "leads": 0, 
-                "views": 0, 
-                "offers": 0, 
-                "recommendation": "Hold asking price"
+                "name": prop,
+                "leads": 0,
+                "views": 0,
+                "offers": 0,
             }
         listings_dict[prop]["leads"] += 1
-        # Mock offers based on leads
         if l.get("status") == "closed":
             listings_dict[prop]["offers"] += 1
-            
-        # Dynamically adjust insight based on mock logic just to give variety
-        if listings_dict[prop]["leads"] < 5:
-            listings_dict[prop]["insight"] = "Slow on Dubizzle"
-        elif listings_dict[prop]["leads"] < 15:
-            listings_dict[prop]["insight"] = "Viewers want furnished option"
 
     viewing_feedbacks = []
     for v in owner_viewings:
         prop = v.get("property_address") or (v.get("leads") and (v["leads"].get("property_address") or v["leads"].get("location_pref"))) or "Unknown Property"
         if prop not in listings_dict:
             listings_dict[prop] = {
-                "name": prop, 
-                "insight": "Newly listed, gathering interest",
-                "leads": 0, 
-                "views": 0, 
-                "offers": 0, 
-                "recommendation": "Hold asking price"
+                "name": prop,
+                "leads": 0,
+                "views": 0,
+                "offers": 0,
             }
         listings_dict[prop]["views"] += 1
-        
-        # Collect feedbacks
+
+        # Collect real feedback (no rating exists in schema — none is invented)
         if v.get("feedback_received"):
             agent_name = v.get("agents", {}).get("name") if isinstance(v.get("agents"), dict) else "Unknown"
             client_name = v.get("leads", {}).get("name") if isinstance(v.get("leads"), dict) else "Unknown Client"
@@ -213,50 +202,12 @@ async def get_owner_dashboard(owner_id: UUID, current_user: dict = Depends(verif
             viewing_feedbacks.append({
                 "date": dt.strftime("%a %d %b %H:%M"),
                 "property": prop,
-                "rating": 4, # Mock rating since it's not in schema
                 "feedback": v["feedback_received"],
                 "client_name": client_name,
                 "agent": agent_name
             })
-            
-    # Fallback to realistic mock data if completely empty (just for UI demonstration of screenshot)
-    if not owner_leads and not owner_viewings:
-        name_lower = owner.get("name", "").lower()
-        if "khalifa" in name_lower:
-            listings_dict = {
-                "2BR - Dubai Marina": {"name": "2BR - Dubai Marina", "insight": "Strong interest, priced right", "leads": 28, "views": 9, "offers": 2, "recommendation": "Hold asking price"},
-                "Studio - JVC": {"name": "Studio - JVC", "insight": "Layout raised by 3 viewers", "leads": 12, "views": 3, "offers": 0, "recommendation": "Consider -5% to AED 62k"},
-                "1BR - JLT": {"name": "1BR - JLT", "insight": "Good response from Bayut", "leads": 14, "views": 4, "offers": 1, "recommendation": "Hold, review in 7 days"},
-                "2BR - Business Bay": {"name": "2BR - Business Bay", "insight": "Photos underperforming", "leads": 10, "views": 2, "offers": 0, "recommendation": "Refresh listing media"}
-            }
-            viewing_feedbacks = [
-                {"date": "Sat 14 Jun 11:20", "property": "2BR - Dubai Marina", "rating": 5, "feedback": "Loved the view and layout — wants to proceed with an offer.", "client_name": "Hassan M.", "agent": "Aisha R."},
-                {"date": "Sun 15 Jun 16:05", "property": "2BR - Dubai Marina", "rating": 4, "feedback": "Liked it; comparing with a JLT unit before deciding.", "client_name": "Lena K.", "agent": "Aisha R."},
-                {"date": "Mon 16 Jun 13:40", "property": "Studio - JVC", "rating": 3, "feedback": "Kitchen feels small; asked whether the price is negotiable.", "client_name": "Raj P.", "agent": "Daniel F."},
-                {"date": "Wed 18 Jun 10:15", "property": "1BR - JLT", "rating": 4, "feedback": "Good natural light, happy with the building amenities.", "client_name": "Sara M.", "agent": "Omar K."},
-                {"date": "Thu 19 Jun 17:30", "property": "2BR - Business Bay", "rating": 2, "feedback": "Photos looked better than reality; concerned about street noise.", "client_name": "Tom B.", "agent": "Aisha R."}
-            ]
-        elif "mariam" in name_lower:
-            listings_dict = {
-                "Villa - Palm Jumeirah": {"name": "Villa - Palm Jumeirah", "insight": "High value enquiries, serious buyers", "leads": 24, "views": 7, "offers": 2, "recommendation": "Hold asking price"},
-                "3BR - Downtown": {"name": "3BR - Downtown", "insight": "Service charge a concern", "leads": 15, "views": 4, "offers": 0, "recommendation": "Highlight payment plan"}
-            }
-            viewing_feedbacks = [
-                {"date": "Sat 14 Jun 12:00", "property": "Villa - Palm Jumeirah", "rating": 5, "feedback": "Exceptional finishing — submitting an offer this week.", "client_name": "Daniel B.", "agent": "Fatima A."},
-                {"date": "Tue 17 Jun 15:30", "property": "3BR - Downtown", "rating": 3, "feedback": "Loved the location but the service charge feels high.", "client_name": "Mei L.", "agent": "Priya S."}
-            ]
-        else:
-            # Default to Pinnacle
-            listings_dict = {
-                f"Studio - {property_group or 'Dubai Hills'}": {"name": f"Studio - {property_group or 'Dubai Hills'}", "insight": "Best performer, fast enquiries", "leads": 19, "views": 6, "offers": 1, "recommendation": "Hold asking price"},
-                f"3BR - {property_group or 'Dubai Creek'}": {"name": f"3BR - {property_group or 'Dubai Creek'}", "insight": "Viewers want furnished option", "leads": 18, "views": 5, "offers": 0, "recommendation": "Add furnished package"},
-                f"TH - {property_group or 'Dubai Hills'}": {"name": f"TH - {property_group or 'Dubai Hills'}", "insight": "Slow on Dubizzle", "leads": 11, "views": 3, "offers": 0, "recommendation": "Consider -4% reduction"}
-            }
-            viewing_feedbacks = [
-                {"date": "Mon 16 Jun 11:00", "property": f"Studio - {property_group or 'Dubai Hills'}", "rating": 5, "feedback": "Perfect for investment — moving fast on this one.", "client_name": "Yuki T.", "agent": "Daniel F."},
-                {"date": "Wed 18 Jun 14:20", "property": f"3BR - {property_group or 'Dubai Creek'}", "rating": 4, "feedback": "Wants a furnished option; otherwise very interested.", "client_name": "Omar S.", "agent": "Priya S."},
-                {"date": "Fri 20 Jun 10:45", "property": f"TH - {property_group or 'Dubai Hills'}", "rating": 2, "feedback": "Felt overpriced versus nearby townhouses.", "client_name": "Grace L.", "agent": "Fatima A."}
-            ]
+
+    # No fabricated fallback datasets — an owner with no activity sees empty data.
 
     # Overall KPIs
     total_new_leads = sum(l["leads"] for l in listings_dict.values())
@@ -289,46 +240,36 @@ async def get_owner_dashboard(owner_id: UUID, current_user: dict = Depends(verif
         
     listings_subtitle = f"{num_listings} listings · {areas_str} · {date_str}"
 
-    # Generate AI Schedule info
+    # Generate AI Schedule info from real report history (None when never run)
     ai_schedule = {
         "status": "Sent automatically by AI",
-        "last_sent": "Mon 16 Jun 2026 - 08:00",
-        "next_run": "Mon 23 Jun 2026 - 08:00"
+        "last_sent": None,
+        "next_run": None
     }
 
-    # Get latest report from owner_reports for weekly message (fallback to mock)
+    # Latest real report for the agency drives the weekly message
     reports = sb.table("owner_reports").select("*").eq("agency_id", agency_id).order("generated_at", desc=True).limit(1).execute()
     weekly_message = None
     if reports.data:
         rep = reports.data[0]
         dt = datetime.fromisoformat(rep["generated_at"].replace('Z', '+00:00')) if rep.get("generated_at") else datetime.utcnow()
-        reply_dt = dt + timedelta(hours=1, minutes=42)
         weekly_message = {
             "sent_at": dt.strftime("%a %d %b %Y - %H:%M"),
-            "ai_message": rep.get("ai_narrative") or f"Hi {owner['name']}, here is your weekly update...",
-            "owner_reply": "Good progress, thank you. Let's discuss.",
-            "owner_reply_at": reply_dt.strftime("%a %d %b %Y - %H:%M")
+            "ai_message": rep.get("ai_narrative"),
+            "owner_reply": None,  # no owner-reply data is stored yet
+            "owner_reply_at": None
         }
         next_dt = dt + timedelta(days=7)
         ai_schedule["last_sent"] = dt.strftime("%a %d %b %Y - %H:%M")
         ai_schedule["next_run"] = next_dt.strftime("%a %d %b %Y - %H:%M")
     else:
+        # No reports generated yet — honest summary derived from real counts only
         dynamic_ai_msg = f"Hi {owner['name']}, here is your weekly update from AndiOS for {num_listings} listings. This week we generated {total_new_leads} new leads, held {viewings_held} viewings and received {offers_received} offers. Full feedback from each viewing is attached. Reply here any time and your agent will follow up."
-        
-        # Set specific reply text based on owner name to match screenshots exactly
-        name_lower = owner.get("name", "").lower()
-        if "khalifa" in name_lower:
-            reply_text = "Thanks for the update — really helpful to see the viewing feedback. Let's hold the price on the Marina unit for now and revisit the JVC studio next week."
-        elif "mariam" in name_lower:
-            reply_text = "Appreciated. Happy to add the furnished package on the Creek unit if you think it helps. Please go ahead."
-        else:
-            reply_text = "Good progress, thank you. Let's discuss the price reduction on our call."
-            
         weekly_message = {
-            "sent_at": "Mon 16 Jun 2026 - 08:00",
+            "sent_at": end_date.strftime("%a %d %b %Y - %H:%M"),
             "ai_message": dynamic_ai_msg,
-            "owner_reply": reply_text,
-            "owner_reply_at": "Mon 16 Jun 2026 - 09:42"
+            "owner_reply": None,
+            "owner_reply_at": None
         }
 
     response_data = {

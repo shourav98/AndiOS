@@ -9,8 +9,9 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-# Allow OAuth over HTTP for localhost
-os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+# Allow OAuth over HTTP for localhost ONLY in development
+if os.getenv("APP_ENV", "development") == "development":
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
 
 class Settings(BaseSettings):

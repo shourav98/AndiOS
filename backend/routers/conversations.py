@@ -48,7 +48,13 @@ async def agent_send_message(
     result = await send_whatsapp_message(phone, body.message_body)
 
     if result.get("status") == "error":
-        raise HTTPException(status_code=502, detail=f"WhatsApp send failed: {result.get('error')}")
+        raise HTTPException(status_code=502, detail="WhatsApp send failed — check provider credentials")
+
+    # sender_id is derived server-side (never trusted from the client body).
+    # Prefer the authenticated agent's profile id; fall back to the auth user id.
+    sender = body.agent_id
+    if not sender or sender != current_user.get("agent_id"):
+        sender = current_user.get("agent_id") or user_id
 
     # Log to conversations
     conv = sb.table("conversations").insert({
@@ -58,7 +64,7 @@ async def agent_send_message(
         "channel": "whatsapp",
         "message_body": body.message_body,
         "sender_type": "agent",
-        "sender_id": body.agent_id or user_id,
+        "sender_id": sender,
     }).execute()
 
     return api_success(data={"conversation_id": conv.data[0]["id"]}, message="Message sent successfully")

@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/leads", tags=["Leads"])
 
 
-@router.get("", response_model=ApiResponse[list[dict]])
+@router.get("", response_model=ApiResponse[dict])
 async def list_leads(
     status: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
@@ -46,9 +46,32 @@ async def list_leads(
     if is_ai_handling is not None:
         query = query.eq("is_ai_handling", is_ai_handling)
     if search:
-        query = query.or_(f"name.ilike.%{search}%,phone.ilike.%{search}%,email.ilike.%{search}%")
+        # Sanitize: strip characters that alter PostgREST filter syntax
+        clean = search.replace(",", "").replace("(", "").replace(")", "")
+        clean = clean.replace("%", "").replace("\\", "").strip()
+        if clean:
+            query = query.or_(f"name.ilike.%{clean}%,phone.ilike.%{clean}%,email.ilike.%{clean}%")
 
     result = query.range(offset, offset + limit - 1).execute()
+    total = getattr(result, "count", None)
+
+    # Total count for pagination when the client requests it (?include_count=true)
+    if total is None and offset == 0:
+        try:
+            count_query = sb.table("leads").select("id", count="exact")
+            count_query = apply_lead_scope(count_query, current_user)
+            if status:
+                count_query = count_query.eq("status", status)
+            if source:
+                count_query = count_query.eq("source", source)
+            if agent_id:
+                count_query = count_query.eq("assigned_agent_id", str(agent_id))
+            if is_ai_handling is not None:
+                count_query = count_query.eq("is_ai_handling", is_ai_handling)
+            total = count_query.execute().count
+        except Exception as e:
+            logger.warning(f"Lead count query failed: {e}")
+            total = len(result.data)
     
     # Source display name mapping (lowercase DB value → UI display)
     SOURCE_LABELS = {
@@ -112,7 +135,15 @@ async def list_leads(
             "created_at": row.get("created_at"),
         })
 
-    return api_success(data=formatted_leads, message="Leads retrieved successfully")
+    return api_success(
+        data={
+            "leads": formatted_leads,
+            "total": total if total is not None else len(formatted_leads),
+            "limit": limit,
+            "offset": offset,
+        },
+        message="Leads retrieved successfully",
+    )
 
 
 @router.get("/stats", response_model=ApiResponse[LeadStats])

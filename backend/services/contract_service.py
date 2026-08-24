@@ -111,7 +111,8 @@ async def _generate_pdf(contract: dict, lead: dict) -> str:
 
         c.save()
 
-        # Upload to Supabase Storage
+        # Upload to Supabase Storage (PRIVATE bucket access via signed URL —
+        # contracts contain Emirates ID / passport / phone data)
         sb = supabase_client.get_supabase()
         try:
             with open(filepath, "rb") as f:
@@ -122,12 +123,17 @@ async def _generate_pdf(contract: dict, lead: dict) -> str:
                 file=file_bytes,
                 file_options={"content-type": "application/pdf"},
             )
-            pdf_url = sb.storage.from_(SUPABASE_STORAGE_BUCKET).get_public_url(storage_path)
-            logger.info(f"PDF uploaded to Supabase Storage: {pdf_url}")
+            # 7-day signed URL matches e-sign token expiry; no public access
+            signed = sb.storage.from_(SUPABASE_STORAGE_BUCKET).create_signed_url(storage_path, 60 * 60 * 24 * 7)
+            signed_path = signed.get("signedURL") or signed.get("signed_url") if isinstance(signed, dict) else None
+            if not signed_path:
+                raise RuntimeError(f"Signing failed: {signed}")
+            pdf_url = signed_path if str(signed_path).startswith("http") else f"{settings.SUPABASE_URL}/storage/v1{signed_path}"
+            logger.info(f"PDF uploaded to Supabase Storage (signed URL): {pdf_url[:80]}...")
             return pdf_url
         except Exception as storage_err:
-            logger.warning(f"Supabase Storage upload failed, using local path: {storage_err}")
-            return f"{settings.API_BASE_URL}/static/{filename}"
+            logger.error(f"Supabase Storage upload/signing failed: {storage_err}")
+            raise RuntimeError("Failed to store generated contract document")
     finally:
         # Clean up local file
         if os.path.exists(filepath):
@@ -365,37 +371,42 @@ def generate_subscription_agreement_pdf(contract_info: dict) -> bytes:
         c.line(2 * cm, y - 0.15 * cm, width - 2 * cm, y - 0.15 * cm)
         y -= line_height
 
-    def draw_row(label: str, value: str):
+    def draw_row(label: str, value):
         nonlocal y
         c.setFillColor(colors.HexColor("#64748B"))
         c.setFont("Helvetica", 10)
         c.drawString(2 * cm, y, label)
         c.setFillColor(colors.HexColor("#0F172A"))
         c.setFont("Helvetica-Bold", 10)
-        c.drawString(8 * cm, y, str(value))
+        # Render missing real data as an em-dash — never fabricate values
+        text = "—" if value in (None, "") else str(value)
+        c.drawString(8 * cm, y, text)
         y -= line_height
 
     # Section 1: Agreement Details
     draw_section_heading("1. SUBSCRIPTION CONTRACT DETAILS")
-    draw_row("Contract Number:", contract_info.get("contract_number", "139350"))
+    draw_row("Contract Number:", contract_info.get("contract_number"))
     draw_row("Product & Tier:", contract_info.get("product", "Grow Plan + Agent Calls"))
-    draw_row("Subscription Status:", contract_info.get("status", "Active"))
-    draw_row("Contract Period:", f"{contract_info.get('duration_start', '28 Jan, 2026')} — {contract_info.get('duration_end', '27 Jan, 2027')}")
-    draw_row("Payment Method:", contract_info.get("payment_mode", "Credit/Debit Card"))
+    draw_row("Subscription Status:", contract_info.get("status"))
+    draw_row("Contract Period:", f"{contract_info.get('duration_start') or '—'} — {contract_info.get('duration_end') or '—'}")
+    draw_row("Payment Method:", contract_info.get("payment_mode"))
 
     # Section 2: Financial Terms
     draw_section_heading("2. PRICING & TAX INVOICE TERMS (AED)")
-    price = contract_info.get("price_details", {})
-    draw_row("Gross Annual Fee (Excl. VAT):", f"AED {price.get('gross_amount_aed', 33600):,.2f}")
-    draw_row("UAE Value Added Tax (VAT 5%):", f"AED {price.get('vat_5_percent_aed', 1680):,.2f}")
+    price = contract_info.get("price_details") or {}
+    gross = price.get("gross_amount_aed")
+    vat = price.get("vat_5_percent_aed")
+    total = price.get("total_amount_aed")
+    draw_row("Gross Annual Fee (Excl. VAT):", f"AED {gross:,.2f}" if gross is not None else "—")
+    draw_row("UAE Value Added Tax (VAT 5%):", f"AED {vat:,.2f}" if vat is not None else "—")
     draw_row("Discount Applied:", f"{price.get('discount_percent', 0)}%")
-    draw_row("Total Annual Contract Value:", f"AED {price.get('total_amount_aed', 35280):,.2f}")
+    draw_row("Total Annual Contract Value:", f"AED {total:,.2f}" if total is not None else "—")
 
     # Section 3: Signatures
     draw_section_heading("3. AUTHORIZED SIGNATURES & LEGAL COMPLIANCE")
-    draw_row("Customer Legal Entity:", contract_info.get("agency_name", "Registered Real Estate Agency"))
-    draw_row("Authorized Signatory:", contract_info.get("signed_by", "Sara Al Owais"))
-    draw_row("Digital Signature Date:", contract_info.get("duration_start", "28 Jan, 2026"))
+    draw_row("Customer Legal Entity:", contract_info.get("agency_name"))
+    draw_row("Authorized Signatory:", contract_info.get("signed_by"))
+    draw_row("Digital Signature Date:", contract_info.get("duration_start"))
     draw_row("Provider Entity:", "AndiOS Real Estate Technologies FZ-LLC, Dubai, UAE")
 
     # Footer
