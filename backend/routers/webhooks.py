@@ -36,14 +36,28 @@ router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 def _verify_pf_signature(raw_body: bytes, signature_header: str | None) -> bool:
     """
     Verify Property Finder webhook HMAC-SHA256 signature.
-    Header format: 'sha256=<hex_digest>'
-    Returns True if valid or if in dev mode / no secret configured.
+    Header format: 'sha256=<hex_digest>' over the raw request body.
+
+    A configured PROPERTY_FINDER_WEBHOOK_SECRET always enforces strict
+    verification — regardless of APP_ENV — so a mis-set APP_ENV=development
+    can never disable signature checking when a secret exists.
+    Without a secret, unverified requests are tolerated ONLY in explicit
+    development; production fails closed.
     """
-    if getattr(settings, "APP_ENV", "development") == "development":
-        return True
     secret = getattr(settings, "PROPERTY_FINDER_WEBHOOK_SECRET", "")
     if not secret:
+        if getattr(settings, "APP_ENV", "development") != "development":
+            logger.critical(
+                "PROPERTY_FINDER_WEBHOOK_SECRET is not configured — rejecting "
+                "Property Finder webhook (fail closed)"
+            )
+            return False
+        logger.warning(
+            "PROPERTY_FINDER_WEBHOOK_SECRET not set — accepting UNVERIFIED "
+            "Property Finder webhook (development only)"
+        )
         return True
+
     if not signature_header:
         return False
     expected = "sha256=" + hmac.new(
