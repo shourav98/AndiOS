@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     VAPI_API_KEY: str = ""
     VAPI_PHONE_NUMBER_ID: str = ""
     VAPI_ASSISTANT_ID: str = ""
+    # Shared secret Vapi sends as the 'x-vapi-secret' header on server webhooks
+    # (configure as server.secret in the Vapi dashboard). Mandatory in
+    # production — inbound Vapi webhooks are rejected without it (fail closed).
+    VAPI_WEBHOOK_SECRET: str = ""
 
     # Supabase Storage
     SUPABASE_STORAGE_BUCKET: str = "contracts"

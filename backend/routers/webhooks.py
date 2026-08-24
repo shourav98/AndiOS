@@ -798,22 +798,56 @@ async def whatsapp_inbound(request: Request):
 
 # ─── Vapi AI Caller Webhook ────────────────────────────────────────────────────
 
+def _verify_vapi_request(request: Request) -> bool:
+    """
+    Authenticate inbound Vapi server-message webhooks.
+
+    Vapi's supported mechanism is a shared secret: configure server.secret in
+    the Vapi dashboard and Vapi sends it as the 'x-vapi-secret' header on every
+    webhook request. Comparison is constant-time. (Vapi does not sign payloads
+    with an HMAC/timestamp — no such check is attempted.)
+
+    Fails closed outside development when the secret is unconfigured.
+    """
+    secret = getattr(settings, "VAPI_WEBHOOK_SECRET", "")
+    provided = request.headers.get("x-vapi-secret")
+    if not secret:
+        if getattr(settings, "APP_ENV", "development") != "development":
+            logger.critical(
+                "VAPI_WEBHOOK_SECRET is not configured — rejecting Vapi "
+                "webhook (fail closed)"
+            )
+            return False
+        logger.warning(
+            "VAPI_WEBHOOK_SECRET not set — accepting unauthenticated Vapi "
+            "webhook in development only"
+        )
+        return True
+    return bool(provided) and hmac.compare_digest(str(provided), str(secret))
+
+
 @router.post("/vapi")
 async def vapi_webhook(request: Request):
     """
     Receives call result callbacks from Vapi.ai.
-    Stores transcript, recording URL, duration, and outcome.
+    Requests are authenticated via the x-vapi-secret shared secret before any
+    processing. Stores transcript, recording URL, duration, and outcome.
     Auto-flags DNC owners and schedules retries for voicemail/no-answer.
     """
+    # ── Authentication — reject forged/unauthenticated requests ──
+    if not _verify_vapi_request(request):
+        raise HTTPException(status_code=403, detail="Invalid webhook authentication")
+
     try:
         payload = await request.json()
         from services.vapi_service import process_vapi_webhook
         result = await process_vapi_webhook(payload)
         return api_success(data=result, message="Vapi webhook processed")
-    except Exception as e:
-        logger.error(f"Vapi webhook error: {e}")
-        # Vapi expects 200 OK — don't raise HTTP errors
-        return api_success(data={"status": "error", "detail": str(e)}, message="Vapi webhook error")
+    except Exception:
+        logger.exception("Vapi webhook processing error")
+        # Keep the established 200-OK contract for delivery, but never expose
+        # internal exception details to the caller.
+        return api_success(data={"status": "error"}, message="Vapi webhook error")
 
 
 # ─── Stripe Billing Webhook ───────────────────────────────────────────────────
