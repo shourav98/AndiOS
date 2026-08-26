@@ -82,7 +82,7 @@ async def generate_contract_pdf(contract_id: str, current_user: dict = Depends(v
     sb = supabase_client.get_supabase()
     require_agency_id(current_user)
 
-    # Tenant ownership check â€” foreign/non-existent contracts are indistinguishable (404)
+    # Tenant ownership check — foreign/non-existent contracts are indistinguishable (404)
     query = sb.table("contracts").select("id").eq("id", contract_id)
     result = apply_agency_scope(query, current_user).execute()
     if not result.data:
@@ -91,9 +91,11 @@ async def generate_contract_pdf(contract_id: str, current_user: dict = Depends(v
     try:
         url = await generate_tenancy_agreement(contract_id)
         return api_success(data={"url": url}, message="Contract PDF generated and uploaded successfully")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"PDF generation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Contract PDF generation failed")
 
 
 @router.get("/{contract_id}")
@@ -103,12 +105,14 @@ def get_contract(contract_id: str, current_user: dict = Depends(verify_token)):
     require_agency_id(current_user)
 
     query = sb.table("contracts").select("*").eq("id", contract_id)
-    result = apply_agency_scope(query, current_user).single().execute()
+    res = apply_agency_scope(query, current_user).maybe_single().execute()
+    # maybe_single().execute() returns the row dict, or None when 0 rows
+    data = res.data if (res and hasattr(res, "data")) else res
 
-    if not result.data:
+    if not data:
         raise HTTPException(status_code=404, detail="Contract not found")
 
-    return api_success(data=result.data, message="Contract retrieved successfully")
+    return api_success(data=data, message="Contract retrieved successfully")
 
 
 @router.post("/{contract_id}/send-esign")
@@ -118,12 +122,13 @@ async def send_contract_esign(contract_id: str, current_user: dict = Depends(ver
     sb = supabase_client.get_supabase()
 
     query = sb.table("contracts").select("status, document_url").eq("id", contract_id)
-    result = apply_agency_scope(query, current_user).single().execute()
-    if not result.data:
+    res = apply_agency_scope(query, current_user).maybe_single().execute()
+    contract_row = res.data if (res and hasattr(res, "data")) else res
+    if not contract_row:
         raise HTTPException(status_code=404, detail="Contract not found")
 
     # Generate PDF first if not yet generated
-    if not result.data.get("document_url"):
+    if not contract_row.get("document_url"):
         await generate_tenancy_agreement(contract_id)
 
     try:
@@ -137,7 +142,7 @@ async def send_contract_esign(contract_id: str, current_user: dict = Depends(ver
 @router.post("/{contract_id}/sign")
 async def sign_contract(contract_id: str, body: SignRequest):
     """
-    Public endpoint â€” landlord or tenant signs the contract using their unique token.
+    Public endpoint — landlord or tenant signs the contract using their unique token.
     No auth required (token-based verification).
     """
     try:
@@ -156,7 +161,7 @@ async def close_contract(contract_id: str, body: CloseContractRequest, current_u
     sb = supabase_client.get_supabase()
     require_agency_id(current_user)
 
-    # Tenant ownership check â€” foreign/non-existent contracts are indistinguishable (404)
+    # Tenant ownership check — foreign/non-existent contracts are indistinguishable (404)
     query = sb.table("contracts").select("id").eq("id", contract_id)
     result = apply_agency_scope(query, current_user).execute()
     if not result.data:
@@ -164,7 +169,7 @@ async def close_contract(contract_id: str, body: CloseContractRequest, current_u
 
     try:
         result = await close_contract_with_cheque(contract_id, body.cheque_image_url)
-        return api_success(data=result, message="Contract closed successfully â€” deal won!")
+        return api_success(data=result, message="Contract closed successfully — deal won!")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
