@@ -262,8 +262,12 @@ async def verify_and_record_signature(contract_id: str, token: str, role: str) -
 
     # Check expiry
     expires_at = contract.get("sign_token_expires_at")
-    if expires_at and datetime.fromisoformat(expires_at) < datetime.utcnow():
-        raise ValueError("Signature link has expired")
+    if expires_at:
+        exp_dt = datetime.fromisoformat(expires_at)
+        # Compare like-for-like: DB values are offset-aware, utcnow() is naive
+        now_utc = datetime.utcnow().replace(tzinfo=exp_dt.tzinfo) if exp_dt.tzinfo else datetime.utcnow()
+        if exp_dt < now_utc:
+            raise ValueError("Signature link has expired")
 
     # Verify token
     if role == "landlord":
