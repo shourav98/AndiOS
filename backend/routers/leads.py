@@ -1,10 +1,10 @@
 """
 Leads Router
-GET    /leads                  — list leads with filters
-GET    /leads/stats            — overview stats
-GET    /leads/{id}             — single lead + conversation
-PATCH  /leads/{id}             — update lead
-POST   /leads/{id}/handover    — trigger AI→agent handover
+GET    /leads                  â€” list leads with filters
+GET    /leads/stats            â€” overview stats
+GET    /leads/{id}             â€” single lead + conversation
+PATCH  /leads/{id}             â€” update lead
+POST   /leads/{id}/handover    â€” trigger AIâ†’agent handover
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional
@@ -73,7 +73,7 @@ async def list_leads(
             logger.warning(f"Lead count query failed: {e}")
             total = len(result.data)
     
-    # Source display name mapping (lowercase DB value → UI display)
+    # Source display name mapping (lowercase DB value â†’ UI display)
     SOURCE_LABELS = {
         "property_finder": "Property Finder",
         "whatsapp": "WhatsApp",
@@ -106,7 +106,7 @@ async def list_leads(
         elif budget >= 1_000:
             amount_str = f"AED {int(budget / 1_000)}k"
         else:
-            amount_str = f"AED {int(budget):,}" if budget else "—"
+            amount_str = f"AED {int(budget):,}" if budget else "â€”"
         if purpose == "rent" and budget:
             amount_str += "/yr"
 
@@ -235,7 +235,7 @@ async def update_lead(lead_id: UUID, body: LeadUpdate, current_user: dict = Depe
     if not result.data:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    # ── Smart AI Restore: if re-enabling AI handling, reset status from 'handover' ──
+    # â”€â”€ Smart AI Restore: if re-enabling AI handling, reset status from 'handover' â”€â”€
     lead = result.data[0]
     if update_data.get("is_ai_handling") is True and lead.get("status") == "handover":
         restore_result = sb.table("leads").update({
@@ -293,7 +293,9 @@ async def create_lead(lead: LeadCreate, current_user: dict = Depends(verify_toke
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
 
-    lead_data = lead.dict(exclude_unset=True)
+    # mode="json": serialize UUID/datetime/enum fields to JSON-safe values
+    # (raw UUID objects are not JSON-serializable for the PostgREST payload)
+    lead_data = lead.model_dump(mode="json", exclude_unset=True)
     lead_data["agency_id"] = agency_id
     
     # Handle the status parameter if passed in the payload for testing, otherwise default to new
