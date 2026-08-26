@@ -1,10 +1,10 @@
 """
 Leads Router
-GET    /leads                  â€” list leads with filters
-GET    /leads/stats            â€” overview stats
-GET    /leads/{id}             â€” single lead + conversation
-PATCH  /leads/{id}             â€” update lead
-POST   /leads/{id}/handover    â€” trigger AIâ†’agent handover
+GET    /leads                  — list leads with filters
+GET    /leads/stats            — overview stats
+GET    /leads/{id}             — single lead + conversation
+PATCH  /leads/{id}             — update lead
+POST   /leads/{id}/handover    — trigger AI→agent handover
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional
@@ -34,46 +34,49 @@ async def list_leads(
     """List all leads with optional filters. Used by the Leads dashboard page."""
     sb = get_supabase()
     current_user = _
-    query = sb.table("leads").select("*, agents(name)").order("created_at", desc=True)
-    query = apply_lead_scope(query, current_user)
+    # Single source of truth: the data query and the count query MUST apply
+    # identical filters (search included) or total and results diverge.
+    SEARCHABLE_FIELDS = (
+        "name", "phone", "email", "external_lead_id",
+        "property_ref", "property_address", "location_pref",
+    )
 
-    if status:
-        query = query.eq("status", status)
-    if source:
-        query = query.eq("source", source)
-    if agent_id:
-        query = query.eq("assigned_agent_id", str(agent_id))
-    if is_ai_handling is not None:
-        query = query.eq("is_ai_handling", is_ai_handling)
-    if search:
-        # Sanitize: strip characters that alter PostgREST filter syntax
-        clean = search.replace(",", "").replace("(", "").replace(")", "")
-        clean = clean.replace("%", "").replace("\\", "").strip()
-        if clean:
-            query = query.or_(f"name.ilike.%{clean}%,phone.ilike.%{clean}%,email.ilike.%{clean}%")
+    def _apply_filters(q):
+        q = apply_lead_scope(q, current_user)          # agency + agent scoping
+        if status:
+            q = q.eq("status", status)
+        if source:
+            q = q.eq("source", source)
+        if agent_id:
+            q = q.eq("assigned_agent_id", str(agent_id))
+        if is_ai_handling is not None:
+            q = q.eq("is_ai_handling", is_ai_handling)
+        if search:
+            # Sanitize characters that alter PostgREST or_= syntax
+            clean = search.replace(",", "").replace("(", "").replace(")", "")
+            clean = clean.replace("%", "").replace("\\", "").strip()
+            if clean:
+                conds = ",".join(f"{f}.ilike.%{clean}%" for f in SEARCHABLE_FIELDS)
+                q = q.or_(conds)
+        return q
 
-    result = query.range(offset, offset + limit - 1).execute()
+    result = (
+        _apply_filters(sb.table("leads").select("*, agents(name)"))
+        .order("created_at", desc=True)
+        .range(offset, offset + limit - 1)
+        .execute()
+    )
     total = getattr(result, "count", None)
 
-    # Total count for pagination when the client requests it (?include_count=true)
+    # Exact total for pagination — same filters as the data query
     if total is None and offset == 0:
         try:
-            count_query = sb.table("leads").select("id", count="exact")
-            count_query = apply_lead_scope(count_query, current_user)
-            if status:
-                count_query = count_query.eq("status", status)
-            if source:
-                count_query = count_query.eq("source", source)
-            if agent_id:
-                count_query = count_query.eq("assigned_agent_id", str(agent_id))
-            if is_ai_handling is not None:
-                count_query = count_query.eq("is_ai_handling", is_ai_handling)
-            total = count_query.execute().count
+            total = _apply_filters(sb.table("leads").select("id", count="exact")).execute().count
         except Exception as e:
             logger.warning(f"Lead count query failed: {e}")
             total = len(result.data)
     
-    # Source display name mapping (lowercase DB value â†’ UI display)
+    # Source display name mapping (lowercase DB value → UI display)
     SOURCE_LABELS = {
         "property_finder": "Property Finder",
         "whatsapp": "WhatsApp",
@@ -106,7 +109,7 @@ async def list_leads(
         elif budget >= 1_000:
             amount_str = f"AED {int(budget / 1_000)}k"
         else:
-            amount_str = f"AED {int(budget):,}" if budget else "â€”"
+            amount_str = f"AED {int(budget):,}" if budget else "—"
         if purpose == "rent" and budget:
             amount_str += "/yr"
 
@@ -235,7 +238,7 @@ async def update_lead(lead_id: UUID, body: LeadUpdate, current_user: dict = Depe
     if not result.data:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    # â”€â”€ Smart AI Restore: if re-enabling AI handling, reset status from 'handover' â”€â”€
+    # ── Smart AI Restore: if re-enabling AI handling, reset status from 'handover' ──
     lead = result.data[0]
     if update_data.get("is_ai_handling") is True and lead.get("status") == "handover":
         restore_result = sb.table("leads").update({
@@ -312,7 +315,7 @@ async def create_lead(lead: LeadCreate, current_user: dict = Depends(verify_toke
                 status_code=400,
                 detail="assigned_agent_id does not belong to your agency",
             )
-    
+
     # Handle the status parameter if passed in the payload for testing, otherwise default to new
     if "status" not in lead_data:
         lead_data["status"] = "new"
