@@ -1,5 +1,5 @@
 """
-Dashboard Router â€” Role-based overview API for Agents and Owners
+Dashboard Router — Role-based overview API for Agents and Owners
 GET /dashboard/overview
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -46,6 +46,43 @@ async def get_dashboard_overview(
     role = agent.get("role")
     is_owner = role == "owner"
 
+    # ── B-5: Branch filter ────────────────────────────────────────────────────
+    # branch_id → agents in THIS agency's branch → their leads/viewings/contracts.
+    # Scoped to the caller's agency: a foreign branch_id resolves to zero agents.
+    branch_agent_ids = None
+    if branch_id:
+        branch_rows = (
+            sb.table("agents")
+            .select("id")
+            .eq("agency_id", agency_id)
+            .eq("branch", branch_id)
+            .execute()
+            .data or []
+        )
+        branch_agent_ids = [a["id"] for a in branch_rows]
+
+    effective_agent_id = agent_id
+    if branch_agent_ids is not None:
+        if effective_agent_id:
+            if effective_agent_id not in branch_agent_ids:
+                # Agent exists but sits outside the requested branch → nothing matches
+                branch_agent_ids = []
+                effective_agent_id = None   # fall through to emptied in_() sentinel
+        else:
+            effective_agent_id = None       # branch list governs
+
+    NULL_UUID = "00000000-0000-0000-0000-000000000000"
+
+    def _scoped(q, column: str):
+        """Apply agent/branch narrowing to a query builder (owner-side)."""
+        if not is_owner:
+            return q.eq(column, current_agent_id)
+        if effective_agent_id:
+            return q.eq(column, effective_agent_id)
+        if branch_agent_ids is not None:
+            return q.in_(column, branch_agent_ids or [NULL_UUID])
+        return q
+
     now = datetime.utcnow()
 
     # Date calculations based on timeframe
@@ -88,61 +125,57 @@ async def get_dashboard_overview(
             pass
 
     # 2. Query Leads (Current Period)
-    leads_query = sb.table("leads").select("*").eq("agency_id", agency_id)
-    if not is_owner:
-        leads_query = leads_query.eq("assigned_agent_id", current_agent_id)
-    elif agent_id:
-        leads_query = leads_query.eq("assigned_agent_id", agent_id)
-        
+    leads_query = _scoped(
+        sb.table("leads").select("*").eq("agency_id", agency_id),
+        "assigned_agent_id",
+    )
     if platform:
         leads_query = leads_query.ilike("source", f"%{platform}%")
     if start_date:
         leads_query = leads_query.gte("created_at", start_date)
     if end_date:
         leads_query = leads_query.lte("created_at", end_date)
-        
+
     leads = leads_query.execute().data
 
     # 3. Query Viewings (Current Period)
-    viewings_query = sb.table("viewings").select("*").eq("agency_id", agency_id)
-    if not is_owner:
-        viewings_query = viewings_query.eq("agent_id", current_agent_id)
-    elif agent_id:
-        viewings_query = viewings_query.eq("agent_id", agent_id)
-        
+    viewings_query = _scoped(
+        sb.table("viewings").select("*, leads(name, source)").eq("agency_id", agency_id),
+        "agent_id",
+    )
     if start_date:
         viewings_query = viewings_query.gte("viewing_datetime", start_date)
     if end_date:
         viewings_query = viewings_query.lte("viewing_datetime", end_date)
-        
+
     viewings = viewings_query.execute().data
 
     # 4. Query Contracts (Current Period)
-    contracts_query = sb.table("contracts").select("*").eq("agency_id", agency_id)
-    if not is_owner:
-        contracts_query = contracts_query.eq("agent_id", current_agent_id)
-    elif agent_id:
-        contracts_query = contracts_query.eq("agent_id", agent_id)
-        
+    contracts_query = _scoped(
+        sb.table("contracts").select("*").eq("agency_id", agency_id),
+        "agent_id",
+    )
     if start_date:
         contracts_query = contracts_query.gte("created_at", start_date)
     if end_date:
         contracts_query = contracts_query.lte("created_at", end_date)
-        
+
     contracts = contracts_query.execute().data
-    
+
     # 5. Query Previous Period
     if prev_start_date and prev_end_date:
-        prev_leads_q = sb.table("leads").select("*").eq("agency_id", agency_id)
-        if not is_owner: prev_leads_q = prev_leads_q.eq("assigned_agent_id", current_agent_id)
-        elif agent_id: prev_leads_q = prev_leads_q.eq("assigned_agent_id", agent_id)
+        prev_leads_q = _scoped(
+            sb.table("leads").select("*").eq("agency_id", agency_id),
+            "assigned_agent_id",
+        )
         if platform: prev_leads_q = prev_leads_q.ilike("source", f"%{platform}%")
         prev_leads_q = prev_leads_q.gte("created_at", prev_start_date).lte("created_at", prev_end_date)
         prev_leads = prev_leads_q.execute().data
-        
-        prev_viewings_q = sb.table("viewings").select("*").eq("agency_id", agency_id)
-        if not is_owner: prev_viewings_q = prev_viewings_q.eq("agent_id", current_agent_id)
-        elif agent_id: prev_viewings_q = prev_viewings_q.eq("agent_id", agent_id)
+
+        prev_viewings_q = _scoped(
+            sb.table("viewings").select("*").eq("agency_id", agency_id),
+            "agent_id",
+        )
         prev_viewings_q = prev_viewings_q.gte("viewing_datetime", prev_start_date).lte("viewing_datetime", prev_end_date)
         prev_viewings = prev_viewings_q.execute().data
         
@@ -166,7 +199,9 @@ async def get_dashboard_overview(
     viewing_completed = sum(1 for v in viewings if v.get("status") == "completed")
     closed_leads = sum(1 for l in leads if l.get("status") == "closed")
     
-    closed_contracts = [c for c in contracts if c.get("status") in ("signed", "active")]
+    # B-1: "closed" = fee cheque attached (contract lifecycle final state).
+    # Include it alongside signed/active so post-close deals are counted.
+    closed_contracts = [c for c in contracts if c.get("status") in ("signed", "active", "closed")]
     closed_deals_count = len(closed_contracts)
     total_revenue = sum(float(c.get("rent_amount") or 0) for c in closed_contracts)
     agency_fees_earned = total_revenue * 0.05 # Assuming 5% agency fee
@@ -243,8 +278,13 @@ async def get_dashboard_overview(
 
     for v in todays_viewings:
         v["agent_name"] = all_agents_map.get(v.get("agent_id"), "Unknown")
+        # B-2: expose the associated lead's name + platform source
+        # (joined via viewings.lead_id → leads; agency-scoped by the viewing row)
+        lead_info = v.get("leads") or {}
+        v["lead_name"] = lead_info.get("name")
+        v["lead_source"] = lead_info.get("source")
 
-    # Funnel and AI Stats â€” computed from real call records (no fabricated data)
+    # Funnel and AI Stats — computed from real call records (no fabricated data)
     funnel_data = [
         { "name": 'Leads', "count": total_leads, "percentage": 100 },
         { "name": 'Viewings', "count": leads_with_viewings, "percentage": lead_to_viewing_pct },
@@ -283,7 +323,7 @@ async def get_dashboard_overview(
             "role": role,
             "metrics": {
                 "avg_response_time": {
-                    # Not yet measurable (requires message-timestamp analytics) â€” null, not fabricated
+                    # Not yet measurable (requires message-timestamp analytics) — null, not fabricated
                     "value": None,
                     "subtext": ai_handled_subtext,
                     "trend": None,
@@ -324,7 +364,7 @@ async def get_dashboard_overview(
 @router.get("/calling-performance")
 async def get_calling_performance(current_user: dict = Depends(verify_token)):
     """
-    Returns metrics for the Calling Agent Dashboard â€” computed from real call
+    Returns metrics for the Calling Agent Dashboard — computed from real call
     records for the last 7 days. No mock data.
     """
     sb = get_supabase()
