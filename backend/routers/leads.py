@@ -297,6 +297,21 @@ async def create_lead(lead: LeadCreate, current_user: dict = Depends(verify_toke
     # (raw UUID objects are not JSON-serializable for the PostgREST payload)
     lead_data = lead.model_dump(mode="json", exclude_unset=True)
     lead_data["agency_id"] = agency_id
+
+    # Assignment target must belong to THIS agency (no cross-tenant assignment)
+    if lead_data.get("assigned_agent_id"):
+        agent_check = (
+            sb.table("agents")
+            .select("id")
+            .eq("id", lead_data["assigned_agent_id"])
+            .eq("agency_id", agency_id)
+            .execute()
+        )
+        if not agent_check.data:
+            raise HTTPException(
+                status_code=400,
+                detail="assigned_agent_id does not belong to your agency",
+            )
     
     # Handle the status parameter if passed in the payload for testing, otherwise default to new
     if "status" not in lead_data:
