@@ -33,9 +33,12 @@ def create_contract(contract: ContractCreate, current_user: dict = Depends(verif
     sb = supabase_client.get_supabase()
     agency_id = require_agency_id(current_user)
 
-    contract_data = contract.model_dump(exclude_none=True)
+    contract_data = contract.model_dump(mode="json", exclude_none=True)
     contract_data["agency_id"] = agency_id
-    contract_data["created_by"] = current_user.get("agent_id")
+    # Attribute the contract to the acting agent (contracts.agent_id exists;
+    # the previously used "created_by" column does not exist in the schema).
+    if current_user.get("agent_id"):
+        contract_data["agent_id"] = current_user.get("agent_id")
 
     result = sb.table("contracts").insert(contract_data).execute()
     if not result.data:
@@ -79,7 +82,7 @@ async def generate_contract_pdf(contract_id: str, current_user: dict = Depends(v
     sb = supabase_client.get_supabase()
     require_agency_id(current_user)
 
-    # Tenant ownership check — foreign/non-existent contracts are indistinguishable (404)
+    # Tenant ownership check â€” foreign/non-existent contracts are indistinguishable (404)
     query = sb.table("contracts").select("id").eq("id", contract_id)
     result = apply_agency_scope(query, current_user).execute()
     if not result.data:
@@ -134,7 +137,7 @@ async def send_contract_esign(contract_id: str, current_user: dict = Depends(ver
 @router.post("/{contract_id}/sign")
 async def sign_contract(contract_id: str, body: SignRequest):
     """
-    Public endpoint — landlord or tenant signs the contract using their unique token.
+    Public endpoint â€” landlord or tenant signs the contract using their unique token.
     No auth required (token-based verification).
     """
     try:
@@ -153,7 +156,7 @@ async def close_contract(contract_id: str, body: CloseContractRequest, current_u
     sb = supabase_client.get_supabase()
     require_agency_id(current_user)
 
-    # Tenant ownership check — foreign/non-existent contracts are indistinguishable (404)
+    # Tenant ownership check â€” foreign/non-existent contracts are indistinguishable (404)
     query = sb.table("contracts").select("id").eq("id", contract_id)
     result = apply_agency_scope(query, current_user).execute()
     if not result.data:
@@ -161,7 +164,7 @@ async def close_contract(contract_id: str, body: CloseContractRequest, current_u
 
     try:
         result = await close_contract_with_cheque(contract_id, body.cheque_image_url)
-        return api_success(data=result, message="Contract closed successfully — deal won!")
+        return api_success(data=result, message="Contract closed successfully â€” deal won!")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
