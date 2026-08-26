@@ -1,5 +1,5 @@
 """
-Dashboard Router — Role-based overview API for Agents and Owners
+Dashboard Router â€” Role-based overview API for Agents and Owners
 GET /dashboard/overview
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -33,9 +33,12 @@ async def get_dashboard_overview(
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
     # 1. Fetch current agent profile to determine role and agency_id
-    agent_res = sb.table("agents").select("*").eq("email", email).single().execute()
-    if not agent_res.data:
-        raise HTTPException(status_code=404, detail="Agent profile not found")
+    agent_res = sb.table("agents").select("*").eq("email", email).maybe_single().execute()
+    agent = agent_res.data if (agent_res and hasattr(agent_res, "data")) else None
+    if not agent:
+        # Authenticated but no agent profile (e.g. partial registration):
+        # a 4xx client error, never a 500.
+        raise HTTPException(status_code=400, detail="No agent profile found for this user")
 
     agent = agent_res.data
     agency_id = agent.get("agency_id")
@@ -241,7 +244,7 @@ async def get_dashboard_overview(
     for v in todays_viewings:
         v["agent_name"] = all_agents_map.get(v.get("agent_id"), "Unknown")
 
-    # Funnel and AI Stats — computed from real call records (no fabricated data)
+    # Funnel and AI Stats â€” computed from real call records (no fabricated data)
     funnel_data = [
         { "name": 'Leads', "count": total_leads, "percentage": 100 },
         { "name": 'Viewings', "count": leads_with_viewings, "percentage": lead_to_viewing_pct },
@@ -280,7 +283,7 @@ async def get_dashboard_overview(
             "role": role,
             "metrics": {
                 "avg_response_time": {
-                    # Not yet measurable (requires message-timestamp analytics) — null, not fabricated
+                    # Not yet measurable (requires message-timestamp analytics) â€” null, not fabricated
                     "value": None,
                     "subtext": ai_handled_subtext,
                     "trend": None,
@@ -321,7 +324,7 @@ async def get_dashboard_overview(
 @router.get("/calling-performance")
 async def get_calling_performance(current_user: dict = Depends(verify_token)):
     """
-    Returns metrics for the Calling Agent Dashboard — computed from real call
+    Returns metrics for the Calling Agent Dashboard â€” computed from real call
     records for the last 7 days. No mock data.
     """
     sb = get_supabase()
