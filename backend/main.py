@@ -35,7 +35,10 @@ def _validate_production_config() -> None:
     if settings.APP_ENV == "development":
         return
     required = {
+        "SECRET_KEY": settings.SECRET_KEY,
         "FRONTEND_URL": settings.FRONTEND_URL,
+        "API_BASE_URL": settings.API_BASE_URL,
+        "WHATSAPP_VERIFY_TOKEN": settings.WHATSAPP_VERIFY_TOKEN,
         "STRIPE_SECRET_KEY": settings.STRIPE_SECRET_KEY,
         "STRIPE_WEBHOOK_SECRET": settings.STRIPE_WEBHOOK_SECRET,
         "PROPERTY_FINDER_WEBHOOK_SECRET": settings.PROPERTY_FINDER_WEBHOOK_SECRET,
@@ -51,8 +54,12 @@ def _validate_production_config() -> None:
             "Related endpoints will reject requests (fail closed).",
             ", ".join(missing),
         )
+    if settings.SECRET_KEY in ("change-me-in-production", "andios-dev-secret-key-change-in-production", ""):
+        logger.critical("INSECURE SECRET_KEY — replace default development secret key in production .env immediately.")
     if not str(settings.FRONTEND_URL or "").startswith("https://"):
         logger.critical("FRONTEND_URL should use HTTPS in production (CORS/cookies depend on it).")
+    if not str(settings.API_BASE_URL or "").startswith("https://"):
+        logger.critical("API_BASE_URL should use HTTPS in production (webhook callback URLs depend on it).")
 
 
 @asynccontextmanager

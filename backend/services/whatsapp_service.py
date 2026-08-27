@@ -72,9 +72,43 @@ async def _send_twilio(to_phone: str, message: str) -> dict:
         return {"status": "error", "error": str(e)}
 
 
-def verify_360dialog_webhook(payload: dict, signature: str) -> bool:
-    """Verify 360dialog webhook signature (HMAC). Placeholder — implement per provider docs."""
-    return True  # TODO: add HMAC verification
+def verify_360dialog_webhook(payload: bytes | str | dict, signature: str | None, secret: str | None = None) -> bool:
+    """
+    Verify 360dialog webhook signature (HMAC-SHA256).
+    Fails closed when secret or signature is missing in production.
+    """
+    import hmac
+    import hashlib
+    import json
+
+    webhook_secret = secret or getattr(settings, "WHATSAPP_WEBHOOK_TOKEN", "") or getattr(settings, "WHATSAPP_API_KEY", "")
+    is_production = getattr(settings, "APP_ENV", "development") != "development"
+
+    if not webhook_secret:
+        if is_production:
+            logger.critical("360dialog webhook secret is not configured — rejecting webhook (fail closed)")
+            return False
+        logger.warning("360dialog webhook secret not set — failing safe in development")
+        return False
+
+    if not signature or payload is None:
+        return False
+
+    if isinstance(payload, bytes):
+        raw_body = payload
+    elif isinstance(payload, dict):
+        raw_body = json.dumps(payload, separators=(',', ':')).encode("utf-8")
+    else:
+        raw_body = str(payload).encode("utf-8")
+
+    expected = hmac.new(
+        key=webhook_secret.encode("utf-8"),
+        msg=raw_body,
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+
+    clean_signature = signature.replace("sha256=", "").strip()
+    return hmac.compare_digest(expected, clean_signature)
 
 
 def parse_360dialog_inbound(payload: dict) -> list[dict]:

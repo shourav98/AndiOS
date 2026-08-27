@@ -654,9 +654,23 @@ async def whatsapp_verify(
     hub_challenge: str = Query(None, alias="hub.challenge"),
     hub_verify_token: str = Query(None, alias="hub.verify_token"),
 ):
-    """WhatsApp webhook verification endpoint."""
-    if hub_mode == "subscribe" and hub_verify_token == settings.WHATSAPP_VERIFY_TOKEN:
-        return int(hub_challenge)
+    """WhatsApp webhook verification endpoint (Meta Cloud API)."""
+    configured_token = (getattr(settings, "WHATSAPP_VERIFY_TOKEN", "") or "").strip()
+    is_production = getattr(settings, "APP_ENV", "development") != "development"
+
+    if is_production and not configured_token:
+        logger.critical("WHATSAPP_VERIFY_TOKEN is not configured in production — rejecting verification")
+        raise HTTPException(status_code=403, detail="Verification token not configured")
+
+    if not configured_token:
+        configured_token = "andios_verify_token"  # Development fallback only
+
+    if hub_mode == "subscribe" and hub_challenge and hub_verify_token:
+        if hmac.compare_digest(str(hub_verify_token), str(configured_token)):
+            try:
+                return int(hub_challenge)
+            except ValueError:
+                return hub_challenge
     raise HTTPException(status_code=403, detail="Verification failed")
 
 

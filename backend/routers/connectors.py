@@ -48,25 +48,6 @@ WEBHOOK_URLS = {
     "whatsapp": f"{settings.API_BASE_URL}/webhooks/whatsapp",
 }
 
-# Mock listing data per provider (step 2 of wizard)
-MOCK_LISTINGS = {
-    "property_finder": [
-        {"id": "PF-4821", "title": "2BR Apartment", "location": "Dubai Marina", "price": "AED 2.4M"},
-        {"id": "PF-4822", "title": "Studio Apartment", "location": "JVC", "price": "AED 55k/yr"},
-        {"id": "PF-4823", "title": "3BR Apartment", "location": "Downtown Dubai", "price": "AED 4.1M"},
-    ],
-    "bayut": [
-        {"id": "BYT-2001", "title": "Modern Apartment", "location": "Dubai, UAE", "price": "AED 2.5M"},
-        {"id": "BYT-2002", "title": "Luxury Villa", "location": "Abu Dhabi, UAE", "price": "AED 6.8M"},
-        {"id": "BYT-2003", "title": "Cozy Studio", "location": "Sharjah, UAE", "price": "AED 1.2M"},
-    ],
-    "dubizzle": [
-        {"id": "DBZ-7001", "title": "Villa", "location": "Arabian Ranches", "price": "AED 6.8M"},
-        {"id": "DBZ-7002", "title": "Townhouse", "location": "Dubai Hills Estate", "price": "AED 3.9M"},
-        {"id": "DBZ-7003", "title": "Studio Apartment", "location": "Business Bay", "price": "AED 65k/yr"},
-    ],
-}
-
 
 # ─── Request models ─────────────────────────────────────────────────────────────
 
@@ -154,8 +135,8 @@ async def get_connector_listings(
     current_user: dict = Depends(verify_token)
 ):
     """
-    Step 2 of wizard: Fetch available listings for this connector.
-    Returns mock data — replace with real provider API calls once credentials are live.
+    Step 2 of wizard: Fetch available listings for this connector from stored feed/credentials.
+    Returns real listings if imported or a clean status indicating sync via active webhook.
     """
     if connector_name not in {"property_finder", "bayut", "dubizzle"}:
         raise HTTPException(status_code=400, detail=f"Listings not supported for: {connector_name}")
@@ -163,22 +144,32 @@ async def get_connector_listings(
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
 
-    connector = sb.table("connectors").select("auth_data").eq("name", connector_name).eq("agency_id", agency_id).execute()
+    connector = sb.table("connectors").select("auth_data, is_connected").eq("name", connector_name).eq("agency_id", agency_id).execute()
     if not connector.data or not connector.data[0].get("auth_data"):
         raise HTTPException(
             status_code=400,
             detail=f"No credentials found for {connector_name}. Call POST /connectors/{connector_name}/connect first."
         )
 
-    listings = MOCK_LISTINGS.get(connector_name, [])
+    auth_data = connector.data[0].get("auth_data") or {}
+    # If listings were provided in auth_data or parsed from feed
+    listings = auth_data.get("listings", [])
+    if isinstance(listings, list) and len(listings) > 0:
+        total = len(listings)
+        msg = f"Retrieved {total} listings for {CONNECTOR_DISPLAY.get(connector_name, connector_name)}"
+    else:
+        listings = []
+        total = 0
+        msg = f"Credentials configured. Listings will automatically sync via webhook for {CONNECTOR_DISPLAY.get(connector_name, connector_name)}."
 
     return api_success(
         data={
             "connector": connector_name,
             "listings": listings,
-            "total": len(listings),
+            "total": total,
+            "is_connected": connector.data[0].get("is_connected", False),
         },
-        message=f"Listings fetched for {CONNECTOR_DISPLAY.get(connector_name, connector_name)}"
+        message=msg
     )
 
 

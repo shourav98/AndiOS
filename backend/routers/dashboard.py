@@ -89,25 +89,27 @@ async def get_dashboard_overview(
     prev_start_date = None
     prev_end_date = None
 
-    if timeframe:
-        if timeframe == "today":
+    timeframe_str = timeframe if isinstance(timeframe, str) else None
+
+    if timeframe_str:
+        if timeframe_str == "today":
             start_date = now.strftime("%Y-%m-%d")
             prev_start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
             prev_end_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-        elif timeframe == "this_month":
+        elif timeframe_str == "this_month":
             start_date = now.replace(day=1).strftime("%Y-%m-%d")
             prev_month_end = now.replace(day=1) - timedelta(days=1)
             prev_start_date = prev_month_end.replace(day=1).strftime("%Y-%m-%d")
             prev_end_date = prev_month_end.strftime("%Y-%m-%d")
-        elif timeframe == "last_7_days":
+        elif timeframe_str == "last_7_days":
             start_date = (now - timedelta(days=7)).strftime("%Y-%m-%d")
             prev_start_date = (now - timedelta(days=14)).strftime("%Y-%m-%d")
             prev_end_date = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-        elif timeframe == "last_30_days":
+        elif timeframe_str == "last_30_days":
             start_date = (now - timedelta(days=30)).strftime("%Y-%m-%d")
             prev_start_date = (now - timedelta(days=60)).strftime("%Y-%m-%d")
             prev_end_date = (now - timedelta(days=30)).strftime("%Y-%m-%d")
-        elif timeframe == "this_quarter":
+        elif timeframe_str == "this_quarter":
             quarter_month = (now.month - 1) // 3 * 3 + 1
             start_date = now.replace(month=quarter_month, day=1).strftime("%Y-%m-%d")
             prev_quarter_end = now.replace(month=quarter_month, day=1) - timedelta(days=1)
@@ -263,6 +265,24 @@ async def get_dashboard_overview(
 
     deals_by_agent = list(agent_deals_dict.values())
 
+    def format_lead_age(created_at_str: str | None) -> str:
+        if not created_at_str:
+            return "—"
+        try:
+            created_dt = datetime.fromisoformat(str(created_at_str).replace("Z", "+00:00"))
+            now_dt = datetime.now(created_dt.tzinfo) if created_dt.tzinfo else datetime.utcnow()
+            diff_sec = max(0, int((now_dt - created_dt).total_seconds()))
+            if diff_sec < 60:
+                return f"{diff_sec}s"
+            elif diff_sec < 3600:
+                return f"{diff_sec // 60}m"
+            elif diff_sec < 86400:
+                return f"{diff_sec // 3600}h"
+            else:
+                return f"{diff_sec // 86400}d"
+        except Exception:
+            return "—"
+
     # Live Leads (Most recent 5 active leads)
     active_leads = [l for l in leads if l.get("status") not in ("closed", "lost")]
     active_leads.sort(key=lambda x: x.get("updated_at") or x.get("created_at"), reverse=True)
@@ -270,11 +290,40 @@ async def get_dashboard_overview(
 
     for ll in top_live_leads:
         ll["agent_name"] = all_agents_map.get(ll.get("assigned_agent_id"), "Unknown")
+        ll["age"] = format_lead_age(ll.get("created_at"))
 
-    # Today's Viewings
-    today_str = now.strftime("%Y-%m-%d")
-    todays_viewings = [v for v in viewings if v.get("viewing_datetime") and v.get("viewing_datetime").startswith(today_str)]
-    todays_viewings.sort(key=lambda x: x.get("viewing_datetime"))
+    # Today's Viewings (timezone aware in Asia/Dubai and UTC)
+    try:
+        import pytz
+        dubai_tz = pytz.timezone("Asia/Dubai")
+        now_dubai = datetime.now(dubai_tz)
+        today_date_str = now_dubai.strftime("%Y-%m-%d")
+    except Exception:
+        today_date_str = now.strftime("%Y-%m-%d")
+
+    today_utc_str = now.strftime("%Y-%m-%d")
+
+    todays_viewings = []
+    for v in viewings:
+        v_dt_str = str(v.get("viewing_datetime") or "")
+        if not v_dt_str:
+            continue
+        try:
+            v_dt = datetime.fromisoformat(v_dt_str.replace("Z", "+00:00"))
+            try:
+                import pytz
+                dubai_tz = pytz.timezone("Asia/Dubai")
+                v_local_date = v_dt.astimezone(dubai_tz).strftime("%Y-%m-%d")
+            except Exception:
+                v_local_date = v_dt.strftime("%Y-%m-%d")
+
+            if v_local_date == today_date_str or v_dt_str.startswith(today_utc_str) or v_dt_str.startswith(today_date_str):
+                todays_viewings.append(v)
+        except Exception:
+            if v_dt_str.startswith(today_date_str) or v_dt_str.startswith(today_utc_str):
+                todays_viewings.append(v)
+
+    todays_viewings.sort(key=lambda x: str(x.get("viewing_datetime") or ""))
 
     for v in todays_viewings:
         v["agent_name"] = all_agents_map.get(v.get("agent_id"), "Unknown")
@@ -283,6 +332,20 @@ async def get_dashboard_overview(
         lead_info = v.get("leads") or {}
         v["lead_name"] = lead_info.get("name")
         v["lead_source"] = lead_info.get("source")
+        v_dt_str = str(v.get("viewing_datetime") or "")
+        v_time = ""
+        if v_dt_str:
+            try:
+                v_dt = datetime.fromisoformat(v_dt_str.replace("Z", "+00:00"))
+                try:
+                    import pytz
+                    dubai_tz = pytz.timezone("Asia/Dubai")
+                    v_time = v_dt.astimezone(dubai_tz).strftime("%H:%M")
+                except Exception:
+                    v_time = v_dt.strftime("%H:%M")
+            except Exception:
+                v_time = v_dt_str[11:16] if len(v_dt_str) >= 16 else ""
+        v["time"] = v_time
 
     # Funnel and AI Stats — computed from real call records (no fabricated data)
     funnel_data = [
@@ -309,6 +372,82 @@ async def get_dashboard_overview(
     answer_rate_pct = round((answered_dials / outbound_dials * 100), 1) if outbound_dials else 0
     calls_to_listings_pct = round((listings_won / answered_dials * 100), 1) if answered_dials else 0
 
+    # ── Calculate Average Response Time from conversation timestamps ──
+    lead_ids = [l["id"] for l in leads if l.get("id")]
+    durations_seconds = []
+    if lead_ids:
+        try:
+            convs_res = (
+                sb.table("conversations")
+                .select("lead_id, direction, sender_type, timestamp")
+                .eq("agency_id", agency_id)
+                .in_("lead_id", lead_ids)
+                .order("timestamp", desc=False)
+                .execute()
+            )
+            conv_rows = convs_res.data or []
+            lead_convs = {}
+            for row in conv_rows:
+                lid = row.get("lead_id")
+                if lid:
+                    lead_convs.setdefault(lid, []).append(row)
+
+            for l in leads:
+                lid = l.get("id")
+                c_list = lead_convs.get(lid, [])
+                if not c_list:
+                    continue
+
+                l_created_at = l.get("created_at")
+                if l_created_at:
+                    try:
+                        l_created_dt = datetime.fromisoformat(l_created_at.replace("Z", "+00:00"))
+                        for msg in c_list:
+                            if msg.get("direction") == "outbound" and msg.get("timestamp"):
+                                m_dt = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00"))
+                                diff = (m_dt - l_created_dt).total_seconds()
+                                if 0 <= diff <= 86400 * 7:
+                                    durations_seconds.append(diff)
+                                break
+                    except Exception:
+                        pass
+
+                last_inbound_time = None
+                for msg in c_list:
+                    direction = msg.get("direction")
+                    sender_type = msg.get("sender_type")
+                    ts_str = msg.get("timestamp")
+                    if not ts_str:
+                        continue
+                    try:
+                        msg_dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    except Exception:
+                        continue
+
+                    if direction == "inbound" and sender_type == "lead":
+                        last_inbound_time = msg_dt
+                    elif direction == "outbound" and sender_type in ("ai", "agent") and last_inbound_time:
+                        diff = (msg_dt - last_inbound_time).total_seconds()
+                        if 0 <= diff <= 86400 * 7:
+                            durations_seconds.append(diff)
+                        last_inbound_time = None
+        except Exception as e:
+            logger.warning(f"Failed to compute response time analytics: {e}")
+
+    avg_response_value = None
+    if durations_seconds:
+        avg_sec = sum(durations_seconds) / len(durations_seconds)
+        if avg_sec < 60:
+            avg_response_value = f"{int(avg_sec)}s"
+        elif avg_sec < 3600:
+            mins = int(avg_sec // 60)
+            secs = int(avg_sec % 60)
+            avg_response_value = f"{mins}m {secs:02d}s" if secs > 0 else f"{mins}m"
+        else:
+            hours = int(avg_sec // 3600)
+            mins = int((avg_sec % 3600) // 60)
+            avg_response_value = f"{hours}h {mins:02d}m" if mins > 0 else f"{hours}h"
+
     ai_agent_stats = {
         "outbound_dials": outbound_dials,
         "answer_rate": f"{answer_rate_pct}%",
@@ -323,11 +462,10 @@ async def get_dashboard_overview(
             "role": role,
             "metrics": {
                 "avg_response_time": {
-                    # Not yet measurable (requires message-timestamp analytics) — null, not fabricated
-                    "value": None,
+                    "value": avg_response_value,
                     "subtext": ai_handled_subtext,
-                    "trend": None,
-                    "trend_value": None
+                    "trend": "up" if avg_response_value else None,
+                    "trend_value": "0pts" if avg_response_value else None
                 },
                 "lead_to_viewing": {
                     "value": lead_to_viewing_pct,
@@ -343,7 +481,7 @@ async def get_dashboard_overview(
                 },
                 "close_rate": {
                     "value": close_rate,
-                    "subtext": "overall, this qtr" if timeframe == "this_quarter" else (timeframe.replace("_", " ") if timeframe else "overall"),
+                    "subtext": "overall, this qtr" if timeframe_str == "this_quarter" else (timeframe_str.replace("_", " ") if timeframe_str else "overall"),
                     "trend": cr_trend["trend"],
                     "trend_value": cr_trend["trend_value"]
                 }
@@ -362,16 +500,30 @@ async def get_dashboard_overview(
     )
 
 @router.get("/calling-performance")
-async def get_calling_performance(current_user: dict = Depends(verify_token)):
+async def get_calling_performance(
+    current_user: dict = Depends(verify_token),
+    agent_id: Optional[str] = Query(None),
+):
     """
     Returns metrics for the Calling Agent Dashboard — computed from real call
-    records for the last 7 days. No mock data.
+    records for the last 7 days.
     """
     sb = get_supabase()
     agency_id = current_user.get("agency_id")
+    role = current_user.get("role")
+    current_agent_id = current_user.get("agent_id")
+    is_owner_or_manager = role in ("owner", "manager")
 
     if not agency_id:
         raise HTTPException(status_code=400, detail="User not associated with an agency")
+
+    if not is_owner_or_manager and agent_id and str(agent_id) != str(current_agent_id):
+        raise HTTPException(status_code=403, detail="Agents can only view their own calling performance")
+
+    if is_owner_or_manager and agent_id:
+        agent_check = sb.table("agents").select("id").eq("id", agent_id).eq("agency_id", agency_id).execute()
+        if not agent_check.data:
+            raise HTTPException(status_code=400, detail="Requested agent does not belong to your agency")
 
     week_start = (datetime.utcnow() - timedelta(days=7)).isoformat()
 

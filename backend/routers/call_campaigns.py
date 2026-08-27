@@ -147,6 +147,16 @@ async def run_campaign(campaign_id: str, current_user: dict = Depends(verify_tok
     if campaign.data["status"] == "Completed":
         raise HTTPException(status_code=400, detail="Campaign already completed")
 
+    import os
+    from config import settings
+    vapi_key = (getattr(settings, "VAPI_API_KEY", "") or os.getenv("VAPI_API_KEY", "")).strip()
+    is_production = getattr(settings, "APP_ENV", "development") != "development"
+    if is_production and not vapi_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Vapi AI calling is not configured. Please configure VAPI_API_KEY and VAPI_ASSISTANT_ID in environment."
+        )
+
     # Update status to Running
     sb.table("call_campaigns").update({"status": "Running"}).eq("id", campaign_id).execute()
 
