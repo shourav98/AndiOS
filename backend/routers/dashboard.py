@@ -292,45 +292,46 @@ async def get_dashboard_overview(
         ll["agent_name"] = all_agents_map.get(ll.get("assigned_agent_id"), "Unknown")
         ll["age"] = format_lead_age(ll.get("created_at"))
 
-    # Today's Viewings (timezone aware in Asia/Dubai and UTC)
+    # Today's Viewings — always fetched with a dedicated independent query,
+    # ignoring any timeframe/date filters applied to the rest of the dashboard.
+    # This ensures today's viewings always appear regardless of the selected period.
     try:
         import pytz
         dubai_tz = pytz.timezone("Asia/Dubai")
         now_dubai = datetime.now(dubai_tz)
         today_date_str = now_dubai.strftime("%Y-%m-%d")
+        # Compute the UTC window that covers today in Dubai time (UTC+4: day starts at 20:00 UTC prev day)
+        today_start_dubai = now_dubai.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end_dubai   = now_dubai.replace(hour=23, minute=59, second=59, microsecond=999999)
+        import datetime as _dt_mod
+        today_start_utc = today_start_dubai.astimezone(_dt_mod.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        today_end_utc   = today_end_dubai.astimezone(_dt_mod.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     except Exception:
-        today_date_str = now.strftime("%Y-%m-%d")
+        today_date_str  = now.strftime("%Y-%m-%d")
+        today_start_utc = f"{today_date_str}T00:00:00"
+        today_end_utc   = f"{today_date_str}T23:59:59"
 
-    today_utc_str = now.strftime("%Y-%m-%d")
+    try:
+        todays_viewings_q = _scoped(
+            sb.table("viewings")
+            .select("*, leads(name, source)")
+            .eq("agency_id", agency_id)
+            .gte("viewing_datetime", today_start_utc)
+            .lte("viewing_datetime", today_end_utc),
+            "agent_id",
+        )
+        todays_viewings_raw = todays_viewings_q.execute().data or []
+    except Exception as e:
+        logger.warning(f"Today's viewings query failed: {e}")
+        todays_viewings_raw = []
+
+    todays_viewings_raw.sort(key=lambda x: str(x.get("viewing_datetime") or ""))
 
     todays_viewings = []
-    for v in viewings:
-        v_dt_str = str(v.get("viewing_datetime") or "")
-        if not v_dt_str:
-            continue
-        try:
-            v_dt = datetime.fromisoformat(v_dt_str.replace("Z", "+00:00"))
-            try:
-                import pytz
-                dubai_tz = pytz.timezone("Asia/Dubai")
-                v_local_date = v_dt.astimezone(dubai_tz).strftime("%Y-%m-%d")
-            except Exception:
-                v_local_date = v_dt.strftime("%Y-%m-%d")
-
-            if v_local_date == today_date_str or v_dt_str.startswith(today_utc_str) or v_dt_str.startswith(today_date_str):
-                todays_viewings.append(v)
-        except Exception:
-            if v_dt_str.startswith(today_date_str) or v_dt_str.startswith(today_utc_str):
-                todays_viewings.append(v)
-
-    todays_viewings.sort(key=lambda x: str(x.get("viewing_datetime") or ""))
-
-    for v in todays_viewings:
+    for v in todays_viewings_raw:
         v["agent_name"] = all_agents_map.get(v.get("agent_id"), "Unknown")
-        # B-2: expose the associated lead's name + platform source
-        # (joined via viewings.lead_id → leads; agency-scoped by the viewing row)
         lead_info = v.get("leads") or {}
-        v["lead_name"] = lead_info.get("name")
+        v["lead_name"]   = lead_info.get("name")
         v["lead_source"] = lead_info.get("source")
         v_dt_str = str(v.get("viewing_datetime") or "")
         v_time = ""
@@ -338,14 +339,15 @@ async def get_dashboard_overview(
             try:
                 v_dt = datetime.fromisoformat(v_dt_str.replace("Z", "+00:00"))
                 try:
-                    import pytz
-                    dubai_tz = pytz.timezone("Asia/Dubai")
-                    v_time = v_dt.astimezone(dubai_tz).strftime("%H:%M")
+                    import pytz as _pytz
+                    _dubai = _pytz.timezone("Asia/Dubai")
+                    v_time = v_dt.astimezone(_dubai).strftime("%H:%M")
                 except Exception:
                     v_time = v_dt.strftime("%H:%M")
             except Exception:
                 v_time = v_dt_str[11:16] if len(v_dt_str) >= 16 else ""
         v["time"] = v_time
+        todays_viewings.append(v)
 
     # Funnel and AI Stats — computed from real call records (no fabricated data)
     funnel_data = [

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Integration-fixes verification suite (regenerated).
 
 Covers: auth (change-password / profile), billing fail-closed + cancel +
@@ -1023,6 +1023,7 @@ async def test_b2_todays_viewings_include_lead_name_and_source():
     tomorrow = (datetime.utcnow() + timedelta(days=1)).isoformat()
     T["leads"].return_value.select.return_value.eq.return_value.execute.return_value.data = []
     V_sel = T["viewings"].return_value.select
+    # Main viewings chain used for KPI/funnel calculations: .select().eq().execute()
     V_sel.return_value.eq.return_value.execute.return_value.data = [
         {"id": "v1", "lead_id": "l1", "agent_id": "a1",
          "property_address": "Apartment 101, Downtown",
@@ -1031,6 +1032,14 @@ async def test_b2_todays_viewings_include_lead_name_and_source():
         {"id": "v2", "lead_id": "l2", "agent_id": "a2", "property_address": "Villa 4",
          "viewing_datetime": tomorrow, "status": "scheduled",
          "leads": {"name": "Future Person", "source": "bayut"}},
+    ]
+    # Independent today's-viewings query: .select().eq("agency_id").gte().lte().execute()
+    # Only today's viewing is returned (DB filters by UTC date window).
+    V_sel.return_value.eq.return_value.gte.return_value.lte.return_value.execute.return_value.data = [
+        {"id": "v1", "lead_id": "l1", "agent_id": "a1",
+         "property_address": "Apartment 101, Downtown",
+         "viewing_datetime": datetime.utcnow().isoformat(), "status": "scheduled",
+         "leads": {"name": "John Doe", "source": "property_finder"}},
     ]
     T["contracts"].return_value.select.return_value.eq.return_value.execute.return_value.data = []
     T["calls"].return_value.select.return_value.eq.return_value.execute.return_value.data = []
