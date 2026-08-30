@@ -27,6 +27,45 @@ class InviteAgentRequest(BaseModel):
     email: EmailStr
     name: str
     role: str = "agent"  # 'agent' or 'manager'
+    branch: Optional[str] = None
+
+
+def validate_and_normalize_branch(sb, agency_id: str, branch_val: Optional[str]) -> Optional[str]:
+    """
+    Validates that branch_val belongs to one of the agency's created branches (by id or name).
+    Returns the canonical branch name.
+    Raises HTTPException(400) if branch_val is invalid.
+    """
+    if not branch_val or not str(branch_val).strip() or str(branch_val).strip() in ("All branches", "All", "none", "None", ""):
+        return None
+
+    clean_val = str(branch_val).strip()
+
+    # 1. Fetch agency's valid branches from settings
+    agency_res = sb.table("agencies").select("settings").eq("id", agency_id).maybe_single().execute()
+    stored_branches = ((agency_res.data or {}).get("settings") or {}).get("branches") or []
+
+    # Check against stored branches
+    for b in stored_branches:
+        if b.get("id") == clean_val or b.get("name", "").strip().lower() == clean_val.lower():
+            return b.get("name", clean_val).strip()
+
+    # 2. Also check against distinct branches already assigned to active agents in DB
+    agents_res = sb.table("agents").select("branch").eq("agency_id", agency_id).eq("is_active", True).execute()
+    existing_agent_branches = {row["branch"].strip() for row in (agents_res.data or []) if row.get("branch") and str(row.get("branch")).strip()}
+    for eb in existing_agent_branches:
+        import uuid
+        auto_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{agency_id}-{eb}"))
+        if auto_id == clean_val or eb.lower() == clean_val.lower():
+            return eb
+
+    # If not found in any valid branch
+    valid_branch_names = sorted(list({b.get("name") for b in stored_branches if b.get("name")} | existing_agent_branches))
+    valid_str = ", ".join(f"'{name}'" for name in valid_branch_names) if valid_branch_names else "None (Please create a branch first)"
+    raise HTTPException(
+        status_code=400,
+        detail=f"Invalid branch '{clean_val}'. Allowed branches for your agency: {valid_str}"
+    )
 
 
 @router.get("", response_model=ApiResponse[list[AgentResponse]])
@@ -73,7 +112,7 @@ async def create_branch_endpoint(body: dict, current_user: dict = Depends(verify
 
 @router.post("", response_model=ApiResponse[AgentResponse], status_code=201)
 async def create_agent(body: AgentCreate, current_user: dict = Depends(verify_token)):
-    """Add a new agent — checks plan limits before creating."""
+    """Add a new agent — checks plan limits and validates branch before creating."""
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
 
@@ -87,8 +126,13 @@ async def create_agent(body: AgentCreate, current_user: dict = Depends(verify_to
     try:
         agent_data = body.model_dump(exclude_none=True)
         agent_data["agency_id"] = agency_id
+        if "branch" in agent_data and agent_data["branch"]:
+            agent_data["branch"] = validate_and_normalize_branch(sb, agency_id, agent_data["branch"])
+
         result = sb.table("agents").insert(agent_data).execute()
         return api_success(data=result.data[0], message="Agent created successfully", status_code=201)
+    except HTTPException:
+        raise
     except Exception as e:
         if "unique" in str(e).lower():
             raise HTTPException(status_code=409, detail="Agent with this email already exists")
@@ -100,9 +144,10 @@ async def invite_agent(body: InviteAgentRequest, current_user: dict = Depends(ve
     """
     Invite a new agent via email.
     1. Checks plan limits
-    2. Creates agent row in agents table (is_active=True)
-    3. Sends Supabase invite email — agent sets password on first login
-    4. Syncs app_metadata so the invited user gets correct agency_id/role
+    2. Validates branch is an allowed agency branch
+    3. Creates agent row in agents table (is_active=True)
+    4. Sends Supabase invite email — agent sets password on first login
+    5. Syncs app_metadata so the invited user gets correct agency_id/role
     """
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
@@ -113,6 +158,11 @@ async def invite_agent(body: InviteAgentRequest, current_user: dict = Depends(ve
     # Check plan limits
     check_agent_limit(agency_id)
 
+    # Validate branch if provided
+    norm_branch = None
+    if body.branch:
+        norm_branch = validate_and_normalize_branch(sb, agency_id, body.branch)
+
     # Check if agent with this email already exists
     existing = sb.table("agents").select("id").eq("email", body.email).eq("agency_id", agency_id).execute()
     if existing.data:
@@ -120,13 +170,17 @@ async def invite_agent(body: InviteAgentRequest, current_user: dict = Depends(ve
 
     try:
         # Step 1: Create agent row
-        agent_result = sb.table("agents").insert({
+        insert_payload = {
             "name": body.name,
             "email": body.email,
             "role": body.role,
             "agency_id": agency_id,
             "is_active": True,
-        }).execute()
+        }
+        if norm_branch:
+            insert_payload["branch"] = norm_branch
+
+        agent_result = sb.table("agents").insert(insert_payload).execute()
 
         if not agent_result.data:
             raise HTTPException(status_code=500, detail="Failed to create agent record")
@@ -232,6 +286,9 @@ async def update_agent(agent_id: UUID, body: AgentUpdate, current_user: dict = D
     # Regular agents can only edit their own profile
     if not management and str(agent_id) != str(current_user.get("agent_id")):
         raise HTTPException(status_code=403, detail="You can only edit your own profile")
+
+    if "branch" in update_data and update_data["branch"]:
+        update_data["branch"] = validate_and_normalize_branch(sb, agency_id, update_data["branch"])
 
     result = sb.table("agents").update(update_data).eq("id", str(agent_id)).eq("agency_id", agency_id).execute()
     if not result.data:
