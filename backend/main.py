@@ -173,11 +173,13 @@ from routers import (
     calls,
     admin,
     subscription,
+    branches,
 )
 
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(agents.router)
+app.include_router(branches.router)
 app.include_router(webhooks.router)
 app.include_router(leads.router)
 app.include_router(conversations.router)

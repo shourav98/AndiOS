@@ -51,11 +51,19 @@ async def get_dashboard_overview(
     # Scoped to the caller's agency: a foreign branch_id resolves to zero agents.
     branch_agent_ids = None
     if branch_id and branch_id.strip() not in ("All branches", "All", "all", ""):
+        target_branch_val = branch_id.strip()
+        agency_res = sb.table("agencies").select("settings").eq("id", agency_id).maybe_single().execute()
+        stored_branches = ((agency_res.data or {}).get("settings") or {}).get("branches") or []
+        for b in stored_branches:
+            if b.get("id") == target_branch_val:
+                target_branch_val = b.get("name", target_branch_val)
+                break
+
         branch_rows = (
             sb.table("agents")
             .select("id")
             .eq("agency_id", agency_id)
-            .eq("branch", branch_id.strip())
+            .or_(f"branch.eq.{target_branch_val},branch.eq.{branch_id.strip()}")
             .execute()
             .data or []
         )

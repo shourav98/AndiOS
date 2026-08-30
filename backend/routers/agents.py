@@ -57,13 +57,18 @@ async def list_agents(
 
 
 @router.get("/branches")
-async def list_branches(current_user: dict = Depends(verify_token)):
-    """List all distinct branches configured for the current agency's team."""
-    sb = get_supabase()
-    agency_id = require_agency_id(current_user)
-    result = sb.table("agents").select("branch").eq("agency_id", agency_id).eq("is_active", True).execute()
-    branches = sorted(list({row["branch"].strip() for row in (result.data or []) if row.get("branch") and str(row.get("branch")).strip()}))
-    return api_success(data=branches, message="Branches retrieved successfully")
+async def list_branches_endpoint(current_user: dict = Depends(verify_token)):
+    """List all distinct branches configured for the current agency's team with unique IDs."""
+    from routers.branches import list_branches as get_all_branches
+    return await get_all_branches(current_user=current_user)
+
+
+@router.post("/branches", status_code=201)
+async def create_branch_endpoint(body: dict, current_user: dict = Depends(verify_token)):
+    """Create a new branch from Team page."""
+    from routers.branches import create_branch as add_new_branch, BranchCreate
+    branch_create = BranchCreate(**body)
+    return await add_new_branch(body=branch_create, current_user=current_user)
 
 
 @router.post("", response_model=ApiResponse[AgentResponse], status_code=201)
