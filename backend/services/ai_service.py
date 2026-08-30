@@ -22,12 +22,9 @@ Be warm, concise, and professional. Use simple language. Never ask more than 1-2
 Always respond in the same language the lead uses (English or Arabic).
 
 IMPORTANT — Viewing Booking Flow:
-1. If the user wants to schedule a viewing, call the `check_calendar_slots` function first.
-2. After receiving available slots, present the TWO closest options to the user.
-3. If the user confirms a specific slot (e.g. "the first one", "Tuesday 10 AM", "yes"), call the `book_viewing` function with the chosen slot.
-4. After booking, confirm the viewing details to the user.
-
-Never make up dates or times — always use the function tools."""
+1. If the user asks for available times, call `check_calendar_slots` and present the closest options.
+2. If the user specifies or confirms a specific date/time for viewing (e.g. "today at 4 PM", "tomorrow at 2 PM", "Tuesday 10 AM"), call the `book_viewing` function with the ISO start and end datetimes in Asia/Dubai timezone.
+3. After booking, warmly confirm the viewing date and time to the user."""
 
 SYSTEM_PROMPT_HANDOVER = """You analyze WhatsApp conversations to detect if a lead needs a human agent.
 Return a JSON object with:
@@ -54,7 +51,7 @@ QUALIFY_TOOLS = [
         "type": "function",
         "function": {
             "name": "check_calendar_slots",
-            "description": "Check available viewing slots in the agent's Google Calendar. Call this when the user asks to schedule or book a viewing.",
+            "description": "Check available viewing slots in the agency calendar. Call this when the user asks for available times or to schedule a viewing.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -66,17 +63,17 @@ QUALIFY_TOOLS = [
         "type": "function",
         "function": {
             "name": "book_viewing",
-            "description": "Book a viewing slot that the user has confirmed. Call this ONLY after showing the user available slots and they confirm one.",
+            "description": "Book a viewing slot for the property. Call this when the user specifies or confirms a viewing date and time.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "slot_start": {
                         "type": "string",
-                        "description": "ISO 8601 datetime of the chosen slot start time (from the check_calendar_slots result)",
+                        "description": "ISO 8601 datetime of the slot start time (e.g. 2026-08-29T16:00:00)",
                     },
                     "slot_end": {
                         "type": "string",
-                        "description": "ISO 8601 datetime of the chosen slot end time",
+                        "description": "ISO 8601 datetime of the slot end time (typically 1 hour after start)",
                     },
                 },
                 "required": ["slot_start", "slot_end"],
@@ -108,17 +105,34 @@ async def _execute_check_slots(lead_context: dict) -> str:
         .execute()
     )
 
-    if not connector.data or not connector.data[0].get("auth_data"):
-        return "No calendar connected. Tell the user you will have an agent contact them to schedule."
-
-    auth_data = connector.data[0]["auth_data"]
     tz = pytz.timezone("Asia/Dubai")
     now = datetime.now(tz)
     date_from = now
     date_to = now + timedelta(days=3)
     calendar_id = settings.GOOGLE_SHARED_CALENDAR_ID or "primary"
 
-    slots = get_available_slots(auth_data, calendar_id, date_from, date_to)
+    slots = []
+    if connector.data and connector.data[0].get("auth_data"):
+        try:
+            auth_data = connector.data[0]["auth_data"]
+            slots = get_available_slots(auth_data, calendar_id, date_from, date_to)
+        except Exception as e:
+            logger.warning(f"Google Calendar slot fetch failed: {e}, falling back to standard slots")
+            slots = []
+
+    # Fallback to standard agency slots (10:00, 14:00, 16:00, 18:00) if no calendar or token expired
+    if not slots:
+        for day_offset in range(3):
+            slot_date = (now + timedelta(days=day_offset)).date()
+            for hour in (11, 14, 16, 18):
+                dt_start = tz.localize(datetime(slot_date.year, slot_date.month, slot_date.day, hour, 0))
+                if dt_start > now:
+                    dt_end = dt_start + timedelta(hours=1)
+                    slots.append({
+                        "start": dt_start.isoformat(),
+                        "end": dt_end.isoformat(),
+                    })
+
     if not slots:
         return "No slots available in the next 3 days. Ask the user if next week works."
 
@@ -127,7 +141,7 @@ async def _execute_check_slots(lead_context: dict) -> str:
         dt = datetime.fromisoformat(s["start"])
         slot_strs.append(f'{dt.strftime("%A, %b %d at %I:%M %p")} (start={s["start"]}, end={s["end"]})')
 
-    return f"Available slots:\n" + "\n".join(f"- {s}" for s in slot_strs) + "\n\nOffer the first two closest options to the user. When the user confirms a slot, call the book_viewing function with the exact start and end ISO strings."
+    return f"Available slots:\n" + "\n".join(f"- {s}" for s in slot_strs) + "\n\nOffer the first two closest options to the user or accept their requested slot. When the user confirms a slot, call the book_viewing function with the exact start and end ISO strings."
 
 
 async def _execute_book_viewing(lead_context: dict, slot_start: str, slot_end: str) -> str:
@@ -150,8 +164,11 @@ async def _execute_book_viewing(lead_context: dict, slot_start: str, slot_end: s
 
     # Parse datetime
     tz = pytz.timezone("Asia/Dubai")
+    now_tz = datetime.now(tz)
     try:
         viewing_dt = datetime.fromisoformat(slot_start)
+        if viewing_dt.year < now_tz.year:
+            viewing_dt = viewing_dt.replace(year=now_tz.year, month=now_tz.month, day=now_tz.day)
         if viewing_dt.tzinfo is None:
             viewing_dt = tz.localize(viewing_dt)
     except Exception:
@@ -211,6 +228,10 @@ async def _execute_book_viewing(lead_context: dict, slot_start: str, slot_end: s
     }
     if assigned_agent_id:
         insert_data["agent_id"] = assigned_agent_id
+    else:
+        fallback_agent = sb.table("agents").select("id").eq("agency_id", agency_id).eq("is_active", True).limit(1).execute()
+        if fallback_agent.data:
+            insert_data["agent_id"] = fallback_agent.data[0]["id"]
 
     result = sb.table("viewings").insert(insert_data).execute()
     viewing = result.data[0] if result.data else {}
@@ -241,10 +262,19 @@ async def qualify_and_respond(
     """Generate AI WhatsApp response for lead qualification with tool use (slots + booking)."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT_QUALIFY}]
 
-    # Add lead context as first assistant context
+    import pytz
+    from datetime import datetime
+    now_dubai = datetime.now(pytz.timezone("Asia/Dubai"))
+    current_time_str = now_dubai.strftime("%A, %d %B %Y, %I:%M %p (Asia/Dubai)")
+
+    # Add lead context and current real-world time as system context
     context_msg = (
+        f"Current Real-World Date & Time: {current_time_str}\n"
         f"Lead info: Name={lead_context.get('name')}, "
         f"Property interest={lead_context.get('property_ref', 'unknown')}, "
+        f"Location preference={lead_context.get('location_pref', 'unknown')}, "
+        f"Bedrooms={lead_context.get('bedrooms', 'unknown')}, "
+        f"Budget={lead_context.get('budget_max', 'unknown')}, "
         f"Source={lead_context.get('source')}, "
         f"Current stage={lead_context.get('ai_stage', 'greeting')}, "
         f"Lead ID={lead_context.get('id')}"

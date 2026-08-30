@@ -50,18 +50,18 @@ async def get_dashboard_overview(
     # branch_id → agents in THIS agency's branch → their leads/viewings/contracts.
     # Scoped to the caller's agency: a foreign branch_id resolves to zero agents.
     branch_agent_ids = None
-    if branch_id:
+    if branch_id and branch_id.strip() not in ("All branches", "All", "all", ""):
         branch_rows = (
             sb.table("agents")
             .select("id")
             .eq("agency_id", agency_id)
-            .eq("branch", branch_id)
+            .eq("branch", branch_id.strip())
             .execute()
             .data or []
         )
         branch_agent_ids = [a["id"] for a in branch_rows]
 
-    effective_agent_id = agent_id
+    effective_agent_id = agent_id if (agent_id and str(agent_id).strip() not in ("All agents", "All", "all", "")) else None
     if branch_agent_ids is not None:
         if effective_agent_id:
             if effective_agent_id not in branch_agent_ids:
@@ -131,8 +131,8 @@ async def get_dashboard_overview(
         sb.table("leads").select("*").eq("agency_id", agency_id),
         "assigned_agent_id",
     )
-    if platform:
-        leads_query = leads_query.ilike("source", f"%{platform}%")
+    if platform and platform.strip() not in ("All", "all", "All platforms", ""):
+        leads_query = leads_query.ilike("source", f"%{platform.strip()}%")
     if start_date:
         leads_query = leads_query.gte("created_at", start_date)
     if end_date:
