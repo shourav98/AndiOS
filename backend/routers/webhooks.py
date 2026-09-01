@@ -105,6 +105,8 @@ def _verify_twilio_request(request: Request, params: dict) -> bool:
     auth token and the exact request URL + POST parameters Twilio signed.
 
     Fails closed outside development when TWILIO_AUTH_TOKEN is unconfigured.
+    In development mode (APP_ENV=development), missing signature is accepted
+    to allow Postman testing without signature generation.
     Note: Twilio signs the PUBLIC request URL — reverse proxies must forward
     the correct scheme/host (X-Forwarded-*) for validation to succeed.
     """
@@ -112,8 +114,10 @@ def _verify_twilio_request(request: Request, params: dict) -> bool:
 
     auth_token = (getattr(settings, "TWILIO_AUTH_TOKEN", "") or "").strip()
     signature = request.headers.get("x-twilio-signature")
+    is_development = getattr(settings, "APP_ENV", "development") == "development"
+
     if not auth_token:
-        if getattr(settings, "APP_ENV", "development") != "development":
+        if not is_development:
             logger.critical(
                 "TWILIO_AUTH_TOKEN is not configured — rejecting inbound "
                 "WhatsApp webhook (fail closed)"
@@ -124,11 +128,21 @@ def _verify_twilio_request(request: Request, params: dict) -> bool:
             "webhook in development only"
         )
         return True
+
+    # Development mode: allow Postman testing without X-Twilio-Signature
     if not signature:
+        if is_development:
+            logger.warning(
+                "No X-Twilio-Signature header — accepting in development mode "
+                "(Postman/local test). Set APP_ENV=production to enforce."
+            )
+            return True
         return False
+
     validator = RequestValidator(auth_token)
     str_params = {str(k): str(v) for k, v in params.items()}
     return validator.validate(str(request.url), str_params, signature)
+
 
 
 # ─── Safe Lead Resolution ─────────────────────────────────────────────────────
