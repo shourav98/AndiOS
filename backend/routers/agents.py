@@ -68,6 +68,48 @@ def validate_and_normalize_branch(sb, agency_id: str, branch_val: Optional[str])
     )
 
 
+def _populate_agent_branch_info(sb, agency_id: str, agent_rows: list[dict]) -> list[dict]:
+    """
+    Ensures that for every agent:
+    - 'branch' is the human-readable branch name
+    - 'branch_id' is the unique branch UUID
+    """
+    if not agent_rows:
+        return []
+
+    agency_res = sb.table("agencies").select("settings").eq("id", agency_id).maybe_single().execute()
+    stored_branches = ((agency_res.data or {}).get("settings") or {}).get("branches") or []
+
+    id_to_name = {}
+    name_to_id = {}
+    for b in stored_branches:
+        b_id = b.get("id")
+        b_name = (b.get("name") or "").strip()
+        if b_id and b_name:
+            id_to_name[b_id] = b_name
+            name_to_id[b_name.lower()] = b_id
+
+    for row in agent_rows:
+        raw_b = (row.get("branch") or "").strip()
+        if not raw_b:
+            row["branch"] = None
+            row["branch_id"] = None
+            continue
+
+        if raw_b in id_to_name:
+            row["branch"] = id_to_name[raw_b]
+            row["branch_id"] = raw_b
+        elif raw_b.lower() in name_to_id:
+            row["branch"] = raw_b
+            row["branch_id"] = name_to_id[raw_b.lower()]
+        else:
+            import uuid
+            row["branch"] = raw_b
+            row["branch_id"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{agency_id}-{raw_b}"))
+
+    return agent_rows
+
+
 @router.get("", response_model=ApiResponse[list[AgentResponse]])
 async def list_agents(
     search: Optional[str] = Query(None),
@@ -82,17 +124,25 @@ async def list_agents(
 
     query = sb.table("agents").select("*").eq("agency_id", agency_id).eq("is_active", True)
 
-    if search:
+    if search and isinstance(search, str):
         clean = search.replace(",", "").replace("(", "").replace(")", "").replace("%", "").strip()
         if clean:
             query = query.or_(f"name.ilike.%{clean}%,email.ilike.%{clean}%")
-    if branch and branch != "All branches":
-        query = query.eq("branch", branch)
-    if role and role != "All agents":
+    if branch and isinstance(branch, str) and branch not in ("All branches", "All", "all", ""):
+        # Match both branch name and branch id
+        try:
+            norm_b = validate_and_normalize_branch(sb, agency_id, branch) or branch
+            query = query.or_(f"branch.eq.{norm_b},branch.eq.{branch}")
+        except Exception:
+            query = query.eq("branch", branch)
+    if role and isinstance(role, str) and role not in ("All agents", "All", "all", ""):
         query = query.eq("role", role)
 
-    result = query.order("name").range(offset, offset + limit - 1).execute()
-    return api_success(data=result.data, message="Agents retrieved successfully")
+    lim = limit if isinstance(limit, int) else 50
+    off = offset if isinstance(offset, int) else 0
+    result = query.order("name").range(off, off + lim - 1).execute()
+    formatted_agents = _populate_agent_branch_info(sb, agency_id, result.data or [])
+    return api_success(data=formatted_agents, message="Agents retrieved successfully")
 
 
 @router.get("/branches")
@@ -130,7 +180,8 @@ async def create_agent(body: AgentCreate, current_user: dict = Depends(verify_to
             agent_data["branch"] = validate_and_normalize_branch(sb, agency_id, agent_data["branch"])
 
         result = sb.table("agents").insert(agent_data).execute()
-        return api_success(data=result.data[0], message="Agent created successfully", status_code=201)
+        created_agent = _populate_agent_branch_info(sb, agency_id, result.data)[0]
+        return api_success(data=created_agent, message="Agent created successfully", status_code=201)
     except HTTPException:
         raise
     except Exception as e:
@@ -185,7 +236,7 @@ async def invite_agent(body: InviteAgentRequest, current_user: dict = Depends(ve
         if not agent_result.data:
             raise HTTPException(status_code=500, detail="Failed to create agent record")
 
-        agent = agent_result.data[0]
+        agent_formatted = _populate_agent_branch_info(sb, agency_id, [agent])[0]
 
         # Step 2: Send Supabase invite email
         try:
@@ -206,7 +257,7 @@ async def invite_agent(body: InviteAgentRequest, current_user: dict = Depends(ve
             # Agent row is already created — they can still register manually
 
         return api_success(
-            data=agent,
+            data=agent_formatted,
             message=f"Invitation sent to {body.email}",
             status_code=201,
         )
@@ -252,6 +303,8 @@ async def get_agent(agent_id: UUID, current_user: dict = Depends(verify_token)):
     if not agent.data:
         raise HTTPException(status_code=404, detail="Agent not found")
 
+    agent_formatted = _populate_agent_branch_info(sb, agency_id, [agent.data])[0]
+
     # Agent stats
     leads = sb.table("leads").select("status").eq("assigned_agent_id", str(agent_id)).execute().data
     viewings = sb.table("viewings").select("status").eq("agent_id", str(agent_id)).execute().data
@@ -262,7 +315,7 @@ async def get_agent(agent_id: UUID, current_user: dict = Depends(verify_token)):
         "total_viewings": len(viewings),
         "viewings_completed": sum(1 for v in viewings if v["status"] == "completed"),
     }
-    return api_success(data={**agent.data, "stats": stats}, message="Agent profile retrieved successfully")
+    return api_success(data={**agent_formatted, "stats": stats}, message="Agent profile retrieved successfully")
 
 
 @router.patch("/{agent_id}", response_model=ApiResponse[AgentResponse])
@@ -293,7 +346,8 @@ async def update_agent(agent_id: UUID, body: AgentUpdate, current_user: dict = D
     result = sb.table("agents").update(update_data).eq("id", str(agent_id)).eq("agency_id", agency_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Agent not found")
-    return api_success(data=result.data[0], message="Agent updated successfully")
+    updated_agent = _populate_agent_branch_info(sb, agency_id, result.data)[0]
+    return api_success(data=updated_agent, message="Agent updated successfully")
 
 
 @router.delete("/{agent_id}")
