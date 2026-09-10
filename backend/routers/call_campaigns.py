@@ -6,6 +6,7 @@ from middleware.auth_middleware import verify_token
 from utils.response import api_success
 from utils.tenant import require_agency_id, is_management_role
 from utils.plan_limits import check_campaign_limit, get_plan_limits
+from services.quota_service import check_and_consume_voice_quota, refund_voice_quota
 import logging
 
 logger = logging.getLogger(__name__)
@@ -157,12 +158,33 @@ async def run_campaign(campaign_id: str, current_user: dict = Depends(verify_tok
             detail="Vapi AI calling is not configured. Please configure VAPI_API_KEY and VAPI_ASSISTANT_ID in environment."
         )
 
+    # ── Voice quota gate (shared gateway): check before triggering Vapi ──
+    # Atomic check — if quota exceeded, abort campaign and notify dashboard.
+    quota_allowed = await check_and_consume_voice_quota(agency_id)
+    if not quota_allowed:
+        # Revert status to Paused so the campaign can be resumed after top-up
+        sb.table("call_campaigns").update({"status": "Paused"}).eq("id", campaign_id).execute()
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                "Monthly voice call quota exceeded. "
+                "Please purchase an Add-on pack to resume calling. "
+                "Agent login and lead history remain fully accessible."
+            )
+        )
+
     # Update status to Running
     sb.table("call_campaigns").update({"status": "Running"}).eq("id", campaign_id).execute()
 
     # Trigger first batch
     from services.vapi_service import run_campaign_batch
-    await run_campaign_batch(campaign_id, agency_id, batch_size=10)
+    try:
+        await run_campaign_batch(campaign_id, agency_id, batch_size=10)
+    except Exception as vapi_err:
+        # Refund the quota unit if Vapi setup itself fails
+        await refund_voice_quota(agency_id)
+        sb.table("call_campaigns").update({"status": "Paused"}).eq("id", campaign_id).execute()
+        raise HTTPException(status_code=502, detail=f"Vapi call setup failed: {vapi_err}")
 
     # Schedule recurring batches via APScheduler
     from services.scheduler import scheduler

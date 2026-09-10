@@ -371,3 +371,68 @@ async def landlord_weekly_report_job():
 # Register cron jobs
 scheduler.add_job(weekly_reengagement_job, CronTrigger(day_of_week='wed', hour=10), id="weekly_reengagement_job", replace_existing=True)
 scheduler.add_job(landlord_weekly_report_job, CronTrigger(day_of_week='fri', hour=17), id="landlord_weekly_report_job", replace_existing=True)
+
+
+# ─── WhatsApp Number Provisioning Lifecycle Jobs ───────────────────────────────
+
+async def poll_provisioned_whatsapp_senders_job():
+    """
+    Runs every 15 minutes.
+    Checks all agencies in 'provisioned' status to see if Meta/Twilio have approved
+    their WhatsApp Sender. Transitions approved senders to 'active'.
+    Also fires a stale-approval alert for agencies pending > 48 hours.
+    """
+    try:
+        from services.provisioning_service import check_stale_provisioned_agencies, check_twilio_sender_status
+        from database.supabase_client import get_supabase
+
+        sb = get_supabase()
+        provisioned = sb.table("agencies").select(
+            "id, dedicated_whatsapp_number, whatsapp_number_status"
+        ).eq("whatsapp_number_status", "provisioned").execute()
+
+        if not provisioned or not provisioned.data:
+            return
+
+        for agency in provisioned.data:
+            try:
+                await check_twilio_sender_status(
+                    agency["id"],
+                    agency.get("dedicated_whatsapp_number"),
+                )
+            except Exception as e:
+                logger.error(f"[Scheduler] Error polling sender for agency {agency['id']}: {e}")
+
+        # Fire stale alert for any agency > 48h without approval
+        await check_stale_provisioned_agencies(hours_threshold=48.0)
+    except Exception as e:
+        logger.error(f"[Scheduler] Error in poll_provisioned_whatsapp_senders_job: {e}")
+
+
+async def recover_stuck_provisioning_job():
+    """
+    Runs every 15 minutes.
+    Crash-recovery sweep: finds agencies stuck in 'provisioning' state > 15 minutes
+    without a purchased number (indicates a crashed backend mid-Twilio call)
+    and marks them 'failed' so admins can retry.
+    """
+    try:
+        from services.provisioning_service import recover_stuck_provisioning_agencies
+        await recover_stuck_provisioning_agencies(minutes_threshold=15.0)
+    except Exception as e:
+        logger.error(f"[Scheduler] Error in recover_stuck_provisioning_job: {e}")
+
+
+# Register provisioning lifecycle jobs
+scheduler.add_job(
+    poll_provisioned_whatsapp_senders_job,
+    CronTrigger(minute="*/15"),
+    id="poll_provisioned_whatsapp_senders_job",
+    replace_existing=True,
+)
+scheduler.add_job(
+    recover_stuck_provisioning_job,
+    CronTrigger(minute="*/15"),
+    id="recover_stuck_provisioning_job",
+    replace_existing=True,
+)

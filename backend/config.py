@@ -33,10 +33,19 @@ class Settings(BaseSettings):
     # or '?token=' query param). Mandatory in production — requests are rejected
     # without it (fail closed). Configure the callback URL accordingly in 360dialog.
     WHATSAPP_WEBHOOK_TOKEN: str = ""
-    # Twilio (optional)
+    # Twilio — Master account credentials (Centralized Shared Gateway model).
+    # All agencies share this single Twilio account. Each agency gets a
+    # dedicated phone number purchased from this master account and stored
+    # in agencies.dedicated_whatsapp_number / dedicated_voice_number.
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""
+    # Default outbound number used when an agency has no dedicated number yet
     TWILIO_WHATSAPP_NUMBER: str = ""
+
+    # ─── Quota Enforcement ────────────────────────────────────────────────────
+    # Set to False in development to bypass all quota checks (allow unlimited usage).
+    # Always True in production.
+    QUOTA_ENFORCEMENT_ENABLED: bool = True
 
     # Google Calendar
     GOOGLE_CLIENT_ID: str = ""

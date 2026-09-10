@@ -50,7 +50,7 @@ async def get_dashboard_overview(
     # branch_id → agents in THIS agency's branch → their leads/viewings/contracts.
     # Scoped to the caller's agency: a foreign branch_id resolves to zero agents.
     branch_agent_ids = None
-    if branch_id and branch_id.strip() not in ("All branches", "All", "all", ""):
+    if isinstance(branch_id, str) and branch_id.strip() not in ("All branches", "All", "all", ""):
         target_branch_val = branch_id.strip()
         agency_res = sb.table("agencies").select("settings").eq("id", agency_id).maybe_single().execute()
         stored_branches = ((agency_res.data or {}).get("settings") or {}).get("branches") or []
@@ -59,14 +59,11 @@ async def get_dashboard_overview(
                 target_branch_val = b.get("name", target_branch_val)
                 break
 
-        branch_rows = (
-            sb.table("agents")
-            .select("id")
-            .eq("agency_id", agency_id)
-            .or_(f"branch.eq.{target_branch_val},branch.eq.{branch_id.strip()}")
-            .execute()
-            .data or []
-        )
+        agents_base_query = sb.table("agents").select("id").eq("agency_id", agency_id)
+        if target_branch_val == branch_id.strip():
+            branch_rows = agents_base_query.eq("branch", target_branch_val).execute().data or []
+        else:
+            branch_rows = agents_base_query.or_(f"branch.eq.{target_branch_val},branch.eq.{branch_id.strip()}").execute().data or []
         branch_agent_ids = [a["id"] for a in branch_rows]
 
     effective_agent_id = agent_id if (agent_id and str(agent_id).strip() not in ("All agents", "All", "all", "")) else None
@@ -135,12 +132,13 @@ async def get_dashboard_overview(
             pass
 
     # 2. Query Leads (Current Period)
+    effective_platform = platform.strip() if (isinstance(platform, str) and platform.strip() not in ("All", "all", "All platforms", "")) else None
     leads_query = _scoped(
         sb.table("leads").select("*").eq("agency_id", agency_id),
         "assigned_agent_id",
     )
-    if platform and platform.strip() not in ("All", "all", "All platforms", ""):
-        leads_query = leads_query.ilike("source", f"%{platform.strip()}%")
+    if effective_platform:
+        leads_query = leads_query.ilike("source", f"%{effective_platform}%")
     if start_date:
         leads_query = leads_query.gte("created_at", start_date)
     if end_date:
@@ -178,7 +176,7 @@ async def get_dashboard_overview(
             sb.table("leads").select("*").eq("agency_id", agency_id),
             "assigned_agent_id",
         )
-        if platform: prev_leads_q = prev_leads_q.ilike("source", f"%{platform}%")
+        if effective_platform: prev_leads_q = prev_leads_q.ilike("source", f"%{effective_platform}%")
         prev_leads_q = prev_leads_q.gte("created_at", prev_start_date).lte("created_at", prev_end_date)
         prev_leads = prev_leads_q.execute().data
 

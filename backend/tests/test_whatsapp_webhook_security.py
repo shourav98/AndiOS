@@ -119,13 +119,15 @@ async def _run_twilio(sb, request, ai_reply="AI reply text"):
          patch("routers.webhooks.qualify_and_respond", new_callable=AsyncMock) as mock_ai, \
          patch("routers.webhooks.detect_handover", new_callable=AsyncMock) as mock_handover, \
          patch("routers.webhooks.extract_lead_qualifications", new_callable=AsyncMock) as mock_extract, \
-         patch("routers.webhooks.send_whatsapp_message", new_callable=AsyncMock) as mock_send:
+         patch("routers.webhooks.send_whatsapp_message", new_callable=AsyncMock) as mock_send, \
+         patch("routers.webhooks.send_whatsapp_for_agency", new_callable=AsyncMock) as mock_send_agency:
         mock_ai.return_value = ai_reply
         mock_handover.return_value = {"needs_handover": False}
         mock_extract.return_value = {}
         mock_send.return_value = {"status": "sent", "sid": "SM1"}
+        mock_send_agency.return_value = {"status": "sent", "sid": "SM1"}
         result = await whatsapp_inbound(request)
-        return result, mock_ai, mock_send
+        return result, mock_ai, mock_send_agency
 
 
 # ─── AUTHENTICATED REQUESTS BEHAVE AS BEFORE ──────────────────────────────────
@@ -260,8 +262,9 @@ async def test_360dialog_production_without_config_fails_closed():
 async def test_twilio_missing_signature_rejected():
     sb = _mock_sb([_lead("lead-1", "agency-1")])
     request = FakeRequest(form_data=_twilio_params())  # no X-Twilio-Signature
-    with pytest.raises(HTTPException) as exc_info:
-        await _run_twilio(sb, request)
+    with patch.object(settings, "APP_ENV", "production"):
+        with pytest.raises(HTTPException) as exc_info:
+            await _run_twilio(sb, request)
 
     assert exc_info.value.status_code == 403
     sb.table.return_value.insert.assert_not_called()

@@ -1,0 +1,71 @@
+name: Monthly Quota Reset
+
+# ── Description ──────────────────────────────────────────────────────────────
+# Runs on the 1st of every month at 00:00 UTC.
+# Calls POST /admin/quota/monthly-reset on the production backend.
+# This is the PRIMARY fallback when pg_cron is not available on the Supabase plan.
+#
+# Setup:
+#   1. Go to GitHub → Settings → Secrets and variables → Actions
+#   2. Add secret: ADMIN_API_KEY  (a super_admin JWT token or API key)
+#   3. Ensure the backend /admin/quota/monthly-reset endpoint is deployed
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'    # Every 1st of month at midnight UTC
+
+  # Allow manual trigger from GitHub Actions UI (for testing)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (only print what would happen, no actual reset)'
+        required: false
+        default: 'false'
+
+jobs:
+  monthly-quota-reset:
+    name: Reset Agency Monthly Quotas
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Trigger monthly quota reset
+        env:
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          echo "🔄 Starting monthly quota reset..."
+          echo "  Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "  Dry run: $DRY_RUN"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "✅ [DRY RUN] Would call POST https://andreearizan.softvencealpha.com/admin/quota/monthly-reset"
+            echo "  No actual reset performed."
+            exit 0
+          fi
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://andreearizan.softvencealpha.com/admin/quota/monthly-reset" \
+            -H "Authorization: Bearer $ADMIN_API_KEY" \
+            -H "Content-Type: application/json" \
+            --max-time 30)
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n-1)
+
+          echo "  HTTP Status: $HTTP_CODE"
+          echo "  Response: $BODY"
+
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ Monthly quota reset successful!"
+          else
+            echo "❌ Monthly quota reset FAILED with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "⚠️  Monthly quota reset failed! Agencies may have stale quota from last month."
+          echo "Manual action required: POST /admin/quota/monthly-reset"
+          # Add Slack/email notification here if needed
