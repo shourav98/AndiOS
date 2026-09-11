@@ -1,6 +1,7 @@
 """
-Webhooks Router — handles inbound leads from Property Finder, Bayut, Dubizzle
-and inbound WhatsApp messages (shared gateway), and Vapi call result callbacks.
+Webhooks Router — handles inbound leads from Property Finder, Bayut, Dubizzle,
+inbound WhatsApp messages (shared gateway), Vapi call result callbacks, and
+inbound voice calls forwarded to the Central Platform DID.
 
 POST /webhooks/property-finder   — new lead from portal (HMAC verified)
 POST /webhooks/bayut             — new lead from Bayut
@@ -8,6 +9,7 @@ POST /webhooks/dubizzle          — new lead from Dubizzle
 GET  /webhooks/whatsapp          — WhatsApp webhook verification
 POST /webhooks/whatsapp          — inbound WhatsApp message (shared gateway router)
 POST /webhooks/vapi              — Vapi call result callback
+POST /webhooks/voice/inbound     — inbound voice call (Central DID, BYON forwarding)
 """
 import time
 import json
@@ -181,6 +183,33 @@ def _verify_meta_request(request: Request, raw_body: bytes) -> bool:
 
     return hmac.compare_digest(expected, signature)
 
+
+def _parse_numeric_budget(val: Any) -> float | None:
+    """Safely parse human-written budget strings into floats for DB numeric columns."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip().lower().replace(",", "").replace("aed", "").replace("$", "").strip()
+    try:
+        import re
+        if s.endswith("k"):
+            return float(s[:-1].strip()) * 1000
+        elif s.endswith("m"):
+            return float(s[:-1].strip()) * 1000000
+        elif s.endswith("b"):
+            return float(s[:-1].strip()) * 1000000000
+        m = re.search(r"(\d+(\.\d+)?)", s)
+        if m:
+            num = float(m.group(1))
+            if "k" in s:
+                num *= 1000
+            elif "m" in s:
+                num *= 1000000
+            return num
+        return float(s)
+    except Exception:
+        return None
 
 
 # ─── Safe Lead Resolution ─────────────────────────────────────────────────────
@@ -830,6 +859,11 @@ async def whatsapp_inbound(request: Request):
                         f"[Meta BYON] Resolved agency {resolved_agency_id} "
                         f"(agent: {resolved_agent_id}) from phone_number_id {to_phone}"
                     )
+                elif to_phone and to_phone == (getattr(settings, "WHATSAPP_PHONE_NUMBER_ID", "") or "").strip():
+                    resolved_agency_id = getattr(settings, "DEFAULT_AGENCY_ID", "") or "d8798ea7-1b47-40be-ba3e-8e9593871393"
+                    logger.info(
+                        f"[Meta] Resolved fallback agency {resolved_agency_id} from platform default phone_number_id {to_phone}"
+                    )
                 else:
                     logger.warning(
                         f"[Meta BYON] No active account for phone_number_id {to_phone} — skipping"
@@ -1037,10 +1071,12 @@ async def whatsapp_inbound(request: Request):
         update_data = {}
         if qualifications.get("bedrooms"):
             update_data["bedrooms"] = qualifications["bedrooms"]
-        if qualifications.get("budget_min"):
-            update_data["budget_min"] = qualifications["budget_min"]
-        if qualifications.get("budget_max"):
-            update_data["budget_max"] = qualifications["budget_max"]
+        b_min = _parse_numeric_budget(qualifications.get("budget_min"))
+        if b_min is not None:
+            update_data["budget_min"] = b_min
+        b_max = _parse_numeric_budget(qualifications.get("budget_max"))
+        if b_max is not None:
+            update_data["budget_max"] = b_max
         if qualifications.get("location_pref"):
             update_data["location_pref"] = qualifications["location_pref"]
         if qualifications.get("purpose"):
@@ -1104,6 +1140,101 @@ async def vapi_webhook(request: Request):
         # Keep the established 200-OK contract for delivery, but never expose
         # internal exception details to the caller.
         return api_success(data={"status": "error"}, message="Vapi webhook error")
+
+
+# ─── Voice Inbound (Central DID / BYON Call Forwarding) ─────────────────────
+
+@router.post("/voice/inbound", response_class=__import__("fastapi").responses.Response)
+async def voice_inbound(request: Request):
+    """
+    Receives inbound voice calls forwarded to the Central Platform DID.
+
+    Agents configure conditional call forwarding (busy / no-answer / unreachable)
+    from their personal mobile to CENTRAL_INBOUND_DID. When Twilio receives a
+    forwarded call it POSTs here with:
+      From          — caller's phone number
+      To            — our central DID
+      ForwardedFrom — the agent's personal number that forwarded the call
+                      (may be absent if carrier strips SIP Diversion header)
+      CallSid       — unique Twilio call identifier
+
+    Resolution order:
+      Tier 1 — ForwardedFrom exact match → communication_accounts (voice)
+      Tier 2 — CRM recent-contact graph  → caller matched to active conversations
+      Tier 3 — Generic AI receptionist   → polite fallback
+
+    Returns TwiML <Dial><Sip> bridging the call to Vapi AI via BYO SIP Trunk
+    with custom X-Agent-Id / X-Agency-Id SIP headers injected for dynamic
+    persona selection.
+
+    ⚠️  Requires BYO SIP Trunk configuration in Vapi (NOT Simple Number Import).
+    ⚠️  Carrier SIP Diversion header support: most UAE major carriers (Etisalat/du)
+        pass ForwardedFrom, but some prepaid/MVNO sims strip it. Tier 2 & 3
+        fallbacks handle that case automatically.
+    """
+    from fastapi.responses import Response as FastAPIResponse
+    from services.voice_service import resolve_inbound_caller, generate_vapi_sip_twiml
+    from services.quota_service import check_and_consume_voice_quota
+    from datetime import datetime, timezone
+
+    # Parse Twilio form-encoded voice webhook payload
+    form = await request.form()
+    form_dict = dict(form)
+
+    # ── Authentication ──
+    if not _verify_twilio_request(request, form_dict):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    from_phone = (form_dict.get("From") or "").lstrip("+")
+    to_number = form_dict.get("To") or ""
+    forwarded_from = form_dict.get("ForwardedFrom") or form_dict.get("Diversion") or None
+    call_sid = form_dict.get("CallSid") or ""
+
+    logger.info(
+        f"[Voice Inbound] CallSid={call_sid} From={from_phone} "
+        f"To={to_number} ForwardedFrom={forwarded_from}"
+    )
+
+    # ── Resolve agent / agency ──
+    ctx = await resolve_inbound_caller(
+        from_phone=from_phone,
+        forwarded_from=forwarded_from,
+        to_number=to_number,
+    )
+
+    # ── Debit voice quota (optional — skip on Tier 3 fallback where no agency) ──
+    if ctx.get("agency_id"):
+        try:
+            from services.quota_service import check_and_consume_voice_quota
+            await check_and_consume_voice_quota(ctx["agency_id"])
+        except Exception as q_err:
+            # Quota failure is non-fatal for inbound calls — log and continue
+            logger.warning(f"[Voice Inbound] Quota check failed: {q_err}")
+
+    # ── Record inbound call in DB ──
+    try:
+        sb = get_supabase()
+        sb.table("calls").insert({
+            "agency_id": ctx.get("agency_id"),
+            "agent_id": ctx.get("agent_id"),
+            "phone_number": from_phone,
+            "direction": "inbound",
+            "status": "Initiated",
+            "status_value": "initiated",
+            "call_sid": call_sid,
+            "resolution_tier": ctx.get("resolution_tier", 3),
+            "call_time": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as db_err:
+        logger.warning(f"[Voice Inbound] Failed to record inbound call: {db_err}")
+
+    # ── Generate TwiML and return ──
+    twiml = generate_vapi_sip_twiml(ctx, call_sid, to_number=to_number)
+    return FastAPIResponse(
+        content=twiml,
+        media_type="application/xml",
+        status_code=200,
+    )
 
 
 # ─── Stripe Billing Webhook ───────────────────────────────────────────────────

@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     WHATSAPP_API_KEY: str = ""
     WHATSAPP_PHONE_NUMBER_ID: str = ""
     WHATSAPP_VERIFY_TOKEN: str = "andios_verify_token"
+    META_APP_SECRET: str = ""  # App Secret for Meta Cloud API X-Hub-Signature-256 verification
     # Shared secret required on INBOUND WhatsApp webhooks (header 'X-Webhook-Token'
     # or '?token=' query param). Mandatory in production — requests are rejected
     # without it (fail closed). Configure the callback URL accordingly in 360dialog.
@@ -76,6 +77,25 @@ class Settings(BaseSettings):
     # (configure as server.secret in the Vapi dashboard). Mandatory in
     # production — inbound Vapi webhooks are rejected without it (fail closed).
     VAPI_WEBHOOK_SECRET: str = ""
+    # BYO SIP Trunk configuration for inbound call bridging.
+    # Vapi's required URI structure: sip:{phone_number}@{credential_id}.sip.vapi.ai
+    # (or .sip.eu.vapi.ai for EU-hosted orgs).
+    # The credential_id must be in the subdomain position so Vapi knows which
+    # SIP Trunk / organization account the INVITE belongs to.
+    # ⚠️  MUST use BYO SIP Trunk mode — NOT Simple Number Import.
+    #     Simple Import bypasses our backend webhook; custom SIP headers
+    #     (X-Agent-Id, X-Agency-Id) never reach Vapi and agent resolution fails.
+    VAPI_SIP_CREDENTIAL_ID: str = ""
+    VAPI_SIP_DOMAIN: str = "sip.vapi.ai"
+    VAPI_SIP_URI: str = ""  # optional override if full custom SIP endpoint is specified
+
+    # ─── Voice BYON: Central Inbound DID ─────────────────────────────────────
+    # The single platform Twilio phone number all agents configure conditional
+    # call forwarding to. AndiOS receives the call, resolves the forwarding
+    # agent via SIP Diversion header (ForwardedFrom), and bridges to Vapi AI.
+    # Only 1 number needed for the entire platform (~$1.15/mo fixed lease;
+    # per-minute usage cost applies separately to actual call duration).
+    CENTRAL_INBOUND_DID: str = ""
 
     # Supabase Storage
     SUPABASE_STORAGE_BUCKET: str = "contracts"

@@ -49,11 +49,12 @@ class MetaWhatsAppAdapter(WhatsAppProvider):
         account: CommunicationAccount | None = None,
         app_secret: str = "",
     ) -> None:
+        from config import settings
         self._account = account
-        self._phone_number_id = account.phone_number_id if account else ""
-        self._access_token = account.access_token if account else ""
+        self._phone_number_id = (account.phone_number_id if account else "") or getattr(settings, "WHATSAPP_PHONE_NUMBER_ID", "") or ""
+        self._access_token = (account.access_token if account else "") or getattr(settings, "WHATSAPP_API_KEY", "") or ""
         # App secret used for webhook HMAC verification (optional in dev)
-        self._app_secret: str = app_secret or (account.metadata.get("app_secret", "") if account else "")
+        self._app_secret: str = app_secret or (account.metadata.get("app_secret", "") if account else "") or getattr(settings, "META_APP_SECRET", "") or ""
 
     @property
     def provider_name(self) -> str:

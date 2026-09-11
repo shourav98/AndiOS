@@ -32,8 +32,15 @@ Return a JSON object with:
   - reason: string (why handover needed, or null)
   - confidence: float 0-1
 
-Trigger handover when: legal questions, complex negotiations, complaints, pricing disputes, 
-requests to speak with a human, off-topic queries, or abusive language."""
+Trigger handover ONLY when:
+- The user explicitly asks to speak with a human / real agent ("speak to a human", "call me", "talk to a person")
+- Legal questions, contracts, formal complaints, pricing disputes / aggressive negotiations
+- Abusive or inappropriate language
+
+DO NOT trigger handover for:
+- Asking for viewings, dates, times, booking requests, or rescheduling
+- Asking for property details, brochures, prices, or locations
+- General greetings and follow-ups"""
 
 SYSTEM_PROMPT_REPORT = """You generate professional owner update reports for a Dubai real estate agency.
 Given structured lead/performance data, write a concise executive summary (3-5 paragraphs) covering:

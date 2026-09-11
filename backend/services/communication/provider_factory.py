@@ -59,14 +59,9 @@ def get_whatsapp_provider(account: CommunicationAccount | None = None) -> WhatsA
 
     if provider_name == "meta":
         from services.communication.meta_adapter import MetaWhatsAppAdapter
-        if account is None:
-            raise ValueError(
-                "CommunicationAccount required for Meta provider "
-                "(Meta credentials are per-agency, not global)."
-            )
         logger.debug(
-            f"[Factory] Using MetaWhatsAppAdapter for agency {account.agency_id} "
-            f"(phone_number_id={account.phone_number_id})"
+            f"[Factory] Using MetaWhatsAppAdapter"
+            + (f" for agency {account.agency_id} (phone_number_id={account.phone_number_id})" if account else " (platform default)")
         )
         return MetaWhatsAppAdapter(account)
 
@@ -119,11 +114,11 @@ async def get_whatsapp_provider_for_agency(
                 .eq("agent_id", agent_id)
                 .eq("channel", "whatsapp")
                 .eq("status", "active")
-                .maybe_single()
+                .limit(1)
                 .execute()
             )
-            if res.data:
-                row = res.data
+            if res and hasattr(res, "data") and res.data:
+                row = res.data[0]
 
         if not row:
             res = (
@@ -133,11 +128,11 @@ async def get_whatsapp_provider_for_agency(
                 .is_("agent_id", "null")
                 .eq("channel", "whatsapp")
                 .eq("status", "active")
-                .maybe_single()
+                .limit(1)
                 .execute()
             )
-            if res.data:
-                row = res.data
+            if res and hasattr(res, "data") and res.data:
+                row = res.data[0]
 
         if row:
             account = CommunicationAccount(

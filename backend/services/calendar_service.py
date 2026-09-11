@@ -168,11 +168,21 @@ def create_viewing_event(
                 # Naive: treat as UTC
                 return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        # Format Dubai time display for cross-timezone clarity
+        try:
+            import pytz
+            dubai_tz = pytz.timezone("Asia/Dubai")
+            dt_dubai = start_datetime.astimezone(dubai_tz) if start_datetime.tzinfo else start_datetime
+            dubai_time_str = dt_dubai.strftime("%I:%M %p")
+        except Exception:
+            dubai_time_str = start_datetime.strftime("%I:%M %p")
+
         event = {
-            "summary": f"🏠 Viewing: {lead_name} — {property_address}",
+            "summary": f"🏠 Viewing: {lead_name} — {property_address} ({dubai_time_str} Dubai Time)",
             "description": (
                 f"Lead: {lead_name}\nPhone: {lead_phone}\n"
                 f"Property: {property_address}\n"
+                f"Time: {dubai_time_str} (Dubai Time, GMT+4)\n"
                 f"Booked via AndiOS AI"
                 + (f"\nAgent: {agent_name}" if agent_name else "")
             ),
