@@ -144,7 +144,7 @@ async def get_whatsapp_provider_for_agency(
                 phone_number=row.get("phone_number", ""),
                 external_account_id=row.get("external_account_id", ""),
                 phone_number_id=row.get("phone_number_id", ""),
-                access_token=row.get("access_token", ""),  # Already decrypted by DB RPC
+                access_token=row.get("access_token") or getattr(settings, "WHATSAPP_API_KEY", ""),
                 status=row.get("status", "active"),
                 metadata=row.get("metadata", {}),
             )

@@ -208,8 +208,29 @@ def _parse_numeric_budget(val: Any) -> float | None:
                 num *= 1000000
             return num
         return float(s)
-    except Exception:
+    except (ValueError, TypeError):
         return None
+
+
+def _parse_bedrooms(val: Any) -> int | None:
+    """Safely parse bedroom count (e.g. '2BHK', '3 bed', 'Studio', 2) into integer."""
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    s = str(val).strip().lower()
+    if "studio" in s:
+        return 0
+    import re
+    m = re.search(r"\d+", s)
+    if m:
+        try:
+            return int(m.group(0))
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 # ─── Safe Lead Resolution ─────────────────────────────────────────────────────
@@ -1069,8 +1090,9 @@ async def whatsapp_inbound(request: Request):
         all_history = history + [{"sender_type": "lead", "message_body": message_body}]
         qualifications = await extract_lead_qualifications(all_history)
         update_data = {}
-        if qualifications.get("bedrooms"):
-            update_data["bedrooms"] = qualifications["bedrooms"]
+        b_count = _parse_bedrooms(qualifications.get("bedrooms"))
+        if b_count is not None:
+            update_data["bedrooms"] = b_count
         b_min = _parse_numeric_budget(qualifications.get("budget_min"))
         if b_min is not None:
             update_data["budget_min"] = b_min
@@ -1082,7 +1104,10 @@ async def whatsapp_inbound(request: Request):
         if qualifications.get("purpose"):
             update_data["purpose"] = qualifications["purpose"]
         if update_data:
-            sb.table("leads").update(update_data).eq("id", lead_id).execute()
+            try:
+                sb.table("leads").update(update_data).eq("id", lead_id).execute()
+            except Exception as qual_upd_err:
+                logger.warning(f"Could not update qualification for lead {lead_id}: {qual_upd_err}")
 
 
     return api_success(message="WhatsApp messages processed successfully")
