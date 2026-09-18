@@ -11,10 +11,12 @@ POST /webhooks/whatsapp          — inbound WhatsApp message (shared gateway ro
 POST /webhooks/vapi              — Vapi call result callback
 POST /webhooks/voice/inbound     — inbound voice call (Central DID, BYON forwarding)
 """
+from __future__ import annotations
 import time
 import json
 import hmac
 import hashlib
+from typing import Any, Optional, Dict, List
 from fastapi import APIRouter, Request, HTTPException, Query
 from fastapi.responses import JSONResponse
 from database.supabase_client import get_supabase
