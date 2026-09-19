@@ -100,6 +100,7 @@ def _mock_sb(candidate_leads):
 async def _run_dialog(sb, request, ai_reply="AI reply text"):
     with patch("routers.webhooks.get_supabase", return_value=sb), \
          patch.object(settings, "WHATSAPP_PROVIDER", "360dialog"), \
+         patch("routers.webhooks._check_and_mark_message_id", return_value=True), \
          patch("routers.webhooks.qualify_and_respond", new_callable=AsyncMock) as mock_ai, \
          patch("routers.webhooks.detect_handover", new_callable=AsyncMock) as mock_handover, \
          patch("routers.webhooks.extract_lead_qualifications", new_callable=AsyncMock) as mock_extract, \
@@ -116,6 +117,7 @@ async def _run_twilio(sb, request, ai_reply="AI reply text"):
     with patch("routers.webhooks.get_supabase", return_value=sb), \
          patch.object(settings, "WHATSAPP_PROVIDER", "twilio"), \
          patch.object(settings, "TWILIO_AUTH_TOKEN", TWILIO_AUTH_TOKEN), \
+         patch("routers.webhooks._check_and_mark_message_id", return_value=True), \
          patch("routers.webhooks.qualify_and_respond", new_callable=AsyncMock) as mock_ai, \
          patch("routers.webhooks.detect_handover", new_callable=AsyncMock) as mock_handover, \
          patch("routers.webhooks.extract_lead_qualifications", new_callable=AsyncMock) as mock_extract, \

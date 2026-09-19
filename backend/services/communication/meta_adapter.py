@@ -2,7 +2,7 @@
 Meta Cloud API WhatsApp Adapter.
 
 Handles:
-  - Outbound text messages via graph.facebook.com/v19.0/{phone_number_id}/messages
+  - Outbound text messages via graph.facebook.com/{version}/{phone_number_id}/messages
   - Inbound webhook verification (X-Hub-Signature-256 HMAC-SHA256)
   - Inbound payload parsing (Meta Cloud API webhook format)
 
@@ -10,7 +10,11 @@ This adapter is initialized per-agency using the agency's own
 CommunicationAccount credentials (WABA ID, phone_number_id, access_token).
 It does NOT read from global .env settings — credentials come from the DB.
 
+Graph API version is controlled by META_GRAPH_API_VERSION in .env (default: v22.0).
+Do NOT hardcode versions here — Meta deprecates old versions regularly.
+
 Reference: https://developers.facebook.com/docs/whatsapp/cloud-api/messages
+Changelog: https://developers.facebook.com/docs/graph-api/changelog
 """
 from __future__ import annotations
 
@@ -31,7 +35,14 @@ from services.communication.base import (
 
 logger = logging.getLogger(__name__)
 
-META_GRAPH_URL = "https://graph.facebook.com/v19.0"
+META_GRAPH_BASE = "https://graph.facebook.com"
+
+
+def _graph_url() -> str:
+    """Return the versioned Graph API base URL from settings."""
+    from config import settings
+    version = getattr(settings, "META_GRAPH_API_VERSION", "v22.0") or "v22.0"
+    return f"{META_GRAPH_BASE}/{version}"
 
 
 class MetaWhatsAppAdapter(WhatsAppProvider):
@@ -78,7 +89,7 @@ class MetaWhatsAppAdapter(WhatsAppProvider):
         For free-form text (within the 24h window):
           pass only body.
         """
-        url = f"{META_GRAPH_URL}/{self._phone_number_id}/messages"
+        url = f"{_graph_url()}/{self._phone_number_id}/messages"
         headers = {
             "Authorization": f"Bearer {self._access_token}",
             "Content-Type": "application/json",

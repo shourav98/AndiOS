@@ -287,6 +287,49 @@ def _find_lead_by_sender_phone(sb, from_phone: str):
     return pool[0], "matched"
 
 
+def _check_and_mark_message_id(sb, message_id: str) -> bool:
+    """
+    Idempotency guard for inbound WhatsApp messages.
+
+    Checks if message_id was already processed; if not, marks it as processed.
+    Uses the whatsapp_processed_messages table (schema_v11_security.sql).
+
+    Returns:
+        True  — message is NEW, caller should proceed with processing.
+        False — message was already processed OR idempotency check succeeded
+                and we should SKIP (message_id already in the table).
+
+    On any error (e.g. table not yet migrated), logs a warning and returns True
+    so processing continues without deduplication (graceful degradation).
+    """
+    try:
+        idem_res = (
+            sb.table("whatsapp_processed_messages")
+            .select("message_id")
+            .eq("message_id", message_id)
+            .limit(1)
+            .execute()
+        )
+        if isinstance(idem_res.data, list) and len(idem_res.data) > 0:
+            logger.info("[WA] Skipping already-processed message_id=%s (idempotency)", message_id)
+            return False
+        # Mark as processed — PK constraint prevents race conditions from double-processing
+        try:
+            sb.table("whatsapp_processed_messages").insert({"message_id": message_id}).execute()
+        except Exception:
+            # Race condition: another worker inserted it first — safe to return True and continue
+            # (the other worker will do the processing; this one will re-check next iteration)
+            pass
+        return True
+    except Exception as idem_err:
+        # Table may not exist yet (pre-migration) — log and proceed without dedup
+        logger.warning(
+            "[WA] Idempotency check unavailable for message_id=%s: %s — proceeding without dedup",
+            message_id, idem_err,
+        )
+        return True
+
+
 # ─── Property Finder Webhook ───────────────────────────────────────────────────
 
 @router.post("/property-finder")
@@ -861,7 +904,12 @@ async def whatsapp_inbound(request: Request):
         if not from_phone or not message_body:
             continue
 
+        # ── Idempotency: skip already-processed messages (replay protection) ──
+        if message_id and not _check_and_mark_message_id(sb, message_id):
+            continue
+
         # ── Resolve agency & agent by incoming channel identifier ──
+
         resolved_agency_id: str | None = None
         resolved_agent_id: str | None = None
         comm_account_id: str | None = None

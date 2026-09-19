@@ -25,23 +25,34 @@ class Settings(BaseSettings):
     OPENAI_MODEL: str = "gpt-4o"
 
     # WhatsApp
-    WHATSAPP_PROVIDER: str = "360dialog"
+    WHATSAPP_PROVIDER: str = "meta"  # Default provider: meta | twilio | 360dialog
     WHATSAPP_API_KEY: str = ""
+    # Meta Graph API version — upgrade periodically. v19.0 is DEPRECATED (Sep 2026).
+    # Check https://developers.facebook.com/docs/graph-api/changelog for current stable.
+    META_GRAPH_API_VERSION: str = "v22.0"
     WHATSAPP_PHONE_NUMBER_ID: str = ""
     WHATSAPP_VERIFY_TOKEN: str = "andios_verify_token"
     META_APP_SECRET: str = ""  # App Secret for Meta Cloud API X-Hub-Signature-256 verification
+    META_APP_ID: str = ""      # Meta App ID — required for Embedded Signup token exchange
     # Shared secret required on INBOUND WhatsApp webhooks (header 'X-Webhook-Token'
     # or '?token=' query param). Mandatory in production — requests are rejected
     # without it (fail closed). Configure the callback URL accordingly in 360dialog.
     WHATSAPP_WEBHOOK_TOKEN: str = ""
     # Twilio — Master account credentials (Centralized Shared Gateway model).
-    # All agencies share this single Twilio account. Each agency gets a
-    # dedicated phone number purchased from this master account and stored
-    # in agencies.dedicated_whatsapp_number / dedicated_voice_number.
+    # DEPRECATED: New agencies use Meta Embedded Signup (BYON). Existing agencies
+    # provisioned with Twilio continue to work. Guarded by ENABLE_TWILIO_PROVISIONING.
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""
     # Default outbound number used when an agency has no dedicated number yet
     TWILIO_WHATSAPP_NUMBER: str = ""
+    # Feature flag: set True ONLY to allow legacy Twilio auto-provisioning for existing agencies.
+    # New agencies must use Embedded Signup. Default: False (disabled).
+    ENABLE_TWILIO_PROVISIONING: bool = False
+
+    # Token Encryption — optional separate key for access_token encryption.
+    # If not set, SECRET_KEY is used (via PBKDF2 derivation in utils/crypto.py).
+    # Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    TOKEN_ENCRYPTION_KEY: str = ""
 
     # ─── Quota Enforcement ────────────────────────────────────────────────────
     # Set to False in development to bypass all quota checks (allow unlimited usage).

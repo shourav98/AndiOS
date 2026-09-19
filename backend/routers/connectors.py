@@ -1,16 +1,19 @@
 """
 Connectors Router — Integrations / Connectors page
-GET  /connectors                            — list all connectors and status
-POST /connectors/{name}/connect             — save API credentials (Step 1)
-GET  /connectors/{name}/listings            — fetch listings for import (Step 2)
-POST /connectors/{name}/activate            — finish & activate connector (Step 3)
-GET  /connectors/{name}/webhook-url         — get webhook URL for connector
-POST /connectors/{name}/disconnect          — disconnect any connector
-GET  /connectors/google-calendar/auth       — start Google OAuth flow
-GET  /connectors/google-calendar/callback   — handle OAuth callback
-POST /connectors/google-calendar/disconnect — disconnect Google Calendar
-POST /connectors/whatsapp/test              — send a test WhatsApp message
-POST /connectors/property-finder/test       — send a test PF webhook
+GET  /connectors                                    — list all connectors and status
+POST /connectors/{name}/connect                     — save API credentials (Step 1)
+GET  /connectors/{name}/listings                    — fetch listings for import (Step 2)
+POST /connectors/{name}/activate                    — finish & activate connector (Step 3)
+GET  /connectors/{name}/webhook-url                 — get webhook URL for connector
+POST /connectors/{name}/disconnect                  — disconnect any connector
+GET  /connectors/google-calendar/auth               — start Google OAuth flow
+GET  /connectors/google-calendar/callback           — handle OAuth callback
+POST /connectors/google-calendar/disconnect         — disconnect Google Calendar
+POST /connectors/whatsapp/test                      — send a test WhatsApp message
+POST /connectors/whatsapp/embedded-signup-callback  — Meta Embedded Signup v4 token exchange
+GET  /connectors/whatsapp/status                    — get WhatsApp connection status
+DELETE /connectors/whatsapp/disconnect              — disconnect WhatsApp account
+POST /connectors/property-finder/test               — send a test PF webhook
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
@@ -374,6 +377,357 @@ async def test_whatsapp(to_phone: str = Query(...), current_user: dict = Depends
     )
 
     return api_success(data={"provider": settings.WHATSAPP_PROVIDER}, message="WhatsApp test message sent")
+
+
+# ─── Meta Embedded Signup v4 ─────────────────────────────────────────────────
+# Reference: https://developers.facebook.com/docs/whatsapp/embedded-signup
+
+class EmbeddedSignupCallbackRequest(BaseModel):
+    """
+    Payload sent by the frontend after the user completes the Meta Embedded Signup
+    (ESU v4) popup. The JS SDK returns these fields in the onMessage callback.
+
+    Fields:
+        code:           The authorization code to exchange for a system user token.
+        waba_id:        The WhatsApp Business Account ID.
+        phone_number_id: Meta's phone number ID for this number.
+        is_coexistence: True if the number was already in use with WhatsApp Business App.
+        agent_id:       Optional — if connecting for a specific agent (BYON).
+    """
+    code: str
+    waba_id: str
+    phone_number_id: str
+    is_coexistence: bool = False
+    agent_id: Optional[str] = None
+
+
+async def _exchange_code_for_token(code: str) -> dict:
+    """
+    Exchange the ESU authorization code for a system user access token.
+    POST https://graph.facebook.com/{version}/oauth/access_token
+    Reference: https://developers.facebook.com/docs/whatsapp/embedded-signup/token-exchange
+    """
+    import httpx
+    graph_version = getattr(settings, "META_GRAPH_API_VERSION", "v22.0")
+    url = f"https://graph.facebook.com/{graph_version}/oauth/access_token"
+    params = {
+        "client_id": getattr(settings, "META_APP_ID", ""),
+        "client_secret": getattr(settings, "META_APP_SECRET", ""),
+        "code": code,
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _register_phone_number(phone_number_id: str, access_token: str) -> None:
+    """
+    Register the phone number for Cloud API use.
+    POST https://graph.facebook.com/{version}/{phone_number_id}/register
+    Reference: https://developers.facebook.com/docs/whatsapp/cloud-api/reference/registration
+    """
+    import httpx
+    graph_version = getattr(settings, "META_GRAPH_API_VERSION", "v22.0")
+    url = f"https://graph.facebook.com/{graph_version}/{phone_number_id}/register"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "pin": "000000"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code not in (200, 201):
+            logger.error("[ESU] Phone register error %s: %s", resp.status_code, resp.text)
+            # Non-fatal for coexistence numbers that are already registered
+            if resp.status_code != 400:
+                resp.raise_for_status()
+
+
+async def _subscribe_app_to_waba(
+    waba_id: str,
+    access_token: str,
+    is_coexistence: bool,
+) -> None:
+    """
+    Subscribe this app to WABA webhooks.
+    POST https://graph.facebook.com/{version}/{waba_id}/subscribed_apps
+
+    For Coexistence accounts, additional webhook fields are required:
+      - smb_message_echoes  (messages sent from the mobile WhatsApp Business App)
+      - history             (historical message sync)
+      - smb_app_state_sync  (app state synchronization)
+    Reference: https://developers.facebook.com/docs/whatsapp/embedded-signup/coexistence
+    """
+    import httpx
+    graph_version = getattr(settings, "META_GRAPH_API_VERSION", "v22.0")
+    url = f"https://graph.facebook.com/{graph_version}/{waba_id}/subscribed_apps"
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    # Standard fields
+    webhook_fields = "messages,message_template_status_update,account_update"
+    if is_coexistence:
+        # Additional fields required for WhatsApp Coexistence
+        # Reference: https://developers.facebook.com/docs/whatsapp/embedded-signup/coexistence
+        webhook_fields += ",smb_message_echoes,history,smb_app_state_sync"
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(url, headers=headers, params={"webhook_fields": webhook_fields})
+        if resp.status_code not in (200, 201):
+            logger.warning("[ESU] Subscribe app to WABA error %s: %s", resp.status_code, resp.text)
+
+
+async def _fetch_phone_number_details(phone_number_id: str, access_token: str) -> dict:
+    """
+    Fetch the actual E.164 phone number for this phone_number_id.
+    GET https://graph.facebook.com/{version}/{phone_number_id}
+    """
+    import httpx
+    graph_version = getattr(settings, "META_GRAPH_API_VERSION", "v22.0")
+    url = f"https://graph.facebook.com/{graph_version}/{phone_number_id}"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    params = {"fields": "display_phone_number,verified_name,quality_rating,name_status"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(url, headers=headers, params=params)
+        if resp.status_code == 200:
+            return resp.json()
+    return {}
+
+
+@router.post("/whatsapp/embedded-signup-callback")
+async def whatsapp_embedded_signup_callback(
+    body: EmbeddedSignupCallbackRequest,
+    current_user: dict = Depends(verify_token),
+):
+    """
+    Meta Embedded Signup v4 backend callback.
+
+    Called by the frontend after the user completes the ESU popup.
+    This endpoint:
+      1. Validates input
+      2. Exchanges the auth code for a system user access token
+      3. Fetches the phone number details (E.164 number, display name)
+      4. Registers the phone number for Cloud API use
+      5. Subscribes the app to WABA webhooks (+ coexistence fields if needed)
+      6. Encrypts and stores the token in communication_accounts
+      7. Returns the connected account summary
+
+    Required env vars: META_APP_ID, META_APP_SECRET, META_GRAPH_API_VERSION
+    """
+    from utils.crypto import encrypt_token
+    from datetime import datetime, timezone, timedelta
+    import re
+
+    agency_id = require_agency_id(current_user)
+    agent_id = body.agent_id  # None = agency default; UUID = per-agent BYON
+
+    # Validate META_APP_SECRET is configured
+    if not getattr(settings, "META_APP_SECRET", ""):
+        raise HTTPException(
+            status_code=503,
+            detail="META_APP_SECRET is not configured. Cannot exchange Embedded Signup code.",
+        )
+
+    # ── Step 1: Exchange code for access token ──
+    try:
+        token_response = await _exchange_code_for_token(body.code)
+    except Exception as exc:
+        logger.error("[ESU] Token exchange failed for agency %s: %s", agency_id, exc)
+        raise HTTPException(status_code=502, detail=f"Meta token exchange failed: {exc}")
+
+    access_token = token_response.get("access_token", "")
+    if not access_token:
+        raise HTTPException(
+            status_code=502,
+            detail="Meta returned no access_token. Check that META_APP_ID and META_APP_SECRET are correct.",
+        )
+
+    # Determine token expiry (long-lived = ~60 days; System User = permanent)
+    expires_in = token_response.get("expires_in")  # seconds, or None for permanent
+    token_expires_at = (
+        (datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))).isoformat()
+        if expires_in
+        else None
+    )
+
+    # ── Step 2: Fetch phone number details ──
+    phone_details = await _fetch_phone_number_details(body.phone_number_id, access_token)
+    display_phone = phone_details.get("display_phone_number", "")
+    # Normalize: strip spaces, dashes, leading '+'
+    phone_e164_digits = re.sub(r"[^\d]", "", display_phone)
+    verified_name = phone_details.get("verified_name", "")
+
+    # ── Step 3: Register phone number for Cloud API ──
+    try:
+        await _register_phone_number(body.phone_number_id, access_token)
+    except Exception as exc:
+        logger.warning("[ESU] Phone registration warning for %s: %s", body.phone_number_id, exc)
+        # Non-fatal — coexistence numbers may already be registered
+
+    # ── Step 4: Subscribe app to WABA webhooks ──
+    try:
+        await _subscribe_app_to_waba(body.waba_id, access_token, body.is_coexistence)
+    except Exception as exc:
+        logger.warning("[ESU] Webhook subscription warning for WABA %s: %s", body.waba_id, exc)
+
+    # ── Step 5: Encrypt token and upsert communication_accounts ──
+    encrypted_token = encrypt_token(access_token)
+
+    sb = get_supabase()
+    upsert_data = {
+        "agency_id": agency_id,
+        "agent_id": agent_id,
+        "channel": "whatsapp",
+        "provider": "meta",
+        "phone_number": phone_e164_digits,
+        "phone_number_id": body.phone_number_id,
+        "external_account_id": body.waba_id,
+        "access_token": encrypted_token,
+        "token_expires_at": token_expires_at,
+        "status": "active",
+        "is_coexistence": body.is_coexistence,
+        "meta_onboarding_state": "embedded_signup",
+        "connected_at": datetime.now(timezone.utc).isoformat(),
+        "disconnected_at": None,
+        "metadata": {
+            "app_secret": getattr(settings, "META_APP_SECRET", ""),
+            "waba_name": verified_name,
+        },
+    }
+
+    try:
+        # Upsert: update if already exists (reconnect), insert if new
+        existing_res = (
+            sb.table("communication_accounts")
+            .select("id")
+            .eq("agency_id", agency_id)
+            .eq("channel", "whatsapp")
+            .eq("provider", "meta")
+        )
+        if agent_id:
+            existing_res = existing_res.eq("agent_id", agent_id)
+        else:
+            existing_res = existing_res.is_("agent_id", "null")
+        existing = existing_res.limit(1).execute()
+
+        if existing.data:
+            existing_id = existing.data[0]["id"]
+            sb.table("communication_accounts").update(upsert_data).eq("id", existing_id).execute()
+            account_id = existing_id
+        else:
+            insert_res = sb.table("communication_accounts").insert(upsert_data).execute()
+            account_id = insert_res.data[0]["id"]
+
+    except Exception as exc:
+        logger.error("[ESU] DB upsert failed for agency %s: %s", agency_id, exc)
+        raise HTTPException(status_code=500, detail=f"Failed to save WhatsApp account: {exc}")
+
+    logger.info(
+        "[ESU] WhatsApp connected: agency=%s agent=%s phone=%s waba=%s coexistence=%s",
+        agency_id, agent_id, phone_e164_digits[-4:] + "****" if phone_e164_digits else "?",
+        body.waba_id, body.is_coexistence,
+    )
+
+    return api_success(
+        data={
+            "status": "connected",
+            "account_id": account_id,
+            "phone_number": display_phone,
+            "phone_number_id": body.phone_number_id,
+            "waba_id": body.waba_id,
+            "is_coexistence": body.is_coexistence,
+            "verified_name": verified_name,
+            "provider": "meta",
+        },
+        message="WhatsApp account connected via Embedded Signup",
+    )
+
+
+@router.get("/whatsapp/status")
+async def whatsapp_connection_status(
+    agent_id: Optional[str] = Query(None, description="Agent UUID — omit for agency default"),
+    current_user: dict = Depends(verify_token),
+):
+    """
+    Get the current WhatsApp connection status for this agency or specific agent.
+    Returns account details without exposing the access token.
+    """
+    agency_id = require_agency_id(current_user)
+    sb = get_supabase()
+
+    query = (
+        sb.table("communication_accounts")
+        .select(
+            "id, phone_number, phone_number_id, external_account_id, status, "
+            "is_coexistence, meta_onboarding_state, connected_at, token_expires_at, metadata"
+        )
+        .eq("agency_id", agency_id)
+        .eq("channel", "whatsapp")
+    )
+    if agent_id:
+        query = query.eq("agent_id", agent_id)
+    else:
+        query = query.is_("agent_id", "null")
+
+    result = query.limit(1).execute()
+
+    if not result.data:
+        return api_success(
+            data={"status": "disconnected", "provider": None},
+            message="No WhatsApp account connected",
+        )
+
+    row = result.data[0]
+    return api_success(
+        data={
+            "status": row.get("status", "disconnected"),
+            "provider": "meta",
+            "phone_number": row.get("phone_number", ""),
+            "phone_number_id": row.get("phone_number_id", ""),
+            "waba_id": row.get("external_account_id", ""),
+            "is_coexistence": row.get("is_coexistence", False),
+            "connected_at": row.get("connected_at"),
+            "token_expires_at": row.get("token_expires_at"),
+            "waba_name": (row.get("metadata") or {}).get("waba_name", ""),
+        },
+        message="WhatsApp connection status",
+    )
+
+
+@router.delete("/whatsapp/disconnect")
+async def whatsapp_disconnect(
+    agent_id: Optional[str] = Query(None),
+    current_user: dict = Depends(verify_token),
+):
+    """
+    Disconnect a WhatsApp account.
+    Sets status to 'disconnected' and clears the access token.
+    Does NOT deregister the phone number from Meta — do that manually if needed.
+    Management roles only.
+    """
+    from datetime import datetime, timezone
+    if not is_management_role(current_user.get("role")):
+        raise HTTPException(status_code=403, detail="Only owners and managers can disconnect WhatsApp")
+
+    agency_id = require_agency_id(current_user)
+    sb = get_supabase()
+
+    query = (
+        sb.table("communication_accounts")
+        .update({
+            "status": "disconnected",
+            "access_token": None,
+            "disconnected_at": datetime.now(timezone.utc).isoformat(),
+        })
+        .eq("agency_id", agency_id)
+        .eq("channel", "whatsapp")
+    )
+    if agent_id:
+        query = query.eq("agent_id", agent_id)
+    else:
+        query = query.is_("agent_id", "null")
+
+    query.execute()
+
+    logger.info("[Connectors] WhatsApp disconnected: agency=%s agent=%s", agency_id, agent_id)
+    return api_success(message="WhatsApp account disconnected")
 
 
 @router.post("/property-finder/test")

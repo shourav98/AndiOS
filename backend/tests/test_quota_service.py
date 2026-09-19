@@ -232,6 +232,7 @@ async def test_webhook_quota_exceeded_suppresses_ai_reply():
     with patch("routers.webhooks.get_supabase", return_value=sb), \
          patch.object(settings, "WHATSAPP_PROVIDER", "twilio"), \
          patch.object(settings, "APP_ENV", "development"), \
+         patch("routers.webhooks._check_and_mark_message_id", return_value=True), \
          patch("routers.webhooks.check_and_consume_whatsapp_quota", return_value=False) as mock_quota, \
          patch("routers.webhooks.qualify_and_respond", new_callable=AsyncMock) as mock_ai, \
          patch("routers.webhooks.send_whatsapp_for_agency", new_callable=AsyncMock) as mock_send:
@@ -274,6 +275,7 @@ async def test_webhook_ai_failure_refunds_quota():
     with patch("routers.webhooks.get_supabase", return_value=sb), \
          patch.object(settings, "WHATSAPP_PROVIDER", "twilio"), \
          patch.object(settings, "APP_ENV", "development"), \
+         patch("routers.webhooks._check_and_mark_message_id", return_value=True), \
          patch("routers.webhooks.check_and_consume_whatsapp_quota", return_value=True) as mock_quota, \
          patch("routers.webhooks.refund_whatsapp_quota", new_callable=AsyncMock) as mock_refund, \
          patch("routers.webhooks.qualify_and_respond", side_effect=RuntimeError("OpenAI timeout")) as mock_ai:

@@ -152,6 +152,7 @@ async def test_whatsapp_automation_inbound_to_ai_reply_flow():
     with patch.object(settings, "META_APP_SECRET", app_secret), \
          patch.object(settings, "WHATSAPP_PROVIDER", "meta"), \
          patch("routers.webhooks.get_supabase", return_value=mock_sb), \
+         patch("routers.webhooks._check_and_mark_message_id", return_value=True), \
          patch("routers.webhooks.check_and_consume_whatsapp_quota", new_callable=AsyncMock) as mock_quota, \
          patch("routers.webhooks.qualify_and_respond", new_callable=AsyncMock) as mock_ai, \
          patch("routers.webhooks.send_whatsapp_for_agency", new_callable=AsyncMock) as mock_send:
