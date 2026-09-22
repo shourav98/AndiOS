@@ -8,7 +8,7 @@ Covers:
      - RPC resolution (get_agency_by_phone_number_id) to agent + agency
      - Lead creation / association
      - AI qualification prompt generation
-     - Outbound auto-reply routing via send_whatsapp_for_agency
+     - Outbound auto-reply routing via send_whatsapp_smart (window-aware)
      - Quota deduction & conversation persistence
 
   2. Inbound Voice Calling Flow (Central DID BYON Forwarding):
@@ -127,7 +127,7 @@ async def test_whatsapp_automation_inbound_to_ai_reply_flow():
         }
     ]
 
-    # 2. Mock lead lookup / creation
+    # Mock lead — include last_inbound_at so webhooks.py can read it
     mock_lead = {
         "id": "44444444-4444-4444-4444-444444444444",
         "agency_id": agency_uuid,
@@ -135,16 +135,26 @@ async def test_whatsapp_automation_inbound_to_ai_reply_flow():
         "phone": "+971509998877",
         "status": "New",
         "handover_required": False,
+        "last_inbound_at": "2099-01-01T10:00:00+00:00",  # in-window: smart send => free-form
     }
 
     def table_router(table_name):
         t = MagicMock()
         if table_name == "leads":
             t.select.return_value.ilike.return_value.execute.return_value.data = [mock_lead]
+            t.select.return_value.eq.return_value.execute.return_value.data = [mock_lead]
+            t.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [mock_lead]
             t.update.return_value.eq.return_value.execute.return_value.data = [mock_lead]
         elif table_name == "conversations":
             t.select.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value.data = []
             t.insert.return_value.execute.return_value.data = [{"id": "conv-1"}]
+        elif table_name == "whatsapp_processed_messages":
+            t.insert.return_value.execute.return_value.data = [{"message_id": "wamid.INBOUND_MSG_1"}]
+        elif table_name == "communication_accounts":
+            t.update.return_value.eq.return_value.execute.return_value.data = []
+        elif table_name == "whatsapp_outbound_queue":
+            # drain_outbound_queue_for_lead checks this; empty = nothing to drain
+            t.select.return_value.eq.return_value.execute.return_value.data = []
         return t
 
     mock_sb.table.side_effect = table_router
@@ -154,11 +164,16 @@ async def test_whatsapp_automation_inbound_to_ai_reply_flow():
          patch("routers.webhooks.get_supabase", return_value=mock_sb), \
          patch("routers.webhooks.check_and_consume_whatsapp_quota", new_callable=AsyncMock) as mock_quota, \
          patch("routers.webhooks.qualify_and_respond", new_callable=AsyncMock) as mock_ai, \
-         patch("routers.webhooks.send_whatsapp_for_agency", new_callable=AsyncMock) as mock_send:
+         patch("routers.webhooks.send_whatsapp_for_agency", new_callable=AsyncMock) as mock_send, \
+         patch("routers.webhooks.send_whatsapp_smart", new_callable=AsyncMock) as mock_smart, \
+         patch("routers.webhooks.drain_outbound_queue_for_lead", new_callable=AsyncMock) as mock_drain, \
+         patch("routers.webhooks.extract_lead_qualifications", new_callable=AsyncMock, return_value={}) as mock_extract:
 
         mock_quota.return_value = True
         mock_ai.return_value = "Hello! I'd be happy to show you our 2BR Downtown listings under 2.5M AED. When are you available for a viewing?"
+        mock_smart.return_value = {"status": "sent", "sid": "wamid.OUTBOUND_REPLY_1"}
         mock_send.return_value = {"status": "sent", "sid": "wamid.OUTBOUND_REPLY_1"}
+        mock_drain.return_value = 0
 
         resp = await whatsapp_inbound(req)
 
@@ -169,13 +184,15 @@ async def test_whatsapp_automation_inbound_to_ai_reply_flow():
         call_args = mock_ai.await_args[0]
         assert "Downtown Dubai" in call_args[2]
 
-        # Verify outgoing auto-reply was triggered with the correct agency and agent
-        assert mock_send.await_count == 1
-        call_pos = mock_send.await_args[0]
-        assert call_pos[0] == agency_uuid
-        assert call_pos[1] == "971509998877"
-        assert "2BR Downtown" in call_pos[2]
-        assert mock_send.await_args.kwargs.get("agent_id") == agent_uuid or (len(call_pos) > 3 and call_pos[3] == agent_uuid)
+        # Verify outgoing auto-reply was routed via send_whatsapp_smart (window-aware)
+        # last_inbound_at=2099 => in-window => smart send calls free-form internally,
+        # but from the webhook's perspective send_whatsapp_smart is the entry point.
+        assert mock_smart.await_count == 1
+        call_pos = mock_smart.await_args[0]
+        assert call_pos[0] == agency_uuid        # agency_id
+        assert call_pos[1] == mock_lead["id"]    # lead_id
+        assert call_pos[2] == "971509998877"     # to_phone (stripped)
+        assert "2BR Downtown" in call_pos[3]     # body
 
 
 # ─── 2. Voice Inbound Calling E2E Flow (Central DID BYON) ─────────────────────

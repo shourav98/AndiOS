@@ -12,3 +12,4 @@ build/
 *.log
 token.json
 google_credentials.json
+backups/

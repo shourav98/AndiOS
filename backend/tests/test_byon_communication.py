@@ -99,8 +99,8 @@ async def test_provider_factory_resolves_agent_then_agency_fallback():
     """Verify factory looks for agent-specific account first, then agency default."""
     mock_sb = MagicMock()
 
-    # Case 1: Agent has their own BYON number
-    mock_sb.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = {
+    # Build a properly structured mock row (list, not dict — .execute().data is a list)
+    agent_row = {
         "id": "comm-agent",
         "agency_id": "agency-1",
         "agent_id": "agent-1",
@@ -108,12 +108,44 @@ async def test_provider_factory_resolves_agent_then_agency_fallback():
         "provider": "meta",
         "phone_number": "971501111111",
         "phone_number_id": "pid-agent-1",
-        "access_token": "token-agent",
+        "access_token": "fake-encrypted-token",
         "status": "active",
         "metadata": {},
     }
 
-    with patch("database.supabase_client.get_supabase", return_value=mock_sb):
+    # The factory uses: .table().select().eq().eq().eq().eq().limit().execute()
+    # We need .execute().data to return [agent_row] for the agent query.
+    execute_mock = MagicMock()
+    execute_mock.data = [agent_row]
+
+    # Build the chain bottom-up
+    limit_mock = MagicMock()
+    limit_mock.execute.return_value = execute_mock
+
+    eq4_mock = MagicMock()
+    eq4_mock.limit.return_value = limit_mock
+
+    eq3_mock = MagicMock()
+    eq3_mock.eq.return_value = eq4_mock
+
+    eq2_mock = MagicMock()
+    eq2_mock.eq.return_value = eq3_mock
+
+    eq1_mock = MagicMock()
+    eq1_mock.eq.return_value = eq2_mock
+
+    select_mock = MagicMock()
+    select_mock.eq.return_value = eq1_mock
+
+    table_mock = MagicMock()
+    table_mock.select.return_value = select_mock
+
+    mock_sb.table.return_value = table_mock
+
+    with (
+        patch("database.supabase_client.get_supabase", return_value=mock_sb),
+        patch("utils.crypto.decrypt_token", return_value="EAAxxxxxx"),
+    ):
         provider, account = await get_whatsapp_provider_for_agency("agency-1", agent_id="agent-1")
         assert account is not None
         assert account.agent_id == "agent-1"
