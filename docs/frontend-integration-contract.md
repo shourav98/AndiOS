@@ -1,146 +1,121 @@
 # Meta Embedded Signup v4 — Frontend Integration Contract
 
-This document provides the exact frontend contract and implementation code for integrating **Meta Embedded Signup (ESU) v4** into the AndiOS frontend (Next.js / React).
+This document specifies the exact contract and implementation for integrating **Meta Embedded Signup (ESU) v4** via Facebook Login for Business in the AndiOS frontend (Next.js / React).
 
 ---
 
-## 1. Overview
+## 1. Overview & v4 Architecture
 
-Meta Embedded Signup allows an agency or agent to connect their own WhatsApp Business Account (BYON - Bring Your Own Number) directly inside the AndiOS dashboard without manual API key entry.
+Meta is retiring Embedded Signup v2/v3 in favor of **Embedded Signup v4** built on **Facebook Login for Business**.
 
-The frontend is responsible for:
-1. Loading the Meta Facebook JavaScript SDK.
-2. Launching the Embedded Signup popup with the required configuration (`config_id`).
-3. Listening to the `window.postMessage` events dispatched by Meta's popup to capture the `waba_id` and `phone_number_id`.
-4. Receiving the OAuth `code` from the `FB.login` response.
-5. Submitting all collected credentials to the backend endpoint `POST /connectors/meta-esu/callback`.
-6. Displaying the connection status and handling disconnection.
+Key specifications in v4:
+- Configuration is driven by `config_id` defined in Meta Developer Portal (Facebook Login for Business).
+- Permissions (`whatsapp_business_management`, `whatsapp_business_messaging`) are bundled inside the configuration ID, so `extras: {}` is passed **empty**.
+- **Coexistence** (using the same number on physical phone + Cloud API) is auto-detected by Meta during signup.
 
----
+### The Asynchronous Race Condition
+When the popup completes, Meta emits two separate events in indeterminate order:
+1. `FB.login` callback containing `{ authResponse: { code: "..." } }`
+2. `window.postMessage` event containing `WA_EMBEDDED_SIGNUP` with `{ event: "FINISH", data: { phone_number_id, waba_id } }`
 
-## 2. Prerequisites
-
-- **Meta App ID**: Provided via environment variable (`NEXT_PUBLIC_META_APP_ID`).
-- **Embedded Signup Configuration ID (`config_id`)**: Created in Meta App Dashboard under WhatsApp > Quickstart / Embedded Signup configurations.
-- **Backend API Base**: Points to `https://andreearizan.softvencealpha.com` (or local `http://localhost:8000`).
+The frontend **must coordinate this race** by caching whichever arrives first and only firing the backend API callback once **both** are available. If `CANCEL` or `ERROR` arrives, the flow aborts immediately.
 
 ---
 
-## 3. Endpoints Contract
+## 2. API Endpoints Contract
 
-### 3.1 `POST /connectors/meta-esu/callback`
-Exchanges the short-lived OAuth code for a permanent/extended token, registers the phone number, subscribes webhooks, and persists the encrypted record in Supabase `communication_accounts`.
+### 2.1 Connect Callback
+`POST /connectors/meta-esu/callback`  
+(Alias: `POST /connectors/whatsapp/embedded-signup-callback`)
 
-**Request Body (`application/json`):**
+**Headers:**
+`Authorization: Bearer <user_jwt_token>`  
+`Content-Type: application/json`
+
+**Request Body:**
 ```json
 {
-  "code": "AQB... (OAuth code from FB.login)",
-  "phone_number_id": "106xxxxxxxxxxxx",
-  "waba_id": "105xxxxxxxxxxxx",
-  "agency_id": "uuid-of-agency",
-  "agent_id": "uuid-of-agent (optional, null if agency-wide)",
-  "is_coexistence": false
+  "code": "AQBx...",
+  "waba_id": "105000000000000",
+  "phone_number_id": "106000000000000",
+  "agent_id": "uuid-of-agent" // Optional: Manager-only override. Ignored/enforced for agents.
 }
 ```
 
-**Response (`200 OK`):**
+> [!IMPORTANT]
+> **Agent Derivation & Security:**
+> The backend authoritatively derives the agent and agency from the caller's JWT bearer token.
+> - For **agents** (`role: "agent"`), `agent_id` is automatically set to the authenticated user's ID (`current_user.id`). Any caller attempting to provide another agent's ID is rejected with `403 Forbidden`.
+> - For **managers/owners** (`role: "owner"`, `role: "manager"`), `agent_id` in the request body is honored if provided, and the backend verifies that the specified agent belongs to the caller's agency (`400 Bad Request` if cross-tenant). If omitted, the connection is configured as the agency-wide fallback WhatsApp sender.
+
+**Success Response (`200 OK`):**
 ```json
 {
-  "success": true,
-  "account_id": "uuid-of-communication-account",
-  "phone_number_id": "106xxxxxxxxxxxx",
-  "waba_id": "105xxxxxxxxxxxx",
-  "is_coexistence": false,
-  "message": "WhatsApp number successfully connected via Meta Embedded Signup"
+  "status": "success",
+  "data": {
+    "status": "connected",
+    "account_id": "8f3b...",
+    "phone_number": "+971501234567",
+    "phone_number_id": "106000000000000",
+    "waba_id": "105000000000000",
+    "is_coexistence": true,
+    "verified_name": "Elite Real Estate LLC",
+    "provider": "meta"
+  },
+  "message": "WhatsApp account successfully connected via Meta Embedded Signup"
 }
 ```
 
 **Error Responses:**
-- `400 Bad Request`: `{ "detail": "Missing required field: ..." }`
-- `502 Bad Gateway`: `{ "detail": "Meta token exchange failed: ..." }`
+- `400 Bad Request`: `{"detail": "Phone number ID ... does not belong to WABA ..."}`
+- `403 Forbidden`: `{"detail": "Agents can only connect their own personal WhatsApp account."}`
+- `409 Conflict`: `{"detail": "Phone number ... is already connected to another account."}`
+- `502 Bad Gateway`: `{"detail": "Meta token exchange failed: ..."}`
 
 ---
 
-### 3.2 `GET /connectors/meta-esu/status`
-Checks the current connection status of an agency or agent's WhatsApp integration.
-
-**Query Parameters:**
-- `agency_id` (required, UUID)
-- `agent_id` (optional, UUID)
+### 2.2 Connection Status
+`GET /connectors/meta-esu/status?agent_id=<uuid>`  
+(Alias: `GET /connectors/whatsapp/status`)
 
 **Response (`200 OK` - Connected):**
 ```json
 {
-  "connected": true,
-  "account_id": "uuid",
-  "phone_number_id": "106xxxxxxxxxxxx",
-  "waba_id": "105xxxxxxxxxxxx",
-  "display_phone_number": "+971501234567",
-  "is_coexistence": false,
-  "status": "active",
-  "provider": "meta",
-  "token_expires_at": "2026-11-18T12:00:00Z"
-}
-```
-
-**Response (`200 OK` - Not Connected):**
-```json
-{
-  "connected": false,
-  "status": "not_connected"
+  "status": "success",
+  "data": {
+    "status": "active",
+    "connected": true,
+    "provider": "meta",
+    "account_id": "8f3b...",
+    "phone_number": "971501234567",
+    "phone_number_id": "106000000000000",
+    "waba_id": "105000000000000",
+    "is_coexistence": true,
+    "connected_at": "2026-09-19T10:00:00+00:00",
+    "waba_name": "Elite Real Estate LLC"
+  }
 }
 ```
 
 ---
 
-### 3.3 `POST /connectors/meta-esu/disconnect`
-Disconnects the WhatsApp account, deregisters from AndiOS, and marks the record inactive.
+### 2.3 Disconnect
+`POST /connectors/meta-esu/disconnect`  
+(Alias: `DELETE /connectors/whatsapp/disconnect`)
 
-**Request Body (`application/json`):**
+**Request Body:**
 ```json
 {
-  "agency_id": "uuid-of-agency",
-  "agent_id": "uuid-of-agent (optional)"
-}
-```
-
-**Response (`200 OK`):**
-```json
-{
-  "success": true,
-  "message": "WhatsApp account disconnected successfully"
+  "agent_id": "uuid-of-agent" // Optional: disconnects agent's BYON number
 }
 ```
 
 ---
 
-### 3.4 `POST /connectors/parse-wa-link`
-Utility endpoint to parse phone numbers from `wa.me` or `api.whatsapp.com` links pasted by users.
-
-**Request Body (`application/json`):**
-```json
-{
-  "link": "https://wa.me/971501234567?text=Hello"
-}
-```
-
-**Response (`200 OK`):**
-```json
-{
-  "valid": true,
-  "e164": "+971501234567",
-  "raw_phone": "971501234567"
-}
-```
-
----
-
-## 4. Frontend Implementation (React / Next.js Component)
-
-Here is the complete, drop-in React hook and button component:
+## 3. Drop-In React / Next.js Component
 
 ```tsx
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 declare global {
   interface Window {
@@ -150,23 +125,67 @@ declare global {
 }
 
 interface MetaSignupProps {
-  agencyId: string;
   agentId?: string;
   onSuccess: (data: any) => void;
-  onError: (err: any) => void;
+  onError: (err: Error) => void;
 }
 
 export const WhatsAppConnectButton: React.FC<MetaSignupProps> = ({
-  agencyId,
   agentId,
   onSuccess,
   onError,
 }) => {
-  const [loading, setLoading] = useState(false);
-  const [sessionInfo, setSessionInfo] = useState<{
-    phone_number_id?: string;
-    waba_id?: string;
-  }>({});
+  const [connecting, setConnecting] = useState(false);
+
+  // Synchronized refs to eliminate stale closure bugs across async callbacks
+  const onSuccessRef = useRef(onSuccess);
+  onSuccessRef.current = onSuccess;
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+  const agentIdRef = useRef(agentId);
+  agentIdRef.current = agentId;
+
+  // Refs to coordinate the asynchronous race between FB.login code and postMessage sessionInfo
+  const authCodeRef = useRef<string | null>(null);
+  const sessionInfoRef = useRef<{ phone_number_id: string; waba_id: string } | null>(null);
+  const callbackFiredRef = useRef<boolean>(false);
+
+  // Coordinated callback: fires ONLY when both auth code and sessionInfo are received
+  const checkAndSendToBackend = async () => {
+    if (callbackFiredRef.current) return;
+    if (!authCodeRef.current || !sessionInfoRef.current) return;
+
+    callbackFiredRef.current = true;
+    try {
+      const response = await fetch('/api/connectors/meta-esu/callback', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`,
+        },
+        body: JSON.stringify({
+          code: authCodeRef.current,
+          phone_number_id: sessionInfoRef.current.phone_number_id,
+          waba_id: sessionInfoRef.current.waba_id,
+          agent_id: agentIdRef.current || null,
+        }),
+      });
+
+      const resData = await response.json();
+      if (!response.ok) {
+        throw new Error(resData.detail || 'Backend failed to connect WhatsApp number.');
+      }
+
+      setConnecting(false);
+      onSuccessRef.current(resData.data);
+    } catch (err: any) {
+      setConnecting(false);
+      onErrorRef.current(err);
+    }
+  };
+
+  const checkAndSendToBackendRef = useRef(checkAndSendToBackend);
+  checkAndSendToBackendRef.current = checkAndSendToBackend;
 
   useEffect(() => {
     // 1. Initialize Meta JS SDK
@@ -175,11 +194,10 @@ export const WhatsAppConnectButton: React.FC<MetaSignupProps> = ({
         appId: process.env.NEXT_PUBLIC_META_APP_ID,
         cookie: true,
         xfbml: true,
-        version: 'v22.0',
+        version: 'v26.0',
       });
     };
 
-    // Load SDK script if not already loaded
     if (!document.getElementById('facebook-jssdk')) {
       const js = document.createElement('script');
       js.id = 'facebook-jssdk';
@@ -187,9 +205,8 @@ export const WhatsAppConnectButton: React.FC<MetaSignupProps> = ({
       document.body.appendChild(js);
     }
 
-    // 2. Listen to Embedded Signup session events (captures phone_number_id & waba_id)
-    const handleMessage = (event: MessageEvent) => {
-      // Validate origin from Meta
+    // 2. Listen to WA_EMBEDDED_SIGNUP window postMessage events
+    const handlePostMessage = (event: MessageEvent) => {
       if (
         event.origin !== 'https://www.facebook.com' &&
         event.origin !== 'https://web.facebook.com'
@@ -198,96 +215,67 @@ export const WhatsAppConnectButton: React.FC<MetaSignupProps> = ({
       }
 
       try {
-        const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
-        if (data.type === 'WA_EMBEDDED_SIGNUP') {
-          if (data.event === 'FINISH') {
-            const { phone_number_id, waba_id } = data.data;
-            setSessionInfo({ phone_number_id, waba_id });
-          } else if (data.event === 'CANCEL') {
-            setLoading(false);
-            onError(new Error('User cancelled WhatsApp signup'));
-          } else if (data.event === 'ERROR') {
-            setLoading(false);
-            onError(new Error(data.data?.error_message || 'WhatsApp signup error'));
+        const payload = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
+        if (payload.type === 'WA_EMBEDDED_SIGNUP') {
+          if (payload.event === 'FINISH') {
+            const { phone_number_id, waba_id } = payload.data || {};
+            sessionInfoRef.current = { phone_number_id, waba_id };
+            checkAndSendToBackendRef.current();
+          } else if (payload.event === 'CANCEL') {
+            setConnecting(false);
+            onErrorRef.current(new Error('User cancelled WhatsApp signup.'));
+          } else if (payload.event === 'ERROR') {
+            setConnecting(false);
+            onErrorRef.current(new Error(payload.data?.error_message || 'Meta signup failed.'));
           }
         }
-      } catch (err) {
-        // Non-JSON message, ignore
+      } catch {
+        // Non-JSON message from other origins/extensions
       }
     };
 
-    window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
-  }, [onError]);
+    window.addEventListener('message', handlePostMessage);
+    return () => window.removeEventListener('message', handlePostMessage);
+  }, []);
 
-  const launchWhatsAppSignup = () => {
+  const launchPopup = () => {
     if (!window.FB) {
-      onError(new Error('Facebook SDK not loaded yet. Please refresh.'));
+      onErrorRef.current(new Error('Facebook SDK is still loading. Please try again.'));
       return;
     }
 
-    setLoading(true);
+    setConnecting(true);
+    authCodeRef.current = null;
+    sessionInfoRef.current = null;
+    callbackFiredRef.current = false;
 
+    // Facebook Login for Business v4
     window.FB.login(
       (response: any) => {
         if (response.authResponse?.code) {
-          const code = response.authResponse.code;
-          
-          // Send code + sessionInfo to backend
-          sendToBackend(code, sessionInfo.phone_number_id, sessionInfo.waba_id);
+          authCodeRef.current = response.authResponse.code;
+          checkAndSendToBackend();
         } else {
-          setLoading(false);
-          onError(new Error('Failed to obtain authorization code from Meta'));
+          setConnecting(false);
+          onError(new Error('Meta authorization was not completed.'));
         }
       },
       {
         config_id: process.env.NEXT_PUBLIC_META_ESU_CONFIG_ID,
         response_type: 'code',
         override_default_response_type: true,
-        extras: {
-          setup: {},
-          featureType: '',
-          sessionInfoVersion: '3',
-        },
+        extras: {}, // Must be empty in v4
       }
     );
   };
 
-  const sendToBackend = async (code: string, phone_number_id?: string, waba_id?: string) => {
-    try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_BASE_URL}/connectors/meta-esu/callback`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          code,
-          phone_number_id,
-          waba_id,
-          agency_id: agencyId,
-          agent_id: agentId || null,
-          is_coexistence: false,
-        }),
-      });
-
-      const result = await res.json();
-      if (!res.ok) {
-        throw new Error(result.detail || 'Failed to complete signup with backend');
-      }
-
-      setLoading(false);
-      onSuccess(result);
-    } catch (err: any) {
-      setLoading(false);
-      onError(err);
-    }
-  };
-
   return (
     <button
-      onClick={launchWhatsAppSignup}
-      disabled={loading}
-      className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-green-600 hover:bg-green-700 disabled:opacity-50"
+      onClick={launchPopup}
+      disabled={connecting}
+      className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold rounded-lg shadow-sm transition disabled:opacity-50"
     >
-      {loading ? 'Connecting...' : 'Connect WhatsApp (Meta)'}
+      {connecting ? 'Connecting...' : 'Connect WhatsApp (Meta ESU v4)'}
     </button>
   );
 };

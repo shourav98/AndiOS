@@ -41,7 +41,7 @@ META_GRAPH_BASE = "https://graph.facebook.com"
 def _graph_url() -> str:
     """Return the versioned Graph API base URL from settings."""
     from config import settings
-    version = getattr(settings, "META_GRAPH_API_VERSION", "v22.0") or "v22.0"
+    version = getattr(settings, "META_GRAPH_API_VERSION", "v26.0") or "v26.0"
     return f"{META_GRAPH_BASE}/{version}"
 
 
@@ -52,7 +52,7 @@ class MetaWhatsAppAdapter(WhatsAppProvider):
     Initialized with a CommunicationAccount that contains:
       - phone_number_id: Meta's phone number ID for this agency
       - access_token:    Long-lived System User token (stored encrypted in DB)
-      - metadata["app_secret"]: Meta App Secret (for HMAC webhook verification)
+      - global META_APP_SECRET: Meta App Secret (for HMAC webhook verification)
     """
 
     def __init__(
@@ -64,8 +64,8 @@ class MetaWhatsAppAdapter(WhatsAppProvider):
         self._account = account
         self._phone_number_id = (account.phone_number_id if account else "") or getattr(settings, "WHATSAPP_PHONE_NUMBER_ID", "") or ""
         self._access_token = (account.access_token if account else "") or getattr(settings, "WHATSAPP_API_KEY", "") or ""
-        # App secret used for webhook HMAC verification (optional in dev)
-        self._app_secret: str = app_secret or (account.metadata.get("app_secret", "") if account else "") or getattr(settings, "META_APP_SECRET", "") or ""
+        # App secret used for webhook HMAC verification (global META_APP_SECRET)
+        self._app_secret: str = app_secret or getattr(settings, "META_APP_SECRET", "") or ""
 
     @property
     def provider_name(self) -> str:

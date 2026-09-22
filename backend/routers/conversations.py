@@ -41,11 +41,13 @@ async def agent_send_message(
     user_id: str = Depends(get_current_user_id),
     current_user: dict = Depends(verify_token),
 ):
-    """Agent manually sends a WhatsApp reply to a lead."""
     sb = get_supabase()
     lead_data = await verify_lead_access(str(lead_id), current_user)
     phone = lead_data["phone"]
-    result = await send_whatsapp_message(phone, body.message_body)
+    from services.whatsapp_service import send_whatsapp_for_agency
+    agency_id = lead_data.get("agency_id") or require_agency_id(current_user)
+    agent_id = lead_data.get("assigned_agent_id") or current_user.get("agent_id")
+    result = await send_whatsapp_for_agency(agency_id, phone, body.message_body, agent_id=agent_id)
 
     if result.get("status") == "error":
         raise HTTPException(status_code=502, detail="WhatsApp send failed — check provider credentials")

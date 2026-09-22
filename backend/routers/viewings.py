@@ -226,7 +226,7 @@ async def create_viewing(body: ViewingCreate, current_user: dict = Depends(verif
     sb.table("leads").update({"status": "viewing_booked"}).eq("id", str(body.lead_id)).execute()
 
     # Send confirmation WhatsApp to lead
-    from services.whatsapp_service import send_whatsapp_message
+    from services.whatsapp_service import send_whatsapp_for_agency
     dt_str = body.viewing_datetime.strftime("%A, %d %B at %I:%M %p")
     confirm_msg = (
         f"✅ Your viewing is confirmed!\n\n"
@@ -236,7 +236,7 @@ async def create_viewing(body: ViewingCreate, current_user: dict = Depends(verif
         f"{'🎥 Google Meet: ' + google_meet_link if google_meet_link else ''}\n\n"
         f"We'll send you a reminder 24 hours before. See you there! 🏠"
     )
-    await send_whatsapp_message(lead_data["phone"], confirm_msg)
+    await send_whatsapp_for_agency(agency_id, lead_data["phone"], confirm_msg, agent_id=str(body.agent_id) if body.agent_id else None)
     sb.table("conversations").insert({
         "lead_id": str(body.lead_id),
         "agency_id": agency_id,
@@ -284,12 +284,12 @@ async def update_viewing(viewing_id: UUID, body: ViewingUpdate, current_user: di
         lead_id = existing_data["lead_id"]
         lead = sb.table("leads").select("phone, name").eq("id", lead_id).execute()
         if lead.data:
-            from services.whatsapp_service import send_whatsapp_message
+            from services.whatsapp_service import send_whatsapp_for_agency
             cancel_msg = (
                 f"Hi {lead.data[0]['name'].split()[0]}, your viewing has been cancelled. "
                 f"Please contact us to reschedule. 📅"
             )
-            await send_whatsapp_message(lead.data[0]["phone"], cancel_msg)
+            await send_whatsapp_for_agency(agency_id, lead.data[0]["phone"], cancel_msg)
 
     result = sb.table("viewings").update(update_data).eq("id", str(viewing_id)).execute()
     return api_success(data=result.data[0], message="Viewing updated successfully")
