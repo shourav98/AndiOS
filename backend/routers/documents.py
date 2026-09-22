@@ -5,7 +5,9 @@ from middleware.auth_middleware import verify_token
 from services.document_service import extract_document_data
 from utils.response import api_success, ApiResponse
 from utils.tenant import require_agency_id, verify_lead_access
+import logging
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/documents", tags=["Documents"])
 
 
@@ -16,7 +18,7 @@ async def create_document(doc: DocumentCreate, current_user: dict = Depends(veri
     agency_id = require_agency_id(current_user)
     await verify_lead_access(str(doc.lead_id), current_user)
 
-    doc_data = doc.model_dump()
+    doc_data = doc.model_dump(mode="json")
     doc_data["agency_id"] = agency_id
     result = sb.table("documents").insert(doc_data).execute()
     if not result.data:
@@ -24,9 +26,19 @@ async def create_document(doc: DocumentCreate, current_user: dict = Depends(veri
 
     doc_data = result.data[0]
 
-    extracted = await extract_document_data(doc_data["id"])
-    doc_data["extracted_data"] = extracted
-    doc_data["status"] = "extracted"
+    # OCR is best-effort: creation must succeed even when extraction fails
+    # (e.g. unreadable file/URL). The row keeps status="failed" + error_message.
+    try:
+        extracted = await extract_document_data(doc_data["id"])
+        doc_data["extracted_data"] = extracted
+        doc_data["status"] = "extracted"
+    except Exception as e:
+        logger.error(f"Document extraction failed for {doc_data['id']}: {e}")
+        doc_data["extracted_data"] = None
+        doc_data["status"] = "failed"
+        sb.table("documents").update(
+            {"status": "failed", "error_message": "AI extraction failed"}
+        ).eq("id", doc_data["id"]).execute()
 
     return api_success(data=doc_data, message="Document created successfully")
 

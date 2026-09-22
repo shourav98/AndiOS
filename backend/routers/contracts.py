@@ -33,9 +33,12 @@ def create_contract(contract: ContractCreate, current_user: dict = Depends(verif
     sb = supabase_client.get_supabase()
     agency_id = require_agency_id(current_user)
 
-    contract_data = contract.model_dump(exclude_none=True)
+    contract_data = contract.model_dump(mode="json", exclude_none=True)
     contract_data["agency_id"] = agency_id
-    contract_data["created_by"] = current_user.get("agent_id")
+    # Attribute the contract to the acting agent (contracts.agent_id exists;
+    # the previously used "created_by" column does not exist in the schema).
+    if current_user.get("agent_id"):
+        contract_data["agent_id"] = current_user.get("agent_id")
 
     result = sb.table("contracts").insert(contract_data).execute()
     if not result.data:
@@ -76,13 +79,23 @@ def list_contracts(current_user: dict = Depends(verify_token)):
 @router.post("/{contract_id}/generate")
 async def generate_contract_pdf(contract_id: str, current_user: dict = Depends(verify_token)):
     """Generates the physical PDF for a contract and uploads to Supabase Storage."""
+    sb = supabase_client.get_supabase()
     require_agency_id(current_user)
+
+    # Tenant ownership check — foreign/non-existent contracts are indistinguishable (404)
+    query = sb.table("contracts").select("id").eq("id", contract_id)
+    result = apply_agency_scope(query, current_user).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
     try:
         url = await generate_tenancy_agreement(contract_id)
         return api_success(data={"url": url}, message="Contract PDF generated and uploaded successfully")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"PDF generation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Contract PDF generation failed")
 
 
 @router.get("/{contract_id}")
@@ -92,12 +105,14 @@ def get_contract(contract_id: str, current_user: dict = Depends(verify_token)):
     require_agency_id(current_user)
 
     query = sb.table("contracts").select("*").eq("id", contract_id)
-    result = apply_agency_scope(query, current_user).single().execute()
+    res = apply_agency_scope(query, current_user).maybe_single().execute()
+    # maybe_single().execute() returns the row dict, or None when 0 rows
+    data = res.data if (res and hasattr(res, "data")) else res
 
-    if not result.data:
+    if not data:
         raise HTTPException(status_code=404, detail="Contract not found")
 
-    return api_success(data=result.data, message="Contract retrieved successfully")
+    return api_success(data=data, message="Contract retrieved successfully")
 
 
 @router.post("/{contract_id}/send-esign")
@@ -107,12 +122,13 @@ async def send_contract_esign(contract_id: str, current_user: dict = Depends(ver
     sb = supabase_client.get_supabase()
 
     query = sb.table("contracts").select("status, document_url").eq("id", contract_id)
-    result = apply_agency_scope(query, current_user).single().execute()
-    if not result.data:
+    res = apply_agency_scope(query, current_user).maybe_single().execute()
+    contract_row = res.data if (res and hasattr(res, "data")) else res
+    if not contract_row:
         raise HTTPException(status_code=404, detail="Contract not found")
 
     # Generate PDF first if not yet generated
-    if not result.data.get("document_url"):
+    if not contract_row.get("document_url"):
         await generate_tenancy_agreement(contract_id)
 
     try:
@@ -142,7 +158,15 @@ async def sign_contract(contract_id: str, body: SignRequest):
 @router.post("/{contract_id}/close")
 async def close_contract(contract_id: str, body: CloseContractRequest, current_user: dict = Depends(verify_token)):
     """Close a signed contract by uploading the 5% agency fee cheque."""
+    sb = supabase_client.get_supabase()
     require_agency_id(current_user)
+
+    # Tenant ownership check — foreign/non-existent contracts are indistinguishable (404)
+    query = sb.table("contracts").select("id").eq("id", contract_id)
+    result = apply_agency_scope(query, current_user).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
     try:
         result = await close_contract_with_cheque(contract_id, body.cheque_image_url)
         return api_success(data=result, message="Contract closed successfully — deal won!")

@@ -37,7 +37,8 @@ async def test_create_document_triggers_extraction(client):
         "updated_at": "2024-01-01T00:00:00Z",
     }]
 
-    with patch("services.document_service.client") as mock_openai:
+    with patch("services.document_service.client") as mock_openai, \
+         patch("services.document_service._fetch_image_as_base64", new_callable=AsyncMock, return_value="fake_base64_data"):
         mock_response = MagicMock()
         mock_response.choices[0].message.content = '{"full_name": "John Doe", "document_number": "P1234567"}'
         mock_openai.chat.completions.create = AsyncMock(return_value=mock_response)

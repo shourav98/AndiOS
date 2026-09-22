@@ -6,9 +6,12 @@ Phase 1: AI Lead Management, WhatsApp Automation,
 
 Run with: uvicorn main:app --reload
 """
+import os
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+if os.getenv("APP_ENV") != "test" and not os.getenv("PYTEST_CURRENT_TEST"):
+    load_dotenv(override=True)
+
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,9 +32,93 @@ logger = logging.getLogger("andios")
 
 
 # ─── Startup / Shutdown ───────────────────────────────────────────────────────
+
+def _validate_production_config() -> None:
+    """Loudly report production configuration gaps at boot (does not block)."""
+    if settings.APP_ENV == "development":
+        return
+    required = {
+        "SECRET_KEY": settings.SECRET_KEY,
+        "FRONTEND_URL": settings.FRONTEND_URL,
+        "API_BASE_URL": settings.API_BASE_URL,
+        "WHATSAPP_VERIFY_TOKEN": settings.WHATSAPP_VERIFY_TOKEN,
+        "STRIPE_SECRET_KEY": settings.STRIPE_SECRET_KEY,
+        "STRIPE_WEBHOOK_SECRET": settings.STRIPE_WEBHOOK_SECRET,
+        "PROPERTY_FINDER_WEBHOOK_SECRET": settings.PROPERTY_FINDER_WEBHOOK_SECRET,
+        "WHATSAPP_WEBHOOK_TOKEN": settings.WHATSAPP_WEBHOOK_TOKEN,
+        "VAPI_WEBHOOK_SECRET": settings.VAPI_WEBHOOK_SECRET,
+        "BAYUT_WEBHOOK_TOKEN": settings.BAYUT_WEBHOOK_TOKEN,
+        "DUBIZZLE_WEBHOOK_TOKEN": settings.DUBIZZLE_WEBHOOK_TOKEN,
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        logger.critical(
+            "PRODUCTION CONFIGURATION INCOMPLETE — missing: %s. "
+            "Related endpoints will reject requests (fail closed).",
+            ", ".join(missing),
+        )
+    if settings.SECRET_KEY in ("change-me-in-production", "andios-dev-secret-key-change-in-production", ""):
+        logger.critical("INSECURE SECRET_KEY — replace default development secret key in production .env immediately.")
+    if not str(settings.FRONTEND_URL or "").startswith("https://"):
+        logger.critical("FRONTEND_URL should use HTTPS in production (CORS/cookies depend on it).")
+    if not str(settings.API_BASE_URL or "").startswith("https://"):
+        logger.critical("API_BASE_URL should use HTTPS in production (webhook callback URLs depend on it).")
+
+    # Fail-fast validation of dedicated token encryption key in production
+    from utils.crypto import validate_token_encryption_key
+    try:
+        validate_token_encryption_key()
+    except Exception as key_err:
+        logger.critical("FATAL: TOKEN_ENCRYPTION_KEY startup validation failed: %s", key_err)
+        raise RuntimeError(f"TOKEN_ENCRYPTION_KEY startup validation failed: {key_err}") from key_err
+
+
+def _check_communication_accounts_configuration() -> None:
+    """Non-fatal startup check: detect active rows requiring tokens that will fail under factory logic."""
+    if settings.APP_ENV == "test":
+        return
+    if settings.ALLOW_PLATFORM_DEFAULT_FALLBACK:
+        return
+    try:
+        from database.supabase_client import get_supabase
+        sb = get_supabase()
+        res = (
+            sb.table("communication_accounts")
+            .select("id, agency_id, provider, status, access_token_enc, access_token")
+            .eq("status", "active")
+            .execute()
+        )
+        if not res or not hasattr(res, "data") or not res.data:
+            return
+
+        problem_agency_ids = set()
+        for row in res.data:
+            prov = (row.get("provider") or "").lower().strip()
+            if prov in ("meta", "360dialog"):
+                has_token = bool(row.get("access_token_enc") or row.get("access_token"))
+                if not has_token:
+                    agency_id = row.get("agency_id")
+                    if agency_id != settings.DEFAULT_AGENCY_ID:
+                        problem_agency_ids.add(agency_id)
+
+        if problem_agency_ids:
+            logger.critical(
+                "CRITICAL CONFIGURATION MISMATCH: Active communication_accounts found with provider in ('meta', '360dialog') "
+                "and no stored token, but agency_id(s) %s do NOT match DEFAULT_AGENCY_ID (%s) and "
+                "ALLOW_PLATFORM_DEFAULT_FALLBACK is False! Outbound WhatsApp messages for these agencies will FAIL. "
+                "Align DEFAULT_AGENCY_ID, enable ALLOW_PLATFORM_DEFAULT_FALLBACK=true, or store encrypted tokens.",
+                sorted(problem_agency_ids),
+                settings.DEFAULT_AGENCY_ID,
+            )
+    except Exception as e:
+        logger.warning("Could not verify communication_accounts configuration at startup: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 AndiOS Backend starting up...")
+    _validate_production_config()
+    _check_communication_accounts_configuration()
     scheduler.start()
     logger.info("⏰ Scheduler started")
     yield
@@ -53,14 +140,30 @@ app = FastAPI(
 )
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
+# Production: only the configured FRONTEND_URL is allowed.
+# Development: localhost dev servers are also permitted.
+
+def _cors_allow_origins() -> list[str]:
+    origins = []
+    if settings.FRONTEND_URL:
+        fe = settings.FRONTEND_URL.rstrip("/")
+        origins.append(fe)
+    api = (settings.API_BASE_URL or "").rstrip("/")
+    if api and api.startswith("http"):
+        # same-origin API calls don't need CORS, but harmless to allow
+        pass
+    if settings.APP_ENV == "development":
+        origins += [
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+        ]
+    return list(dict.fromkeys(o for o in origins if o))
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        settings.FRONTEND_URL,
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=_cors_allow_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -123,11 +226,14 @@ from routers import (
     calls,
     admin,
     subscription,
+    branches,
+    agent_phone_settings,
 )
 
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(agents.router)
+app.include_router(branches.router)
 app.include_router(webhooks.router)
 app.include_router(leads.router)
 app.include_router(conversations.router)
@@ -142,6 +248,7 @@ app.include_router(owners.router)
 app.include_router(call_campaigns.router)
 app.include_router(calls.router)
 app.include_router(subscription.router)
+app.include_router(agent_phone_settings.router)
 
 
 # ─── Health Check ─────────────────────────────────────────────────────────────
@@ -168,15 +275,14 @@ async def health():
         sb.table("leads").select("id").limit(1).execute()
         db_status = "connected"
     except Exception as e:
-        db_status = f"error: {str(e)}"
+        logger.error(f"Health check DB error: {e}")
+        db_status = "error"
 
     return api_success(
         data={
             "status": "ok" if db_status == "connected" else "degraded",
             "database": db_status,
             "scheduler": "running" if scheduler.running else "stopped",
-            "whatsapp_provider": settings.WHATSAPP_PROVIDER,
-            "ai_model": settings.OPENAI_MODEL,
         },
         message="Health check completed"
     )
