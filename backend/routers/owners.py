@@ -11,6 +11,8 @@ import logging
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/owners", tags=["Owners Database"])
 
+MAX_BULK_ROWS = 5000
+
 # ─── Pydantic Models ──────────────────────────────────────────────────────────
 
 class OwnerCreate(BaseModel):
@@ -99,14 +101,19 @@ async def bulk_upload_owners(payload: BulkUploadRequest, current_user: dict = De
             data = owner.dict(exclude_unset=True)
             data["agency_id"] = agency_id
             insert_data.append(data)
-            
+
+        if len(insert_data) > MAX_BULK_ROWS:
+            raise HTTPException(status_code=400, detail=f"Bulk upload limited to {MAX_BULK_ROWS} owners per request")
+
         result = sb.table("owners").insert(insert_data).execute()
-        
+
         return api_success(
-            data={"count": len(result.data)}, 
-            message=f"{len(result.data)} owners uploaded successfully", 
+            data={"count": len(result.data)},
+            message=f"{len(result.data)} owners uploaded successfully",
             status_code=201
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error bulk uploading owners: {e}")
         raise HTTPException(status_code=500, detail="Failed to bulk upload owners")
@@ -136,7 +143,7 @@ async def bulk_upload_owners_csv(
             # Expected columns: name, phone, email, property_group, property_unit
             if not row.get("name") or not row.get("phone"):
                 continue # Skip rows without required fields
-                
+
             data = {
                 "name": row["name"],
                 "phone": row["phone"],
@@ -147,6 +154,8 @@ async def bulk_upload_owners_csv(
                 "agency_id": agency_id
             }
             insert_data.append(data)
+            if len(insert_data) > MAX_BULK_ROWS:
+                raise HTTPException(status_code=400, detail=f"Bulk upload limited to {MAX_BULK_ROWS} owners per file")
             
         if not insert_data:
             raise HTTPException(status_code=400, detail="No valid data found in CSV")
@@ -162,7 +171,7 @@ async def bulk_upload_owners_csv(
         raise
     except Exception as e:
         logger.error(f"Error bulk uploading owners via CSV: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to parse CSV: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to parse CSV file")
 
 @router.get("/{owner_id}")
 async def get_owner(owner_id: str, current_user: dict = Depends(verify_token)):
@@ -253,6 +262,8 @@ async def bulk_upload_owners_xlsx(
                 "agency_id": agency_id,
             }
             insert_data.append(data)
+            if len(insert_data) > MAX_BULK_ROWS:
+                raise HTTPException(status_code=400, detail=f"Bulk upload limited to {MAX_BULK_ROWS} owners per file")
 
         wb.close()
 
@@ -275,5 +286,50 @@ async def bulk_upload_owners_xlsx(
         )
     except Exception as e:
         logger.error(f"Error bulk uploading owners via Excel: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to parse Excel: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to parse Excel file")
+
+
+@router.patch("/{owner_id}")
+async def update_owner(owner_id: str, body: OwnerUpdate, current_user: dict = Depends(verify_token)):
+    """Update an owner record (agency-scoped, non-privileged fields only)."""
+    sb = get_supabase()
+    agency_id = current_user.get("agency_id")
+    if not agency_id:
+        raise HTTPException(status_code=400, detail="User is not associated with any agency")
+
+    update_data = body.model_dump(exclude_none=True)
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    result = (
+        sb.table("owners")
+        .update(update_data)
+        .eq("id", owner_id)
+        .eq("agency_id", agency_id)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Owner not found")
+
+    return api_success(data=result.data[0], message="Owner updated successfully")
+
+
+@router.delete("/{owner_id}")
+async def delete_owner(owner_id: str, current_user: dict = Depends(verify_token)):
+    """Delete an owner record. Owners/managers only."""
+    from utils.tenant import is_management_role
+
+    if not is_management_role(current_user.get("role")):
+        raise HTTPException(status_code=403, detail="Only owners and managers can delete owners")
+
+    sb = get_supabase()
+    agency_id = current_user.get("agency_id")
+    if not agency_id:
+        raise HTTPException(status_code=400, detail="User is not associated with any agency")
+
+    result = sb.table("owners").delete().eq("id", owner_id).eq("agency_id", agency_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Owner not found")
+
+    return api_success(data={"owner_id": owner_id}, message="Owner deleted successfully")
 

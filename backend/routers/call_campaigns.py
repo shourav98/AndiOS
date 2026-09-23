@@ -4,7 +4,9 @@ from typing import Optional, Any
 from database.supabase_client import get_supabase
 from middleware.auth_middleware import verify_token
 from utils.response import api_success
-from utils.tenant import require_agency_id
+from utils.tenant import require_agency_id, is_management_role
+from utils.plan_limits import check_campaign_limit, get_plan_limits
+from services.quota_service import check_and_consume_voice_quota, refund_voice_quota
 import logging
 
 logger = logging.getLogger(__name__)
@@ -74,9 +76,13 @@ async def get_call_campaigns(current_user: dict = Depends(verify_token)):
 
 @router.post("", status_code=201)
 async def create_call_campaign(campaign: CallCampaignCreate, current_user: dict = Depends(verify_token)):
-    """Create a new call campaign."""
+    """Create a new call campaign. Enforces the plan's monthly campaign quota."""
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
+
+    # Enforce plan quota (raises 403 when the monthly limit is reached and
+    # blocks suspended/cancelled subscriptions)
+    check_campaign_limit(agency_id)
 
     # Count owners in the target group (excluding DNC)
     owners_result = (
@@ -122,11 +128,18 @@ async def get_campaign(campaign_id: str, current_user: dict = Depends(verify_tok
 @router.post("/{campaign_id}/run")
 async def run_campaign(campaign_id: str, current_user: dict = Depends(verify_token)):
     """
-    Start or resume a calling campaign.
-    Triggers the first batch of calls immediately, then schedules subsequent batches.
+    Start or resume a calling campaign. Owners/managers only — running a
+    campaign triggers paid outbound dials. Also validates that the agency's
+    subscription is active.
     """
+    if not is_management_role(current_user.get("role")):
+        raise HTTPException(status_code=403, detail="Only owners and managers can run campaigns")
+
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
+
+    # Validate subscription status (raises 403 when suspended/cancelled)
+    get_plan_limits(agency_id)
 
     campaign = sb.table("call_campaigns").select("*").eq("id", campaign_id).eq("agency_id", agency_id).single().execute()
     if not campaign.data:
@@ -135,12 +148,43 @@ async def run_campaign(campaign_id: str, current_user: dict = Depends(verify_tok
     if campaign.data["status"] == "Completed":
         raise HTTPException(status_code=400, detail="Campaign already completed")
 
+    import os
+    from config import settings
+    vapi_key = (getattr(settings, "VAPI_API_KEY", "") or os.getenv("VAPI_API_KEY", "")).strip()
+    is_production = getattr(settings, "APP_ENV", "development") != "development"
+    if is_production and not vapi_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Vapi AI calling is not configured. Please configure VAPI_API_KEY and VAPI_ASSISTANT_ID in environment."
+        )
+
+    # ── Voice quota gate (shared gateway): check before triggering Vapi ──
+    # Atomic check — if quota exceeded, abort campaign and notify dashboard.
+    quota_allowed = await check_and_consume_voice_quota(agency_id)
+    if not quota_allowed:
+        # Revert status to Paused so the campaign can be resumed after top-up
+        sb.table("call_campaigns").update({"status": "Paused"}).eq("id", campaign_id).execute()
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                "Monthly voice call quota exceeded. "
+                "Please purchase an Add-on pack to resume calling. "
+                "Agent login and lead history remain fully accessible."
+            )
+        )
+
     # Update status to Running
     sb.table("call_campaigns").update({"status": "Running"}).eq("id", campaign_id).execute()
 
     # Trigger first batch
     from services.vapi_service import run_campaign_batch
-    await run_campaign_batch(campaign_id, agency_id, batch_size=10)
+    try:
+        await run_campaign_batch(campaign_id, agency_id, batch_size=10)
+    except Exception as vapi_err:
+        # Refund the quota unit if Vapi setup itself fails
+        await refund_voice_quota(agency_id)
+        sb.table("call_campaigns").update({"status": "Paused"}).eq("id", campaign_id).execute()
+        raise HTTPException(status_code=502, detail=f"Vapi call setup failed: {vapi_err}")
 
     # Schedule recurring batches via APScheduler
     from services.scheduler import scheduler

@@ -8,6 +8,8 @@ GET  /auth/me              — Current user profile
 POST /auth/refresh         — Refresh expired access token
 POST /auth/forgot-password — Send password reset email
 POST /auth/reset-password  — Set new password (after OTP/link)
+POST /auth/change-password — Change password while logged in (requires current password)
+PATCH  /auth/profile       — Update own profile (non-privileged fields)
 POST /auth/verify-otp      — Verify 6-digit email OTP
 POST /auth/resend-otp      — Resend OTP verification email
 """
@@ -642,26 +644,25 @@ async def reset_password(
         token = body.candidate_jwt
 
     if token:
-        # Try our custom JWT first (150s reset token or 24h session token)
+        # Single-purpose enforcement: only password-reset tokens may reset passwords.
         try:
             payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
             if payload and payload.get("sub"):
+                if payload.get("purpose") != "password_reset":
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Invalid token for password reset. Request a fresh reset code.",
+                    )
                 user_id = payload["sub"]
                 if not user_email and payload.get("email"):
                     user_email = payload["email"]
+        except HTTPException:
+            raise
         except Exception as e:
             logger.debug(f"JWT decode error on reset-password: {e}")
 
-        # Fallback: try Supabase session token
-        if not user_id:
-            try:
-                user_res = sb.auth.get_user(token)
-                if user_res and user_res.user:
-                    user_id = user_res.user.id
-                    if not user_email:
-                        user_email = user_res.user.email
-            except Exception:
-                pass
+        # NOTE: deliberately no Supabase get_user(token) fallback here — an ordinary
+        # Supabase session/access token must never be able to change a password.
 
     # ── Method 2: Inline 6-digit OTP verification + password reset ────────────────
     # Requires both email AND 6-digit OTP code in body.
@@ -720,5 +721,99 @@ async def reset_password(
     except Exception as e:
         logger.error(f"Reset password error: {e}")
         raise HTTPException(status_code=400, detail="Password reset failed. Please try again.")
+
+
+# ─── CHANGE PASSWORD (session-authenticated) ────────────────────────────────────
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+    confirm_password: Optional[str] = None
+
+
+@router.post("/change-password")
+async def change_password(
+    body: ChangePasswordRequest,
+    current_user: dict = Depends(verify_token),
+):
+    """
+    Change the password of the logged-in user. Requires the CURRENT password.
+    Only real session tokens can reach this — single-purpose password-reset
+    tokens are rejected by the auth middleware.
+    """
+    if body.new_password != body.confirm_password and body.confirm_password is not None:
+        raise HTTPException(status_code=400, detail="New passwords do not match.")
+    if len(body.new_password) < 8:
+        raise HTTPException(status_code=422, detail="New password must be at least 8 characters.")
+
+    email = current_user.get("email")
+    user_id = current_user.get("sub")
+    if not email or not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    sb = get_supabase()
+    # Verify the current password by re-authenticating against Supabase Auth
+    try:
+        sb.auth.sign_in_with_password({
+            "email": email,
+            "password": body.current_password,
+        })
+    except Exception:
+        raise HTTPException(status_code=400, detail="Current password is incorrect.")
+
+    try:
+        sb.auth.admin.update_user_by_id(user_id, {"password": body.new_password})
+    except Exception as e:
+        logger.error(f"Change password failed for {user_id}: {e}")
+        raise HTTPException(status_code=400, detail="Failed to update password. Please try again.")
+
+    return api_success(
+        message="Password changed successfully.",
+        data={"user_id": str(user_id), "status": "password_changed"},
+    )
+
+
+# ─── PROFILE UPDATE (self-service) ──────────────────────────────────────────────
+
+class ProfileUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    whatsapp_number: Optional[str] = None
+    avatar_url: Optional[str] = None
+    branch: Optional[str] = None
+
+
+@router.patch("/profile")
+@router.post("/profile/update")
+async def update_my_profile(
+    body: ProfileUpdateRequest,
+    current_user: dict = Depends(verify_token),
+):
+    """
+    Update the logged-in agent's own profile (non-privileged fields only).
+    Role / agency / activation status cannot be changed here.
+    """
+    update_data = body.model_dump(exclude_none=True)
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    email = current_user.get("email")
+    agency_id = current_user.get("agency_id")
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    sb = get_supabase()
+    query = sb.table("agents").update(update_data).eq("email", email)
+    if agency_id:
+        query = query.eq("agency_id", agency_id)
+    result = query.execute()
+
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Agent profile not found")
+
+    return api_success(
+        data=result.data[0],
+        message="Profile updated successfully",
+    )
 
 

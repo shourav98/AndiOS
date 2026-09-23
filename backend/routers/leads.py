@@ -7,6 +7,7 @@ PATCH  /leads/{id}             — update lead
 POST   /leads/{id}/handover    — trigger AI→agent handover
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
+from datetime import datetime, timedelta
 from typing import Optional
 from uuid import UUID
 from database.supabase_client import get_supabase
@@ -20,35 +21,154 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/leads", tags=["Leads"])
 
 
-@router.get("", response_model=ApiResponse[list[dict]])
+@router.get("", response_model=ApiResponse[dict])
 async def list_leads(
     status: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
-    agent_id: Optional[UUID] = Query(None),
+    platform: Optional[str] = Query(None),
+    agent_id: Optional[str] = Query(None),
+    agent: Optional[str] = Query(None),
+    branch_id: Optional[str] = Query(None),
+    branch: Optional[str] = Query(None),
+    timeframe: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
     is_ai_handling: Optional[bool] = Query(None),
     search: Optional[str] = Query(None),
     limit: int = Query(50, le=200),
     offset: int = Query(0),
     _: dict = Depends(verify_token),
 ):
-    """List all leads with optional filters. Used by the Leads dashboard page."""
+    """List all leads with multi-level filters (status, platform, branch, agent, timeframe, search)."""
     sb = get_supabase()
     current_user = _
-    query = sb.table("leads").select("*, agents(name)").order("created_at", desc=True)
-    query = apply_lead_scope(query, current_user)
+    agency_id = require_agency_id(current_user)
 
-    if status:
-        query = query.eq("status", status)
-    if source:
-        query = query.eq("source", source)
-    if agent_id:
-        query = query.eq("assigned_agent_id", str(agent_id))
-    if is_ai_handling is not None:
-        query = query.eq("is_ai_handling", is_ai_handling)
-    if search:
-        query = query.or_(f"name.ilike.%{search}%,phone.ilike.%{search}%,email.ilike.%{search}%")
+    # 1. Normalize Status filter
+    target_status = None
+    if status and isinstance(status, str) and status.strip().lower() not in ("all", "all status", "select status", ""):
+        s_clean = status.strip().lower().replace(" ", "_")
+        if s_clean in ("closed_won", "closed won", "closed"):
+            target_status = "closed"
+        elif s_clean in ("viewing_booked", "viewing booked"):
+            target_status = "viewing_booked"
+        else:
+            target_status = s_clean
 
-    result = query.range(offset, offset + limit - 1).execute()
+    # 2. Normalize Platform/Source filter
+    effective_source = source if isinstance(source, str) else (platform if isinstance(platform, str) else None)
+    target_source = None
+    if effective_source and effective_source.strip().lower() not in ("all", "all platform", "select platform", ""):
+        src_clean = effective_source.strip().lower().replace(" ", "_")
+        target_source = src_clean
+
+    # 3. Resolve Branch filter (branch_id or branch name)
+    effective_branch = branch_id if isinstance(branch_id, str) else (branch if isinstance(branch, str) else None)
+    branch_agent_ids = None
+    if effective_branch and effective_branch.strip() not in ("All branches", "All", "all", ""):
+        target_branch_val = effective_branch.strip()
+        agency_res = sb.table("agencies").select("settings").eq("id", agency_id).maybe_single().execute()
+        stored_branches = ((agency_res.data or {}).get("settings") or {}).get("branches") or []
+        for b in stored_branches:
+            if b.get("id") == target_branch_val:
+                target_branch_val = b.get("name", target_branch_val)
+                break
+
+        branch_rows = (
+            sb.table("agents")
+            .select("id")
+            .eq("agency_id", agency_id)
+            .or_(f"branch.eq.{target_branch_val},branch.eq.{effective_branch.strip()}")
+            .execute()
+            .data or []
+        )
+        branch_agent_ids = [a["id"] for a in branch_rows]
+
+    # 4. Resolve Agent filter (agent_id or agent name)
+    raw_agent = agent_id if isinstance(agent_id, str) else (agent if isinstance(agent, str) else None)
+    target_agent_id = None
+    if raw_agent and raw_agent.strip() not in ("All agents", "All", "all", ""):
+        clean_agent = raw_agent.strip()
+        if len(clean_agent) == 36 and "-" in clean_agent:
+            target_agent_id = clean_agent
+        else:
+            ag_res = sb.table("agents").select("id").eq("agency_id", agency_id).ilike("name", f"%{clean_agent}%").execute()
+            if ag_res.data:
+                target_agent_id = ag_res.data[0]["id"]
+
+    # 5. Resolve Timeframe & Date Range
+    effective_start_date = start_date if isinstance(start_date, str) else (from_date if isinstance(from_date, str) else None)
+    effective_end_date = end_date if isinstance(end_date, str) else (to_date if isinstance(to_date, str) else None)
+    now = datetime.utcnow()
+    if timeframe and isinstance(timeframe, str) and timeframe.strip().lower() not in ("all", "all time", ""):
+        tf = timeframe.strip().lower().replace(" ", "_")
+        if tf == "today":
+            effective_start_date = now.strftime("%Y-%m-%d")
+            effective_end_date = now.strftime("%Y-%m-%d")
+        elif tf == "last_7_days":
+            effective_start_date = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        elif tf == "this_month":
+            effective_start_date = now.replace(day=1).strftime("%Y-%m-%d")
+        elif tf == "last_30_days":
+            effective_start_date = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+        elif tf == "this_quarter":
+            quarter_month = ((now.month - 1) // 3) * 3 + 1
+            effective_start_date = now.replace(month=quarter_month, day=1).strftime("%Y-%m-%d")
+
+    # Searchable fields
+    SEARCHABLE_FIELDS = (
+        "name", "phone", "email", "external_lead_id",
+        "property_ref", "property_address", "location_pref",
+    )
+
+    def _apply_filters(q):
+        q = apply_lead_scope(q, current_user)          # agency + agent scoping
+        if target_status:
+            if target_status == "closed":
+                q = q.or_("status.eq.closed,status.eq.closed_won")
+            else:
+                q = q.eq("status", target_status)
+        if target_source:
+            q = q.eq("source", target_source)
+        if target_agent_id:
+            q = q.eq("assigned_agent_id", target_agent_id)
+        elif branch_agent_ids is not None:
+            NULL_UUID = "00000000-0000-0000-0000-000000000000"
+            q = q.in_("assigned_agent_id", branch_agent_ids or [NULL_UUID])
+        if effective_start_date:
+            q = q.gte("created_at", f"{effective_start_date}T00:00:00")
+        if effective_end_date:
+            q = q.lte("created_at", f"{effective_end_date}T23:59:59")
+        if is_ai_handling is not None and isinstance(is_ai_handling, bool):
+            q = q.eq("is_ai_handling", is_ai_handling)
+        if search and isinstance(search, str):
+            clean = search.replace(",", "").replace("(", "").replace(")", "")
+            clean = clean.replace("%", "").replace("\\", "").strip()
+            if clean:
+                conds = ",".join(f"{f}.ilike.%{clean}%" for f in SEARCHABLE_FIELDS)
+                q = q.or_(conds)
+        return q
+
+    lim = limit if isinstance(limit, int) else 50
+    off = offset if isinstance(offset, int) else 0
+
+    result = (
+        _apply_filters(sb.table("leads").select("*, agents(name)"))
+        .order("created_at", desc=True)
+        .range(off, off + lim - 1)
+        .execute()
+    )
+    total = getattr(result, "count", None)
+
+    # Exact total for pagination — same filters as the data query
+    if total is None:
+        try:
+            total = _apply_filters(sb.table("leads").select("id", count="exact")).execute().count
+        except Exception as e:
+            logger.warning(f"Lead count query failed: {e}")
+            total = len(result.data)
     
     # Source display name mapping (lowercase DB value → UI display)
     SOURCE_LABELS = {
@@ -112,7 +232,15 @@ async def list_leads(
             "created_at": row.get("created_at"),
         })
 
-    return api_success(data=formatted_leads, message="Leads retrieved successfully")
+    return api_success(
+        data={
+            "leads": formatted_leads,
+            "total": total if total is not None else len(formatted_leads),
+            "limit": limit,
+            "offset": offset,
+        },
+        message="Leads retrieved successfully",
+    )
 
 
 @router.get("/stats", response_model=ApiResponse[LeadStats])
@@ -262,9 +390,26 @@ async def create_lead(lead: LeadCreate, current_user: dict = Depends(verify_toke
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
 
-    lead_data = lead.dict(exclude_unset=True)
+    # mode="json": serialize UUID/datetime/enum fields to JSON-safe values
+    # (raw UUID objects are not JSON-serializable for the PostgREST payload)
+    lead_data = lead.model_dump(mode="json", exclude_unset=True)
     lead_data["agency_id"] = agency_id
-    
+
+    # Assignment target must belong to THIS agency (no cross-tenant assignment)
+    if lead_data.get("assigned_agent_id"):
+        agent_check = (
+            sb.table("agents")
+            .select("id")
+            .eq("id", lead_data["assigned_agent_id"])
+            .eq("agency_id", agency_id)
+            .execute()
+        )
+        if not agent_check.data:
+            raise HTTPException(
+                status_code=400,
+                detail="assigned_agent_id does not belong to your agency",
+            )
+
     # Handle the status parameter if passed in the payload for testing, otherwise default to new
     if "status" not in lead_data:
         lead_data["status"] = "new"

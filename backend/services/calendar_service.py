@@ -16,18 +16,28 @@ logger = logging.getLogger(__name__)
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 
+def get_redirect_uri() -> str:
+    """Return the configured redirect URI or dynamically build it from API_BASE_URL."""
+    configured = (getattr(settings, "GOOGLE_REDIRECT_URI", "") or "").strip()
+    if configured:
+        return configured
+    api_base = (getattr(settings, "API_BASE_URL", "") or "http://localhost:8000").rstrip("/")
+    return f"{api_base}/connectors/google-calendar/callback"
+
+
 def get_oauth_flow() -> Flow:
+    redirect_uri = get_redirect_uri()
     client_config = {
         "web": {
             "client_id": settings.GOOGLE_CLIENT_ID,
             "client_secret": settings.GOOGLE_CLIENT_SECRET,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [settings.GOOGLE_REDIRECT_URI],
+            "redirect_uris": [redirect_uri],
         }
     }
     flow = Flow.from_client_config(client_config, scopes=SCOPES)
-    flow.redirect_uri = settings.GOOGLE_REDIRECT_URI
+    flow.redirect_uri = redirect_uri
     return flow
 
 
@@ -35,10 +45,11 @@ import urllib.parse
 import httpx
 
 def get_auth_url(state: str = None) -> str:
+    redirect_uri = get_redirect_uri()
     base_url = "https://accounts.google.com/o/oauth2/auth"
     params = {
         "client_id": settings.GOOGLE_CLIENT_ID,
-        "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         "response_type": "code",
         "scope": " ".join(SCOPES),
         "access_type": "offline",
@@ -50,12 +61,13 @@ def get_auth_url(state: str = None) -> str:
 
 
 def exchange_code_for_tokens(code: str) -> dict:
+    redirect_uri = get_redirect_uri()
     data = {
         "client_id": settings.GOOGLE_CLIENT_ID,
         "client_secret": settings.GOOGLE_CLIENT_SECRET,
         "code": code,
         "grant_type": "authorization_code",
-        "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+        "redirect_uri": redirect_uri,
     }
     resp = httpx.post("https://oauth2.googleapis.com/token", data=data)
     resp.raise_for_status()
@@ -156,11 +168,21 @@ def create_viewing_event(
                 # Naive: treat as UTC
                 return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        # Format Dubai time display for cross-timezone clarity
+        try:
+            import pytz
+            dubai_tz = pytz.timezone("Asia/Dubai")
+            dt_dubai = start_datetime.astimezone(dubai_tz) if start_datetime.tzinfo else start_datetime
+            dubai_time_str = dt_dubai.strftime("%I:%M %p")
+        except Exception:
+            dubai_time_str = start_datetime.strftime("%I:%M %p")
+
         event = {
-            "summary": f"🏠 Viewing: {lead_name} — {property_address}",
+            "summary": f"🏠 Viewing: {lead_name} — {property_address} ({dubai_time_str} Dubai Time)",
             "description": (
                 f"Lead: {lead_name}\nPhone: {lead_phone}\n"
                 f"Property: {property_address}\n"
+                f"Time: {dubai_time_str} (Dubai Time, GMT+4)\n"
                 f"Booked via AndiOS AI"
                 + (f"\nAgent: {agent_name}" if agent_name else "")
             ),

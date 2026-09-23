@@ -48,3 +48,27 @@ async def get_existing_lead_by_phone(phone: str) -> dict | None:
     except Exception as e:
         logger.error(f"Phone dedup check error: {e}")
         return None
+
+
+async def is_duplicate_lead_for_property(phone: str, property_ref: str) -> bool:
+    """
+    Check if a lead with this phone number has already inquired about this specific property.
+    Deduplicates between portal webhooks and inbound WhatsApp wa.me links.
+    """
+    if not phone or not property_ref:
+        return False
+    try:
+        clean_phone = phone.replace("+", "").replace(" ", "").replace("-", "")
+        sb = get_supabase()
+        result = (
+            sb.table("leads")
+            .select("id")
+            .ilike("phone", f"%{clean_phone[-9:]}")
+            .eq("property_ref", property_ref)
+            .limit(1)
+            .execute()
+        )
+        return bool(result.data and len(result.data) > 0)
+    except Exception as e:
+        logger.error(f"Lead property dedup check error: {e}")
+        return False

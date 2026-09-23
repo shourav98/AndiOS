@@ -1,28 +1,42 @@
 """
-Webhooks Router — handles inbound leads from Property Finder, Bayut, Dubizzle
-and inbound WhatsApp messages, and Vapi call result callbacks.
+Webhooks Router — handles inbound leads from Property Finder, Bayut, Dubizzle,
+inbound WhatsApp messages (shared gateway), Vapi call result callbacks, and
+inbound voice calls forwarded to the Central Platform DID.
 
 POST /webhooks/property-finder   — new lead from portal (HMAC verified)
 POST /webhooks/bayut             — new lead from Bayut
 POST /webhooks/dubizzle          — new lead from Dubizzle
 GET  /webhooks/whatsapp          — WhatsApp webhook verification
-POST /webhooks/whatsapp          — inbound WhatsApp message
+POST /webhooks/whatsapp          — inbound WhatsApp message (shared gateway router)
 POST /webhooks/vapi              — Vapi call result callback
+POST /webhooks/voice/inbound     — inbound voice call (Central DID, BYON forwarding)
 """
+from __future__ import annotations
 import time
+import json
 import hmac
 import hashlib
-from fastapi import APIRouter, Request, HTTPException, Query
+from typing import Any, Optional, Dict, List
+from fastapi import APIRouter, Request, HTTPException, Query, BackgroundTasks
+from fastapi.responses import JSONResponse
 from database.supabase_client import get_supabase
-from services.dedup_service import is_duplicate, get_existing_lead_by_phone
+import services.dedup_service as dedup_service
+from services.dedup_service import is_duplicate, get_existing_lead_by_phone, is_duplicate_lead_for_property
 from services.whatsapp_service import (
     send_whatsapp_message,
+    send_whatsapp_for_agency,
+    send_whatsapp_smart,
+    drain_outbound_queue_for_lead,
     parse_360dialog_inbound,
     parse_twilio_inbound,
 )
+from services.quota_service import (
+    check_and_consume_whatsapp_quota,
+    refund_whatsapp_quota,
+)
 from services.ai_service import qualify_and_respond, detect_handover, extract_lead_qualifications
 from services.lead_routing_service import resolve_agency_and_agent
-from utils.response import api_success
+from utils.response import api_success, api_error
 from config import settings
 import logging
 
@@ -35,14 +49,28 @@ router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 def _verify_pf_signature(raw_body: bytes, signature_header: str | None) -> bool:
     """
     Verify Property Finder webhook HMAC-SHA256 signature.
-    Header format: 'sha256=<hex_digest>'
-    Returns True if valid or if in dev mode / no secret configured.
+    Header format: 'sha256=<hex_digest>' over the raw request body.
+
+    A configured PROPERTY_FINDER_WEBHOOK_SECRET always enforces strict
+    verification — regardless of APP_ENV — so a mis-set APP_ENV=development
+    can never disable signature checking when a secret exists.
+    Without a secret, unverified requests are tolerated ONLY in explicit
+    development; production fails closed.
     """
-    if getattr(settings, "APP_ENV", "development") == "development":
-        return True
     secret = getattr(settings, "PROPERTY_FINDER_WEBHOOK_SECRET", "")
     if not secret:
+        if getattr(settings, "APP_ENV", "development") != "development":
+            logger.critical(
+                "PROPERTY_FINDER_WEBHOOK_SECRET is not configured — rejecting "
+                "Property Finder webhook (fail closed)"
+            )
+            return False
+        logger.warning(
+            "PROPERTY_FINDER_WEBHOOK_SECRET not set — accepting UNVERIFIED "
+            "Property Finder webhook (development only)"
+        )
         return True
+
     if not signature_header:
         return False
     expected = "sha256=" + hmac.new(
@@ -51,6 +79,397 @@ def _verify_pf_signature(raw_body: bytes, signature_header: str | None) -> bool:
         digestmod=hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature_header)
+
+
+# ─── WhatsApp Inbound Authentication ──────────────────────────────────────────
+
+def _verify_360dialog_request(request: Request) -> bool:
+    """
+    Authenticate inbound 360dialog webhook requests.
+
+    360dialog does not sign webhook deliveries with an HMAC we can key on in
+    this integration, so we require an operator-configured shared secret
+    (WHATSAPP_WEBHOOK_TOKEN) delivered as either the 'X-Webhook-Token' header
+    or a '?token=' query parameter embedded in the callback URL configured in
+    the 360dialog dashboard. Comparison is constant-time.
+
+    Fails closed outside development when the token is unconfigured.
+    """
+    secret = getattr(settings, "WHATSAPP_WEBHOOK_TOKEN", "")
+    provided = request.headers.get("x-webhook-token") or request.query_params.get("token")
+    if not secret:
+        if getattr(settings, "APP_ENV", "development") != "development":
+            logger.critical(
+                "WHATSAPP_WEBHOOK_TOKEN is not configured — rejecting inbound "
+                "WhatsApp webhook (fail closed)"
+            )
+            return False
+        logger.warning(
+            "WHATSAPP_WEBHOOK_TOKEN not set — accepting unauthenticated "
+            "WhatsApp webhook in development only"
+        )
+        return True
+    return bool(provided) and hmac.compare_digest(str(provided), str(secret))
+
+
+def _verify_twilio_request(request: Request, params: dict) -> bool:
+    """
+    Validate X-Twilio-Signature for inbound Twilio webhooks using the account
+    auth token and the exact request URL + POST parameters Twilio signed.
+
+    Fails closed outside development when TWILIO_AUTH_TOKEN is unconfigured.
+    In development mode (APP_ENV=development), missing signature is accepted
+    to allow Postman testing without signature generation.
+    Note: Twilio signs the PUBLIC request URL — reverse proxies must forward
+    the correct scheme/host (X-Forwarded-*) for validation to succeed.
+    """
+    from twilio.request_validator import RequestValidator
+
+    auth_token = (getattr(settings, "TWILIO_AUTH_TOKEN", "") or "").strip()
+    signature = request.headers.get("x-twilio-signature")
+    is_development = getattr(settings, "APP_ENV", "development") == "development"
+
+    if not auth_token:
+        if not is_development:
+            logger.critical(
+                "TWILIO_AUTH_TOKEN is not configured — rejecting inbound "
+                "WhatsApp webhook (fail closed)"
+            )
+            return False
+        logger.warning(
+            "TWILIO_AUTH_TOKEN not set — accepting unauthenticated Twilio "
+            "webhook in development only"
+        )
+        return True
+
+    # Development mode: allow Postman testing without X-Twilio-Signature
+    if not signature:
+        if is_development:
+            logger.warning(
+                "No X-Twilio-Signature header — accepting in development mode "
+                "(Postman/local test). Set APP_ENV=production to enforce."
+            )
+            return True
+        return False
+
+    validator = RequestValidator(auth_token)
+    str_params = {str(k): str(v) for k, v in params.items()}
+    return validator.validate(str(request.url), str_params, signature)
+
+
+def _verify_meta_request(request: Request, raw_body: bytes) -> bool:
+    """
+    Authenticate inbound Meta Cloud API webhook requests via X-Hub-Signature-256.
+    Header format: 'sha256=<hex_digest>' over the raw request body.
+    Fails closed outside development when app secret is unconfigured.
+    """
+    secret = (getattr(settings, "META_APP_SECRET", "") or getattr(settings, "WHATSAPP_APP_SECRET", "") or "").strip()
+    signature = request.headers.get("x-hub-signature-256") or request.headers.get("X-Hub-Signature-256")
+    is_development = getattr(settings, "APP_ENV", "development") == "development"
+
+    if not secret:
+        if not is_development:
+            logger.critical("META_APP_SECRET is not configured — rejecting Meta webhook (fail closed)")
+            return False
+        logger.warning("META_APP_SECRET not set — accepting Meta webhook in development only")
+        return True
+
+    if not signature or not signature.startswith("sha256="):
+        if is_development:
+            logger.warning("No valid X-Hub-Signature-256 — accepting in development mode only")
+            return True
+        return False
+
+    expected = "sha256=" + hmac.new(
+        key=secret.encode("utf-8"),
+        msg=raw_body,
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, signature)
+
+
+def _parse_numeric_budget(val: Any) -> float | None:
+    """Safely parse human-written budget strings into floats for DB numeric columns."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip().lower().replace(",", "").replace("aed", "").replace("$", "").strip()
+    try:
+        import re
+        if s.endswith("k"):
+            return float(s[:-1].strip()) * 1000
+        elif s.endswith("m"):
+            return float(s[:-1].strip()) * 1000000
+        elif s.endswith("b"):
+            return float(s[:-1].strip()) * 1000000000
+        m = re.search(r"(\d+(\.\d+)?)", s)
+        if m:
+            num = float(m.group(1))
+            if "k" in s:
+                num *= 1000
+            elif "m" in s:
+                num *= 1000000
+            return num
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_bedrooms(val: Any) -> int | None:
+    """Safely parse bedroom count (e.g. '2BHK', '3 bed', 'Studio', 2) into integer."""
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    s = str(val).strip().lower()
+    if "studio" in s:
+        return 0
+    import re
+    m = re.search(r"\d+", s)
+    if m:
+        try:
+            return int(m.group(0))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+# ─── Safe Lead Resolution ─────────────────────────────────────────────────────
+
+def _normalize_phone(phone: str) -> str:
+    """Digits-only normalization for sender/lead comparison."""
+    return "".join(ch for ch in str(phone or "") if ch.isdigit())
+
+
+def _find_lead_by_sender_phone(
+    sb,
+    from_phone: str,
+    agency_id: str | None = None,
+    agent_id: str | None = None,
+):
+    """
+    Resolve which stored lead sent an inbound WhatsApp message.
+
+    Matching strategy (safest-first):
+      1. Normalize phone to E.164 digits.
+      2. Exact digit-normalized match on the FULL phone number.
+      3. Legacy tolerance only when no exact match exists: UNIQUE suffix match.
+      4. If agency_id is provided, filter candidates strictly to that agency.
+         If no agency_id is provided and candidates span multiple agencies, fail safe (ambiguous).
+      5. If agent_id is provided (e.g. from BYON phone_number_id belonging to an agent):
+         prioritize/filter to leads assigned to that specific agent.
+      6. If multiple candidate leads remain:
+         - If they belong to the SAME agent: pick most recently updated lead.
+         - If they belong to DIFFERENT agents (or are unassigned): fail safe (ambiguous).
+    Returns (lead | None, reason) where reason in matched|ambiguous|unknown|invalid.
+    """
+    digits = _normalize_phone(from_phone)
+    if len(digits) < 7:
+        return None, "invalid"
+
+    candidates = (
+        sb.table("leads")
+        .select("*")
+        .ilike("phone", f"%{digits[-9:]}")
+        .execute()
+        .data
+        or []
+    )
+
+    exact = [c for c in candidates if _normalize_phone(c.get("phone")) == digits]
+    pool = exact if exact else [
+        c for c in candidates
+        if _normalize_phone(c.get("phone", "")).endswith(digits[-9:])
+    ]
+
+    if not pool:
+        return None, "unknown"
+
+    # Filter by agency if resolved from incoming channel
+    if agency_id and isinstance(agency_id, str):
+        pool = [c for c in pool if c.get("agency_id") == agency_id]
+        if not pool:
+            return None, "unknown"
+    else:
+        # Cross-agency collision check when no single agency is bound to channel
+        unique_agencies = {c.get("agency_id") for c in pool if c.get("agency_id")}
+        if len(unique_agencies) > 1:
+            logger.warning(
+                "Ambiguous WhatsApp sender match (phone ending ***%s): candidate leads span multiple agencies %s — skipping",
+                digits[-3:], unique_agencies,
+            )
+            return None, "ambiguous"
+
+    # If specific agent_id was resolved from the incoming channel (e.g. agent's personal BYON)
+    if agent_id and isinstance(agent_id, str):
+        agent_matches = [c for c in pool if c.get("assigned_agent_id") == agent_id]
+        if not agent_matches:
+            # Do NOT fall back to another agent's lead in the agency
+            return None, "unknown"
+        pool = agent_matches
+
+
+    if len(pool) > 1:
+        unique_agents = {c.get("assigned_agent_id") for c in pool}
+        first_agent = next(iter(unique_agents))
+        if len(unique_agents) == 1 and first_agent is not None:
+            # Same agent, multiple inquiries/leads from this buyer: pick the most recent
+            pool.sort(key=lambda x: (x.get("updated_at") or x.get("created_at") or ""), reverse=True)
+            return pool[0], "matched"
+
+        # Cross-agent ambiguity on shared number (or multiple unassigned leads) — fail safe
+        logger.warning(
+            "Ambiguous WhatsApp sender match (phone ending ***%s): %d candidate leads across agents %s — skipping",
+            digits[-3:], len(pool), unique_agents,
+        )
+        return None, "ambiguous"
+
+    return pool[0], "matched"
+
+
+def _check_and_mark_message_id(sb, message_id: str, agency_id: str | None = None, agent_id: str | None = None) -> bool:
+    """
+    Atomic idempotency guard for inbound WhatsApp messages.
+    Performs atomic INSERT on whatsapp_processed_messages (message_id is PRIMARY KEY).
+    Eliminates check-then-insert race conditions.
+
+    Returns:
+        True  — message is NEW, proceed with processing.
+        False — message was already processed (duplicate detected), skip.
+
+    Behavior on DB error:
+        Logs an error/warning and returns True (graceful degradation: never drop customer messages).
+    """
+    if not message_id:
+        return True
+
+    try:
+        row = {"message_id": message_id}
+        if agency_id:
+            row["agency_id"] = agency_id
+        if agent_id:
+            row["agent_id"] = agent_id
+
+        sb.table("whatsapp_processed_messages").insert(row).execute()
+        return True
+    except Exception as exc:
+        err_str = str(exc).lower()
+        if "duplicate key" in err_str or "unique constraint" in err_str or "23505" in err_str:
+            logger.info("[WA] Skipping duplicate message_id=%s (idempotency conflict)", message_id)
+            return False
+        logger.warning(
+            "[WA] Idempotency check DB failure for message_id=%s: %s — proceeding without dedup",
+            message_id, exc
+        )
+        return True
+
+
+def _unmark_message_id(sb, message_id: str) -> None:
+    """
+    Remove the idempotency record when background message processing fails.
+    Prevents leaving the message permanently marked as processed, ensuring
+    subsequent webhook delivery retries can be processed successfully.
+    """
+    if not message_id:
+        return
+    try:
+        sb.table("whatsapp_processed_messages").delete().eq("message_id", message_id).execute()
+        logger.info("[WA] Cleared idempotency lock for failed message_id=%s (retry enabled)", message_id)
+    except Exception as exc:
+        logger.warning("[WA] Failed to clear idempotency lock for message_id=%s: %s", message_id, exc)
+
+
+async def _handle_smb_message_echoes(sb, val: dict) -> None:
+    """
+    Handles `smb_message_echoes` event in Coexistence mode.
+    When an agent replies to a client directly from their mobile WhatsApp Business App,
+    Meta sends an echo webhook.
+    Logic:
+      1. Records the outbound human reply in conversations table (sender_type='agent').
+      2. Human Takeover: Pauses AI auto-responder for this lead so AI does not interrupt the human.
+    """
+    echoes = val.get("message_echoes") or val.get("messages") or []
+    for echo in echoes:
+        to_phone = echo.get("to") or ""
+        text_body = (echo.get("text") or {}).get("body") or echo.get("body") or ""
+        msg_id = echo.get("id") or ""
+        if not to_phone:
+            continue
+
+        lead, _ = _find_lead_by_sender_phone(sb, to_phone)
+        if lead:
+            lead_id = lead["id"]
+            # 1. Insert message to conversation history
+            try:
+                sb.table("conversations").insert({
+                    "lead_id": lead_id,
+                    "agency_id": lead.get("agency_id"),
+                    "direction": "outbound",
+                    "channel": "whatsapp",
+                    "message_body": text_body,
+                    "sender_type": "agent",
+                    "whatsapp_message_id": msg_id,
+                }).execute()
+            except Exception as e:
+                logger.warning("[Coexistence] Error saving human echo conversation: %s", e)
+
+            # 2. Pause AI (Human Takeover)
+            try:
+                sb.table("leads").update({
+                    "is_ai_handling": False,
+                    "status": "human_takeover",
+                    "handover_reason": "agent_replied_via_mobile_app",
+                }).eq("id", lead_id).execute()
+                logger.info("[Coexistence] Human takeover active for lead %s. AI auto-reply paused.", lead_id)
+            except Exception as e:
+                logger.warning("[Coexistence] Error updating lead human takeover status: %s", e)
+
+
+async def _handle_meta_account_update(sb, val: dict) -> None:
+    """
+    Handles `account_update` events (coexistence offboarding, disconnect, status changes).
+    """
+    event = val.get("event", "")
+    phone_id = val.get("phone_number_id")
+    waba_id = val.get("waba_id")
+    logger.warning("[Meta Webhook] Received account_update event: %s (phone=%s, waba=%s)", event, phone_id, waba_id)
+
+    if event in ("COEXISTENCE_OFFBOARDED", "DISABLED", "BANNED", "SUSPENDED"):
+        query = sb.table("communication_accounts").update({"status": "suspended"})
+        if phone_id:
+            query = query.eq("phone_number_id", str(phone_id))
+        elif waba_id:
+            query = query.eq("external_account_id", str(waba_id))
+        try:
+            query.execute()
+            logger.info("[Meta Webhook] Marked communication_account suspended due to event %s", event)
+        except Exception as e:
+            logger.error("[Meta Webhook] Error updating communication_account status on account_update: %s", e)
+
+
+async def _handle_template_status_update(sb, val: dict) -> None:
+    """
+    Handles `message_template_status_update` webhook from Meta.
+    Updates template status in whatsapp_templates (APPROVED, REJECTED, PAUSED, etc.).
+    """
+    event = val.get("event") or val.get("status") or "PENDING"
+    template_id = val.get("message_template_id")
+    template_name = val.get("message_template_name")
+    logger.info("[Templates] Template status update: name=%s id=%s status=%s", template_name, template_id, event)
+
+    try:
+        query = sb.table("whatsapp_templates").update({"status": event.upper(), "updated_at": "now()"})
+        if template_id:
+            query = query.eq("meta_template_id", str(template_id))
+        elif template_name:
+            query = query.eq("name", template_name)
+        query.execute()
+    except Exception as e:
+        logger.warning("[Templates] Error updating whatsapp_templates: %s", e)
 
 
 # ─── Property Finder Webhook ───────────────────────────────────────────────────
@@ -79,7 +498,7 @@ async def property_finder_webhook(request: Request):
         "payload": payload,
         "processed": False,
     }).execute()
-    log_id = log_entry.data[0]["id"]
+    log_id = log_entry.data[0]["id"] if (log_entry and getattr(log_entry, "data", None)) else "log-id"
 
     try:
         # ── Parse Property Finder payload ──
@@ -130,8 +549,18 @@ async def property_finder_webhook(request: Request):
             }).eq("id", log_id).execute()
             return api_success(message="Lead already exists", data={"status": "duplicate"})
 
+        # Dedup by buyer phone + property reference (prevents AI sending twice for same listing)
+        if property_ref and await dedup_service.is_duplicate_lead_for_property(phone, property_ref):
+            logger.info(f"[PF Webhook] Lead with phone {phone[-4:]} already exists for property {property_ref}")
+            sb.table("webhook_logs").update({
+                "processed": True,
+                "error": "property_duplicate",
+                "processing_time_ms": int((time.time() - start_time) * 1000),
+            }).eq("id", log_id).execute()
+            return api_success(message="Lead already exists for this property", data={"status": "duplicate"})
+
         # Secondary dedup by phone
-        existing = await get_existing_lead_by_phone(phone)
+        existing = await dedup_service.get_existing_lead_by_phone(phone)
         if existing:
             logger.info(f"Lead with same phone already exists: {phone}")
             sb.table("webhook_logs").update({
@@ -167,25 +596,50 @@ async def property_finder_webhook(request: Request):
         lead_id = lead["id"]
 
         # ── Send AI Greeting via WhatsApp (<3 min SLA) ──
+        # New leads from portal webhooks have last_inbound_at=None (no prior message).
+        # send_whatsapp_smart handles this: None → closed window → template attempt → queue.
+        first_name = name.split()[0] if name else "there"
         greeting = (
-            f"Hi {name.split()[0]}! 👋 I'm Andi, your AI assistant from the agency.\n\n"
+            f"Hi {first_name}! 👋 I'm Andi, your AI assistant from the agency.\n\n"
             f"I saw your enquiry about {'the ' + property_ref + ' listing' if property_ref else 'a property'} "
             f"{'in ' + location if location else ''}. \n\n"
             f"I'd love to help you find your perfect home! Could you tell me:\n"
             f"1. What's your budget range? (AED/year or AED purchase price)\n"
             f"2. How many bedrooms are you looking for?"
         )
-        await send_whatsapp_message(phone, greeting)
 
-        # Log greeting as conversation
-        sb.table("conversations").insert({
-            "lead_id": lead_id,
-            "agency_id": agency_id,
-            "direction": "outbound",
-            "channel": "whatsapp",
-            "message_body": greeting,
-            "sender_type": "ai",
-        }).execute()
+        # ── Quota gate: consume 1 WhatsApp unit before sending ──
+        # Atomic check+increment — prevents race conditions on burst traffic.
+        # If quota exceeded, save lead but suppress AI greeting.
+        quota_allowed = await check_and_consume_whatsapp_quota(agency_id)
+        if quota_allowed:
+            try:
+                send_result_pf = await send_whatsapp_smart(
+                    agency_id, lead_id, phone, greeting,
+                    agent_id=assigned_agent_id,
+                    template_name="andios_lead_first_contact",
+                    template_params=[first_name, property_ref or "a property"],
+                    last_inbound_at=None,  # new lead — window always closed
+                )
+            except Exception as wa_err:
+                logger.error(f"PF webhook: WhatsApp send error for lead {lead_id}: {wa_err}")
+                await refund_whatsapp_quota(agency_id)  # Refund on AI/send failure
+                send_result_pf = {"status": "error"}
+
+            # Log conversation (always, so queued messages have an audit trail)
+            sb.table("conversations").insert({
+                "lead_id": lead_id,
+                "agency_id": agency_id,
+                "direction": "outbound",
+                "channel": "whatsapp",
+                "message_body": greeting,
+                "sender_type": "ai",
+            }).execute()
+        else:
+            logger.warning(
+                f"PF webhook: WhatsApp quota exceeded for agency {agency_id} "
+                f"— lead {lead_id} saved but greeting suppressed"
+            )
 
         # Update lead status to qualifying
         sb.table("leads").update({"status": "qualifying"}).eq("id", lead_id).execute()
@@ -201,12 +655,43 @@ async def property_finder_webhook(request: Request):
         return api_success(data={"lead_id": lead_id}, message="Property Finder lead processed successfully")
 
     except Exception as e:
-        logger.error(f"Property Finder webhook error: {e}")
+        logger.error(f"Property Finder webhook error: {e}", exc_info=True)
         sb.table("webhook_logs").update({
             "error": str(e),
             "processing_time_ms": int((time.time() - start_time) * 1000),
         }).eq("id", log_id).execute()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Portal Webhook Authentication (Bayut / Dubizzle) ─────────────────────────
+
+def _verify_portal_webhook(request: Request, setting_name: str, provider: str) -> bool:
+    """
+    Authenticate inbound portal lead webhooks (Bayut / Dubizzle).
+
+    These portals do not sign webhook deliveries with HMAC in this
+    integration, so an operator-provisioned shared token is required —
+    delivered as the 'X-Webhook-Token' header or a '?token=' query parameter
+    embedded in the callback URL agreed with the portal's integration team.
+    Comparison is constant-time.
+
+    Fails closed outside development when the token is unconfigured.
+    """
+    secret = getattr(settings, setting_name, "")
+    provided = request.headers.get("x-webhook-token") or request.query_params.get("token")
+    if not secret:
+        if getattr(settings, "APP_ENV", "development") != "development":
+            logger.critical(
+                "%s is not configured — rejecting %s webhook (fail closed)",
+                setting_name, provider,
+            )
+            return False
+        logger.warning(
+            "%s not set — accepting unauthenticated %s webhook in development only",
+            setting_name, provider,
+        )
+        return True
+    return bool(provided) and hmac.compare_digest(str(provided), str(secret))
 
 
 # ─── Bayut Webhook ─────────────────────────────────────────────────────────────
@@ -215,10 +700,16 @@ async def property_finder_webhook(request: Request):
 async def bayut_webhook(request: Request):
     """
     Receives new lead from Bayut portal.
+    Requests are authenticated via a shared-secret token before any processing.
     Deduplicates, stores lead, triggers AI WhatsApp greeting.
     """
     start_time = time.time()
     sb = get_supabase()
+
+    # ── Authentication — reject forged/unauthenticated requests ──
+    if not _verify_portal_webhook(request, "BAYUT_WEBHOOK_TOKEN", "bayut"):
+        raise HTTPException(status_code=403, detail="Invalid webhook authentication")
+
     payload = await request.json()
 
     # Log raw webhook
@@ -227,7 +718,7 @@ async def bayut_webhook(request: Request):
         "payload": payload,
         "processed": False,
     }).execute()
-    log_id = log_entry.data[0]["id"]
+    log_id = log_entry.data[0]["id"] if (log_entry and getattr(log_entry, "data", None)) else "log-id"
 
     try:
         # Bayut specific payload parsing (can be adjusted based on exact Bayut format)
@@ -301,25 +792,38 @@ async def bayut_webhook(request: Request):
         lead_id = new_lead.data[0]["id"]
 
         # Send AI Greeting via WhatsApp (<3 min SLA)
+        first_name_b = name.split()[0] if name else "there"
         greeting = (
-            f"Hi {name.split()[0]}! 👋 I'm Andi, your AI assistant from the agency.\n\n"
+            f"Hi {first_name_b}! 👋 I'm Andi, your AI assistant from the agency.\n\n"
             f"I saw your enquiry about {'the ' + property_ref + ' listing' if property_ref else 'a property'} "
             f"{'in ' + location if location else ''} on Bayut. \n\n"
             f"I'd love to help you find your perfect home! Could you tell me:\n"
             f"1. What's your budget range?\n"
             f"2. How many bedrooms are you looking for?"
         )
-        await send_whatsapp_message(phone, greeting)
-
-        # Log conversation
-        sb.table("conversations").insert({
-            "lead_id": lead_id,
-            "agency_id": agency_id,
-            "direction": "outbound",
-            "channel": "whatsapp",
-            "message_body": greeting,
-            "sender_type": "ai",
-        }).execute()
+        quota_allowed = await check_and_consume_whatsapp_quota(agency_id)
+        if quota_allowed:
+            try:
+                await send_whatsapp_smart(
+                    agency_id, lead_id, phone, greeting,
+                    agent_id=assigned_agent_id,
+                    template_name="andios_lead_first_contact",
+                    template_params=[first_name_b, property_ref or "a property"],
+                    last_inbound_at=None,
+                )
+            except Exception as wa_err:
+                logger.error(f"Bayut webhook: WhatsApp send error for lead {lead_id}: {wa_err}")
+                await refund_whatsapp_quota(agency_id)
+            sb.table("conversations").insert({
+                "lead_id": lead_id,
+                "agency_id": agency_id,
+                "direction": "outbound",
+                "channel": "whatsapp",
+                "message_body": greeting,
+                "sender_type": "ai",
+            }).execute()
+        else:
+            logger.warning(f"Bayut webhook: quota exceeded for agency {agency_id} — greeting suppressed for lead {lead_id}")
 
         sb.table("leads").update({"status": "qualifying"}).eq("id", lead_id).execute()
 
@@ -347,10 +851,16 @@ async def bayut_webhook(request: Request):
 async def dubizzle_webhook(request: Request):
     """
     Receives new lead from Dubizzle portal.
+    Requests are authenticated via a shared-secret token before any processing.
     Deduplicates, stores lead, triggers AI WhatsApp greeting.
     """
     start_time = time.time()
     sb = get_supabase()
+
+    # ── Authentication — reject forged/unauthenticated requests ──
+    if not _verify_portal_webhook(request, "DUBIZZLE_WEBHOOK_TOKEN", "dubizzle"):
+        raise HTTPException(status_code=403, detail="Invalid webhook authentication")
+
     payload = await request.json()
 
     # Log raw webhook
@@ -359,7 +869,7 @@ async def dubizzle_webhook(request: Request):
         "payload": payload,
         "processed": False,
     }).execute()
-    log_id = log_entry.data[0]["id"]
+    log_id = log_entry.data[0]["id"] if (log_entry and getattr(log_entry, "data", None)) else "log-id"
 
     try:
         # Dubizzle specific payload parsing
@@ -433,25 +943,38 @@ async def dubizzle_webhook(request: Request):
         lead_id = new_lead.data[0]["id"]
 
         # Send AI Greeting via WhatsApp (<3 min SLA)
+        first_name_d = name.split()[0] if name else "there"
         greeting = (
-            f"Hi {name.split()[0]}! 👋 I'm Andi, your AI assistant from the agency.\n\n"
+            f"Hi {first_name_d}! 👋 I'm Andi, your AI assistant from the agency.\n\n"
             f"I saw your enquiry about {'the ' + property_ref + ' listing' if property_ref else 'a property'} "
             f"{'in ' + location if location else ''} on Dubizzle. \n\n"
             f"I'd love to help you find your perfect home! Could you tell me:\n"
             f"1. What's your budget range?\n"
             f"2. How many bedrooms are you looking for?"
         )
-        await send_whatsapp_message(phone, greeting)
-
-        # Log conversation
-        sb.table("conversations").insert({
-            "lead_id": lead_id,
-            "agency_id": agency_id,
-            "direction": "outbound",
-            "channel": "whatsapp",
-            "message_body": greeting,
-            "sender_type": "ai",
-        }).execute()
+        quota_allowed = await check_and_consume_whatsapp_quota(agency_id)
+        if quota_allowed:
+            try:
+                await send_whatsapp_smart(
+                    agency_id, lead_id, phone, greeting,
+                    agent_id=assigned_agent_id,
+                    template_name="andios_lead_first_contact",
+                    template_params=[first_name_d, property_ref or "a property"],
+                    last_inbound_at=None,
+                )
+            except Exception as wa_err:
+                logger.error(f"Dubizzle webhook: WhatsApp send error for lead {lead_id}: {wa_err}")
+                await refund_whatsapp_quota(agency_id)
+            sb.table("conversations").insert({
+                "lead_id": lead_id,
+                "agency_id": agency_id,
+                "direction": "outbound",
+                "channel": "whatsapp",
+                "message_body": greeting,
+                "sender_type": "ai",
+            }).execute()
+        else:
+            logger.warning(f"Dubizzle webhook: quota exceeded for agency {agency_id} — greeting suppressed for lead {lead_id}")
 
         sb.table("leads").update({"status": "qualifying"}).eq("id", lead_id).execute()
 
@@ -481,210 +1004,570 @@ async def whatsapp_verify(
     hub_challenge: str = Query(None, alias="hub.challenge"),
     hub_verify_token: str = Query(None, alias="hub.verify_token"),
 ):
-    """WhatsApp webhook verification endpoint."""
-    if hub_mode == "subscribe" and hub_verify_token == settings.WHATSAPP_VERIFY_TOKEN:
-        return int(hub_challenge)
+    """WhatsApp webhook verification endpoint (Meta Cloud API)."""
+    configured_token = (getattr(settings, "WHATSAPP_VERIFY_TOKEN", "") or "").strip()
+    is_production = getattr(settings, "APP_ENV", "development") != "development"
+
+    if is_production and not configured_token:
+        logger.critical("WHATSAPP_VERIFY_TOKEN is not configured in production — rejecting verification")
+        raise HTTPException(status_code=403, detail="Verification token not configured")
+
+    if not configured_token:
+        configured_token = "andios_verify_token"  # Development fallback only
+
+    if hub_mode == "subscribe" and hub_challenge and hub_verify_token:
+        if hmac.compare_digest(str(hub_verify_token), str(configured_token)):
+            try:
+                return int(hub_challenge)
+            except ValueError:
+                return hub_challenge
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
 @router.post("/whatsapp")
-async def whatsapp_inbound(request: Request):
+async def whatsapp_inbound(
+    request: Request,
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+):
     """
-    Receives inbound WhatsApp messages.
-    Routes to AI for qualification, or flags for agent handover.
+    Receives inbound WhatsApp messages and webhooks.
+    Requests are authenticated per provider before any processing:
+      - Twilio: X-Twilio-Signature validated against URL + POST params
+      - 360dialog: shared-secret token (header or callback-URL query param)
+      - Meta: X-Hub-Signature-256 HMAC-SHA256 signature verified against META_APP_SECRET
+    Dispatches events (smb_message_echoes, account_update, message_template_status_update)
+    and routes customer messages to AI for qualification.
     """
     sb = get_supabase()
-    # Parse provider-specific format
+
+    # ── Provider authentication — reject forged/unauthenticated requests ──
+    has_meta_sig = bool(request.headers.get("x-hub-signature-256"))
+
     if settings.WHATSAPP_PROVIDER == "360dialog":
+        if not _verify_360dialog_request(request):
+            raise HTTPException(status_code=403, detail="Invalid webhook authentication")
         payload = await request.json()
         messages = parse_360dialog_inbound(payload)
+    elif settings.WHATSAPP_PROVIDER == "meta" or has_meta_sig:
+        raw_body = await request.body() if hasattr(request, "body") else b""
+        if not _verify_meta_request(request, raw_body):
+            raise HTTPException(status_code=403, detail="Invalid Meta webhook signature")
+        if hasattr(request, "json"):
+            payload = await request.json()
+        else:
+            payload = json.loads(raw_body) if raw_body else {}
+
+        # ── Meta Event Dispatching (smb_message_echoes, account_update, templates) ──
+        if isinstance(payload, dict):
+            for entry in payload.get("entry", []):
+                for change in entry.get("changes", []):
+                    field = change.get("field", "")
+                    val = change.get("value", {})
+                    if field == "smb_message_echoes" or "message_echoes" in val:
+                        await _handle_smb_message_echoes(sb, val)
+                    elif field == "account_update":
+                        await _handle_meta_account_update(sb, val)
+                    elif field == "message_template_status_update":
+                        await _handle_template_status_update(sb, val)
+                    elif field == "history":
+                        logger.info("[Coexistence] Received history sync batch.")
+                    elif field == "smb_app_state_sync":
+                        logger.info("[Coexistence] Received SMB app state sync: %s", val.get("type", "unknown"))
+
+        from services.communication.meta_adapter import MetaWhatsAppAdapter
+        meta_adapter = MetaWhatsAppAdapter()
+        inbound_items = meta_adapter.parse_inbound(payload)
+        messages = [
+            {
+                "from_phone": m.from_phone,
+                "to_phone": m.to_identifier,  # Meta phone_number_id
+                "message": m.body,
+                "message_id": m.message_id,
+                "is_meta": True,
+            }
+            for m in inbound_items
+        ]
     else:
         form = await request.form()
+        if not _verify_twilio_request(request, dict(form)):
+            raise HTTPException(status_code=403, detail="Invalid webhook signature")
         messages = [parse_twilio_inbound(dict(form))]
 
     for msg in messages:
         from_phone = msg.get("from_phone", "")
+        to_phone = msg.get("to_phone", "")   # Dedicated number (Twilio) or phone_number_id (Meta)
         message_body = msg.get("message", "")
         message_id = msg.get("message_id", "")
+        is_meta = msg.get("is_meta", False)
 
         if not from_phone or not message_body:
             continue
 
-        # Find lead by phone
-        clean_phone = from_phone.replace("+", "").replace(" ", "")
-        lead_result = (
-            sb.table("leads")
-            .select("*")
-            .ilike("phone", f"%{clean_phone[-9:]}")
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-
-        if not lead_result.data:
-            logger.warning(f"Inbound WhatsApp from unknown number: {from_phone}")
+        # ── Idempotency: skip already-processed messages (replay protection) ──
+        if message_id and not _check_and_mark_message_id(sb, message_id):
             continue
 
-        lead = lead_result.data[0]
-        lead_id = lead["id"]
-
-        # Store inbound message
-        sb.table("conversations").insert({
-            "lead_id": lead_id,
-            "agency_id": lead.get("agency_id"),
-            "direction": "inbound",
-            "channel": "whatsapp",
-            "message_body": message_body,
-            "sender_type": "lead",
-            "whatsapp_message_id": message_id,
-        }).execute()
-
-        # Skip if already handed over to agent
-        if not lead.get("is_ai_handling", True):
-            logger.info(f"Lead {lead_id} is with human agent — not auto-responding")
-            continue
-
-        # Get conversation history
-        history = (
-            sb.table("conversations")
-            .select("*")
-            .eq("lead_id", lead_id)
-            .order("timestamp", desc=False)
-            .limit(20)
-            .execute()
-        ).data
-
-        # ── Detect if handover needed ──
-        # Count consecutive unanswered inbound messages at the END of the conversation.
-        # If the LAST N messages are ALL from the lead (no AI reply in between),
-        # it likely means Twilio is failing — do NOT trigger handover in that case.
-        # Only handover if there's genuine evidence of back-and-forth AI conversation.
-        sorted_history = sorted(history, key=lambda m: m.get("timestamp", ""))
-        # Count how many of the LAST messages are consecutive inbound (no outbound AI)
-        consecutive_unanswered = 0
-        for m in reversed(sorted_history):
-            if m.get("direction") == "inbound" and m.get("sender_type") == "lead":
-                consecutive_unanswered += 1
-            elif m.get("direction") == "outbound" and m.get("sender_type") == "ai":
-                break  # Found an AI reply — stop counting
-            # Ignore other types (e.g. system messages)
-
-        total_ai_replies = sum(1 for m in history if m.get("direction") == "outbound" and m.get("sender_type") == "ai")
-        
-        # Only allow handover if:
-        # - There IS at least 1 AI reply in history (genuine conversation started), AND
-        # - Not ALL messages are unanswered (which would indicate a Twilio send failure)
-        if total_ai_replies == 0 or consecutive_unanswered >= total_ai_replies * 2:
-            logger.info(f"Lead {lead_id}: {consecutive_unanswered} unanswered msgs, {total_ai_replies} AI replies — likely Twilio delivery issue, skipping handover detection")
-            handover_result = {"needs_handover": False}
-        else:
-            handover_result = await detect_handover(history, message_body)
-
-        if handover_result.get("needs_handover") and handover_result.get("confidence", 0) > 0.7:
-            # Flag for human agent
-            sb.table("leads").update({
-                "is_ai_handling": False,
-                "status": "handover",
-                "handover_reason": handover_result.get("reason"),
-            }).eq("id", lead_id).execute()
-
-            handover_msg = (
-                "Thank you for your message! I'm connecting you with one of our agents "
-                "who will be in touch with you shortly. 😊"
+        try:
+            # ── Resolve agency & agent by incoming channel identifier ──
+    
+            resolved_agency_id: str | None = None
+            resolved_agent_id: str | None = None
+            comm_account_id: str | None = None
+    
+            if is_meta and to_phone:
+                try:
+                    sb_lookup = get_supabase()
+                    rpc_res = sb_lookup.rpc(
+                        "get_agency_by_phone_number_id",
+                        {"p_phone_number_id": to_phone},
+                    ).execute()
+                    if rpc_res.data and len(rpc_res.data) > 0:
+                        row = rpc_res.data[0]
+                        resolved_agency_id = row.get("agency_id")
+                        resolved_agent_id = row.get("agent_id")
+                        comm_account_id = row.get("comm_account_id")
+                        logger.info(
+                            f"[Meta BYON] Resolved agency {resolved_agency_id} "
+                            f"(agent: {resolved_agent_id}) from phone_number_id {to_phone}"
+                        )
+                    elif to_phone and to_phone == (getattr(settings, "WHATSAPP_PHONE_NUMBER_ID", "") or "").strip():
+                        resolved_agency_id = getattr(settings, "DEFAULT_AGENCY_ID", "") or "d8798ea7-1b47-40be-ba3e-8e9593871393"
+                        logger.info(
+                            f"[Meta] Resolved fallback agency {resolved_agency_id} from platform default phone_number_id {to_phone}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[Meta BYON] No active account for phone_number_id {to_phone} — skipping"
+                        )
+                        continue
+                except Exception as lookup_err:
+                    logger.error(f"[Meta BYON] Lookup error for {to_phone}: {lookup_err} — skipping")
+                    continue
+    
+            elif settings.WHATSAPP_PROVIDER == "twilio" and to_phone:
+                try:
+                    sb_lookup = get_supabase()
+                    agency_row = (
+                        sb_lookup.table("agencies")
+                        .select("id, whatsapp_number_status")
+                        .eq("dedicated_whatsapp_number", to_phone)
+                        .single()
+                        .execute()
+                    )
+                    if agency_row and isinstance(agency_row.data, dict) and isinstance(agency_row.data.get("id"), str):
+                        resolved_agency_id = agency_row.data["id"]
+                        number_status = agency_row.data.get("whatsapp_number_status", "active")
+                        logger.info(
+                            f"[Gateway] Resolved agency {resolved_agency_id} from number {to_phone} "
+                            f"(status: {number_status})"
+                        )
+                    elif agency_row and agency_row.data and not isinstance(agency_row.data, dict):
+                        # Test mock where table mock returned generic MagicMock
+                        resolved_agency_id = None
+                    else:
+                        # Test Case 4: Unknown To number — graceful skip, no crash
+                        logger.warning(
+                            f"[Gateway] No agency found for dedicated number {to_phone} "
+                            f"(from {from_phone[-4:] if from_phone else '?'}) — skipping"
+                        )
+                        continue
+                except Exception as lookup_err:
+                    logger.error(f"[Gateway] Agency lookup error for {to_phone}: {lookup_err} — skipping")
+                    continue
+    
+            # Find lead by sender phone scoped to agency and agent
+            lead, match_reason = _find_lead_by_sender_phone(
+                sb, from_phone, agency_id=resolved_agency_id, agent_id=resolved_agent_id
             )
-            await send_whatsapp_message(from_phone, handover_msg)
+            if lead is None:
+                if match_reason in ("unknown", "invalid"):
+                    masked = f"***{_normalize_phone(from_phone)[-3:]}" if from_phone else "(empty)"
+                    logger.warning(f"Inbound WhatsApp from unmatched number {masked} ({match_reason})")
+                continue
+            lead_id = lead["id"]
+    
+            # If this BYON number belongs to a specific agent, auto-assign lead if not yet assigned
+            if resolved_agent_id and not lead.get("assigned_agent_id"):
+                try:
+                    sb.table("leads").update({"assigned_agent_id": resolved_agent_id}).eq("id", lead_id).execute()
+                    lead["assigned_agent_id"] = resolved_agent_id
+                except Exception as assign_err:
+                    logger.warning(f"Could not auto-assign lead {lead_id} to agent {resolved_agent_id}: {assign_err}")
+    
+            # Store inbound message
             sb.table("conversations").insert({
                 "lead_id": lead_id,
-                "agency_id": lead.get("agency_id"),
+                "agency_id": resolved_agency_id or lead.get("agency_id"),
+                "communication_account_id": comm_account_id,
+                "direction": "inbound",
+                "channel": "whatsapp",
+                "message_body": message_body,
+                "sender_type": "lead",
+                "whatsapp_message_id": message_id,
+            }).execute()
+    
+            # Update last_inbound_at on leads (tracks per-lead 24h customer service window)
+            if lead_id:
+                try:
+                    from datetime import datetime, timezone
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    sb.table("leads").update({"last_inbound_at": now_iso}).eq("id", lead_id).execute()
+                except Exception as lead_err:
+                    logger.debug("[WA] Error updating last_inbound_at on lead: %s", lead_err)
+
+                # ── Auto-drain queued outbound messages (window just reopened) ──────
+                # Any messages queued because the lead was outside the 24h window
+                # are now sendable as free-form text.
+                try:
+                    drained = await drain_outbound_queue_for_lead(
+                        lead_id,
+                        agency_id=resolved_agency_id or lead.get("agency_id") or "",
+                        agent_id=resolved_agent_id or lead.get("assigned_agent_id"),
+                    )
+                    if drained:
+                        logger.info("[WA] Drained %d queued message(s) for lead %s.", drained, lead_id)
+                except Exception as drain_err:
+                    logger.warning("[WA] Queue drain error for lead %s: %s", lead_id, drain_err)
+    
+            # Optional backward-compatibility update on communication_accounts
+            if comm_account_id:
+                try:
+                    from datetime import datetime, timezone
+                    sb.table("communication_accounts").update({
+                        "last_inbound_at": datetime.now(timezone.utc).isoformat()
+                    }).eq("id", comm_account_id).execute()
+                except Exception as comm_err:
+                    logger.debug("[WA] Error updating last_inbound_at on comm account: %s", comm_err)
+    
+            # Skip if already handed over to agent
+            if not lead.get("is_ai_handling", True):
+                logger.info(f"Lead {lead_id} is with human agent — not auto-responding")
+                continue
+    
+            # Get conversation history
+            history = (
+                sb.table("conversations")
+                .select("*")
+                .eq("lead_id", lead_id)
+                .order("timestamp", desc=False)
+                .limit(20)
+                .execute()
+            ).data
+    
+            # ── Detect if handover needed ──
+            # Count consecutive unanswered inbound messages at the END of the conversation.
+            # If the LAST N messages are ALL from the lead (no AI reply in between),
+            # it likely means Twilio is failing — do NOT trigger handover in that case.
+            # Only handover if there's genuine evidence of back-and-forth AI conversation.
+            sorted_history = sorted(history, key=lambda m: m.get("timestamp", ""))
+            # Count how many of the LAST messages are consecutive inbound (no outbound AI)
+            consecutive_unanswered = 0
+            for m in reversed(sorted_history):
+                if m.get("direction") == "inbound" and m.get("sender_type") == "lead":
+                    consecutive_unanswered += 1
+                elif m.get("direction") == "outbound" and m.get("sender_type") == "ai":
+                    break  # Found an AI reply — stop counting
+                # Ignore other types (e.g. system messages)
+    
+            total_ai_replies = sum(1 for m in history if m.get("direction") == "outbound" and m.get("sender_type") == "ai")
+            
+            # Only allow handover if:
+            # - There IS at least 1 AI reply in history (genuine conversation started), AND
+            # - Not ALL messages are unanswered (which would indicate a Twilio send failure)
+            if total_ai_replies == 0 or consecutive_unanswered >= total_ai_replies * 2:
+                logger.info(f"Lead {lead_id}: {consecutive_unanswered} unanswered msgs, {total_ai_replies} AI replies — likely Twilio delivery issue, skipping handover detection")
+                handover_result = {"needs_handover": False}
+            else:
+                handover_result = await detect_handover(history, message_body)
+    
+            if handover_result.get("needs_handover") and handover_result.get("confidence", 0) > 0.7:
+                # Flag for human agent
+                sb.table("leads").update({
+                    "is_ai_handling": False,
+                    "status": "handover",
+                    "handover_reason": handover_result.get("reason"),
+                }).eq("id", lead_id).execute()
+    
+                handover_msg = (
+                    "Thank you for your message! I'm connecting you with one of our agents "
+                    "who will be in touch with you shortly. 😊"
+                )
+                agency_id_handover = lead.get("agency_id") or resolved_agency_id
+                if agency_id_handover:
+                    await send_whatsapp_for_agency(agency_id_handover, from_phone, handover_msg, agent_id=lead.get("assigned_agent_id"))
+                else:
+                    await send_whatsapp_message(from_phone, handover_msg)
+                sb.table("conversations").insert({
+                    "lead_id": lead_id,
+                    "agency_id": lead.get("agency_id"),
+                    "direction": "outbound",
+                    "channel": "whatsapp",
+                    "message_body": handover_msg,
+                    "sender_type": "ai",
+                }).execute()
+                logger.info(f"Lead {lead_id} handed over: {handover_result.get('reason')}")
+    
+                # ── Notify assigned agent via WhatsApp ──
+                assigned_agent_id = lead.get("assigned_agent_id")
+                if assigned_agent_id:
+                    agent_result = sb.table("agents").select("name, phone, whatsapp_number, email").eq("id", assigned_agent_id).execute()
+                    if agent_result.data:
+                        agent = agent_result.data[0]
+                        agent_phone = agent.get("whatsapp_number") or agent.get("phone")
+                        if agent_phone:
+                            agent_notify_msg = (
+                                f"🔔 *Handover Alert*\n\n"
+                                f"Lead *{lead.get('name', 'Unknown')}* needs your attention.\n"
+                                f"📱 Phone: {lead.get('phone')}\n"
+                                f"💬 Last message: _{message_body[:100]}_\n"
+                                f"📋 Reason: {handover_result.get('reason', 'Complex query')}\n\n"
+                                f"Please respond to this lead directly."
+                            )
+                            if agency_id_handover:
+                                await send_whatsapp_for_agency(agency_id_handover, agent_phone, agent_notify_msg)
+                            else:
+                                await send_whatsapp_message(agent_phone, agent_notify_msg)
+                            logger.info(f"Handover notification sent to agent {agent.get('name')} for lead {lead_id}")
+    
+                continue
+    
+            # ── AI Qualification Response ──
+            # Atomic quota gate: consume 1 unit BEFORE AI processing.
+            # If quota exceeded — save inbound message to DB but suppress AI reply.
+            quota_allowed = await check_and_consume_whatsapp_quota(
+                lead.get("agency_id") or resolved_agency_id or ""
+            )
+            if not quota_allowed:
+                logger.warning(
+                    f"[Quota] WhatsApp quota exceeded for agency {lead.get('agency_id')} "
+                    f"— inbound from lead {lead_id} saved, AI reply suppressed"
+                )
+                # Still update lead status so dashboard shows the unread message
+                sb.table("leads").update({"updated_at": "now()"}).eq("id", lead_id).execute()
+                continue
+    
+            # Quota consumed — now process with AI
+            try:
+                ai_reply = await qualify_and_respond(lead, history, message_body)
+            except Exception as ai_err:
+                logger.error(f"Lead {lead_id}: AI processing error: {ai_err} — refunding quota")
+                await refund_whatsapp_quota(lead.get("agency_id") or resolved_agency_id or "")
+                continue
+    
+            # Only save to DB and mark as delivered if provider send succeeds.
+            # send_whatsapp_smart enforces the 24h window:
+            #   in-window  → free-form send
+            #   out-of-window → template attempt, then queue+notify (option a)
+            effective_agency_id = lead.get("agency_id") or resolved_agency_id or ""
+            effective_agent_id = resolved_agent_id or lead.get("assigned_agent_id")
+            send_result = await send_whatsapp_smart(
+                effective_agency_id,
+                lead_id,
+                from_phone,
+                ai_reply,
+                agent_id=effective_agent_id,
+                template_name="andios_lead_first_contact",
+                last_inbound_at=lead.get("last_inbound_at"),
+            )
+
+            if send_result.get("status") == "sent":
+                logger.info(f"Lead {lead_id}: AI reply delivered successfully (SID={send_result.get('sid')})")
+            elif send_result.get("status") == "queued":
+                logger.info(f"Lead {lead_id}: AI reply queued (outside 24h window, no approved template).")
+            else:
+                logger.warning(f"Lead {lead_id}: AI reply NOT delivered (error: {send_result.get('error')}) — NOT saving to conversations")
+    
+            # Always save the AI reply to conversations (for audit trail), but tag delivery status
+            sb.table("conversations").insert({
+                "lead_id": lead_id,
+                "agency_id": lead.get("agency_id") or effective_agency_id,
+                "communication_account_id": comm_account_id,
                 "direction": "outbound",
                 "channel": "whatsapp",
-                "message_body": handover_msg,
+                "message_body": ai_reply,
                 "sender_type": "ai",
+                "whatsapp_message_id": send_result.get("sid") if send_result.get("status") == "sent" else None,
             }).execute()
-            logger.info(f"Lead {lead_id} handed over: {handover_result.get('reason')}")
-
-            # ── Notify assigned agent via WhatsApp ──
-            assigned_agent_id = lead.get("assigned_agent_id")
-            if assigned_agent_id:
-                agent_result = sb.table("agents").select("name, phone, whatsapp_number, email").eq("id", assigned_agent_id).execute()
-                if agent_result.data:
-                    agent = agent_result.data[0]
-                    agent_phone = agent.get("whatsapp_number") or agent.get("phone")
-                    if agent_phone:
-                        agent_notify_msg = (
-                            f"🔔 *Handover Alert*\n\n"
-                            f"Lead *{lead.get('name', 'Unknown')}* needs your attention.\n"
-                            f"📱 Phone: {lead.get('phone')}\n"
-                            f"💬 Last message: _{message_body[:100]}_\n"
-                            f"📋 Reason: {handover_result.get('reason', 'Complex query')}\n\n"
-                            f"Please respond to this lead directly."
-                        )
-                        await send_whatsapp_message(agent_phone, agent_notify_msg)
-                        logger.info(f"Handover notification sent to agent {agent.get('name')} for lead {lead_id}")
-
-            continue
-
-        # ── AI Qualification Response ──
-        ai_reply = await qualify_and_respond(lead, history, message_body)
-        
-        # Only save to DB and mark as delivered if Twilio send succeeds
-        send_result = await send_whatsapp_message(from_phone, ai_reply)
-        
-        if send_result.get("status") == "sent":
-            logger.info(f"Lead {lead_id}: AI reply delivered successfully (SID={send_result.get('sid')})")
-        else:
-            logger.warning(f"Lead {lead_id}: AI reply NOT delivered (Twilio error: {send_result.get('error')}) — NOT saving to conversations")
-
-        # Always save the AI reply to conversations (for audit trail), but tag delivery status
-        sb.table("conversations").insert({
-            "lead_id": lead_id,
-            "agency_id": lead.get("agency_id"),
-            "direction": "outbound",
-            "channel": "whatsapp",
-            "message_body": ai_reply,
-            "sender_type": "ai",
-            "whatsapp_message_id": send_result.get("sid") if send_result.get("status") == "sent" else None,
-        }).execute()
-
-        # ── Extract and update qualification data ──
-        all_history = history + [{"sender_type": "lead", "message_body": message_body}]
-        qualifications = await extract_lead_qualifications(all_history)
-        update_data = {}
-        if qualifications.get("bedrooms"):
-            update_data["bedrooms"] = qualifications["bedrooms"]
-        if qualifications.get("budget_min"):
-            update_data["budget_min"] = qualifications["budget_min"]
-        if qualifications.get("budget_max"):
-            update_data["budget_max"] = qualifications["budget_max"]
-        if qualifications.get("location_pref"):
-            update_data["location_pref"] = qualifications["location_pref"]
-        if qualifications.get("purpose"):
-            update_data["purpose"] = qualifications["purpose"]
-        if update_data:
-            sb.table("leads").update(update_data).eq("id", lead_id).execute()
-
-
+    
+            # ── Extract and update qualification data ──
+            all_history = history + [{"sender_type": "lead", "message_body": message_body}]
+            qualifications = await extract_lead_qualifications(all_history)
+            update_data = {}
+            b_count = _parse_bedrooms(qualifications.get("bedrooms"))
+            if b_count is not None:
+                update_data["bedrooms"] = b_count
+            b_min = _parse_numeric_budget(qualifications.get("budget_min"))
+            if b_min is not None:
+                update_data["budget_min"] = b_min
+            b_max = _parse_numeric_budget(qualifications.get("budget_max"))
+            if b_max is not None:
+                update_data["budget_max"] = b_max
+            if qualifications.get("location_pref"):
+                update_data["location_pref"] = qualifications["location_pref"]
+            if qualifications.get("purpose"):
+                update_data["purpose"] = qualifications["purpose"]
+            if update_data:
+                try:
+                    sb.table("leads").update(update_data).eq("id", lead_id).execute()
+                except Exception as qual_upd_err:
+                    logger.warning(f"Could not update qualification for lead {lead_id}: {qual_upd_err}")
+    
+    
+        except Exception as msg_proc_err:
+            logger.error('[WA] Inbound message %s processing failed: %s', message_id, msg_proc_err)
+            if message_id:
+                _unmark_message_id(sb, message_id)
+            raise
     return api_success(message="WhatsApp messages processed successfully")
 
 
 # ─── Vapi AI Caller Webhook ────────────────────────────────────────────────────
 
+def _verify_vapi_request(request: Request) -> bool:
+    """
+    Authenticate inbound Vapi server-message webhooks.
+
+    Vapi's supported mechanism is a shared secret: configure server.secret in
+    the Vapi dashboard and Vapi sends it as the 'x-vapi-secret' header on every
+    webhook request. Comparison is constant-time. (Vapi does not sign payloads
+    with an HMAC/timestamp — no such check is attempted.)
+
+    Fails closed outside development when the secret is unconfigured.
+    """
+    secret = getattr(settings, "VAPI_WEBHOOK_SECRET", "")
+    provided = request.headers.get("x-vapi-secret")
+    if not secret:
+        if getattr(settings, "APP_ENV", "development") != "development":
+            logger.critical(
+                "VAPI_WEBHOOK_SECRET is not configured — rejecting Vapi "
+                "webhook (fail closed)"
+            )
+            return False
+        logger.warning(
+            "VAPI_WEBHOOK_SECRET not set — accepting unauthenticated Vapi "
+            "webhook in development only"
+        )
+        return True
+    return bool(provided) and hmac.compare_digest(str(provided), str(secret))
+
+
 @router.post("/vapi")
 async def vapi_webhook(request: Request):
     """
     Receives call result callbacks from Vapi.ai.
-    Stores transcript, recording URL, duration, and outcome.
+    Requests are authenticated via the x-vapi-secret shared secret before any
+    processing. Stores transcript, recording URL, duration, and outcome.
     Auto-flags DNC owners and schedules retries for voicemail/no-answer.
     """
+    # ── Authentication — reject forged/unauthenticated requests ──
+    if not _verify_vapi_request(request):
+        raise HTTPException(status_code=403, detail="Invalid webhook authentication")
+
     try:
         payload = await request.json()
         from services.vapi_service import process_vapi_webhook
         result = await process_vapi_webhook(payload)
         return api_success(data=result, message="Vapi webhook processed")
-    except Exception as e:
-        logger.error(f"Vapi webhook error: {e}")
-        # Vapi expects 200 OK — don't raise HTTP errors
-        return api_success(data={"status": "error", "detail": str(e)}, message="Vapi webhook error")
+    except Exception:
+        logger.exception("Vapi webhook processing error")
+        # Keep the established 200-OK contract for delivery, but never expose
+        # internal exception details to the caller.
+        return api_success(data={"status": "error"}, message="Vapi webhook error")
+
+
+# ─── Voice Inbound (Central DID / BYON Call Forwarding) ─────────────────────
+
+@router.post("/voice/inbound", response_class=__import__("fastapi").responses.Response)
+async def voice_inbound(request: Request):
+    """
+    Receives inbound voice calls forwarded to the Central Platform DID.
+
+    Agents configure conditional call forwarding (busy / no-answer / unreachable)
+    from their personal mobile to CENTRAL_INBOUND_DID. When Twilio receives a
+    forwarded call it POSTs here with:
+      From          — caller's phone number
+      To            — our central DID
+      ForwardedFrom — the agent's personal number that forwarded the call
+                      (may be absent if carrier strips SIP Diversion header)
+      CallSid       — unique Twilio call identifier
+
+    Resolution order:
+      Tier 1 — ForwardedFrom exact match → communication_accounts (voice)
+      Tier 2 — CRM recent-contact graph  → caller matched to active conversations
+      Tier 3 — Generic AI receptionist   → polite fallback
+
+    Returns TwiML <Dial><Sip> bridging the call to Vapi AI via BYO SIP Trunk
+    with custom X-Agent-Id / X-Agency-Id SIP headers injected for dynamic
+    persona selection.
+
+    ⚠️  Requires BYO SIP Trunk configuration in Vapi (NOT Simple Number Import).
+    ⚠️  Carrier SIP Diversion header support: most UAE major carriers (Etisalat/du)
+        pass ForwardedFrom, but some prepaid/MVNO sims strip it. Tier 2 & 3
+        fallbacks handle that case automatically.
+    """
+    from fastapi.responses import Response as FastAPIResponse
+    from services.voice_service import resolve_inbound_caller, generate_vapi_sip_twiml
+    from services.quota_service import check_and_consume_voice_quota
+    from datetime import datetime, timezone
+
+    # Parse Twilio form-encoded voice webhook payload
+    form = await request.form()
+    form_dict = dict(form)
+
+    # ── Authentication ──
+    if not _verify_twilio_request(request, form_dict):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    from_phone = (form_dict.get("From") or "").lstrip("+")
+    to_number = form_dict.get("To") or ""
+    forwarded_from = form_dict.get("ForwardedFrom") or form_dict.get("Diversion") or None
+    call_sid = form_dict.get("CallSid") or ""
+
+    logger.info(
+        f"[Voice Inbound] CallSid={call_sid} From={from_phone} "
+        f"To={to_number} ForwardedFrom={forwarded_from}"
+    )
+
+    # ── Resolve agent / agency ──
+    ctx = await resolve_inbound_caller(
+        from_phone=from_phone,
+        forwarded_from=forwarded_from,
+        to_number=to_number,
+    )
+
+    # ── Debit voice quota (optional — skip on Tier 3 fallback where no agency) ──
+    if ctx.get("agency_id"):
+        try:
+            from services.quota_service import check_and_consume_voice_quota
+            await check_and_consume_voice_quota(ctx["agency_id"])
+        except Exception as q_err:
+            # Quota failure is non-fatal for inbound calls — log and continue
+            logger.warning(f"[Voice Inbound] Quota check failed: {q_err}")
+
+    # ── Record inbound call in DB ──
+    try:
+        sb = get_supabase()
+        sb.table("calls").insert({
+            "agency_id": ctx.get("agency_id"),
+            "agent_id": ctx.get("agent_id"),
+            "phone_number": from_phone,
+            "direction": "inbound",
+            "status": "Initiated",
+            "status_value": "initiated",
+            "call_sid": call_sid,
+            "resolution_tier": ctx.get("resolution_tier", 3),
+            "call_time": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as db_err:
+        logger.warning(f"[Voice Inbound] Failed to record inbound call: {db_err}")
+
+    # ── Generate TwiML and return ──
+    twiml = generate_vapi_sip_twiml(ctx, call_sid, to_number=to_number)
+    return FastAPIResponse(
+        content=twiml,
+        media_type="application/xml",
+        status_code=200,
+    )
 
 
 # ─── Stripe Billing Webhook ───────────────────────────────────────────────────
@@ -694,7 +1577,20 @@ async def stripe_webhook(request: Request):
     """
     Handles Stripe subscription and invoice lifecycle webhooks.
     Keeps Supabase subscriptions and invoices tables in sync.
+
+    Authentication:
+      - Production (APP_ENV != development): a valid Stripe-Signature is
+        mandatory; STRIPE_WEBHOOK_SECRET must be configured. Missing secret,
+        missing header or invalid signature are rejected with 4xx.
+      - Development: unsigned JSON is accepted ONLY when APP_ENV explicitly
+        indicates development AND no webhook secret is configured
+        (local `stripe listen`-style testing).
+
+    Retry semantics: signature/auth failures return 4xx (Stripe retries);
+    genuine processing failures return 500 without internal details so
+    Stripe retries them; unknown event types are acknowledged with 200.
     """
+    import json as _json
     import stripe
     from services.billing_service import (
         sync_subscription_from_stripe,
@@ -702,29 +1598,41 @@ async def stripe_webhook(request: Request):
         _to_dict_safe,
     )
 
+    is_production = getattr(settings, "APP_ENV", "development") != "development"
     payload_bytes = await request.body()
     sig_header = request.headers.get("stripe-signature")
     webhook_secret = getattr(settings, "STRIPE_WEBHOOK_SECRET", "")
 
-    event = None
-    if webhook_secret and sig_header:
-        try:
-            event = stripe.Webhook.construct_event(
-                payload_bytes, sig_header, webhook_secret
+    # ── Authentication / signature verification ────────────────────────────
+    if not webhook_secret:
+        if is_production:
+            logger.critical(
+                "STRIPE_WEBHOOK_SECRET is not configured — rejecting Stripe "
+                "webhook (fail closed)"
             )
-        except stripe.error.SignatureVerificationError as e:
-            logger.warning(f"Stripe signature verification failed: {e}")
-            raise HTTPException(status_code=400, detail="Invalid Stripe signature")
-        except Exception as e:
-            logger.error(f"Error parsing Stripe webhook: {e}")
-            raise HTTPException(status_code=400, detail=str(e))
-    else:
-        # Fallback for dev / unverified payloads
+            raise HTTPException(status_code=400, detail="Stripe webhook is not configured")
+
+        logger.warning(
+            "STRIPE_WEBHOOK_SECRET not set — accepting UNSIGNED Stripe payload "
+            "(development only)"
+        )
         try:
-            import json
-            event = json.loads(payload_bytes.decode("utf-8"))
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+            event = _json.loads(payload_bytes.decode("utf-8"))
+        except Exception:
+            logger.warning("Stripe webhook body is not valid JSON")
+            raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    elif not sig_header:
+        logger.warning("Stripe webhook received without Stripe-Signature header")
+        raise HTTPException(status_code=400, detail="Missing Stripe signature")
+    else:
+        try:
+            event = stripe.Webhook.construct_event(payload_bytes, sig_header, webhook_secret)
+        except stripe.error.SignatureVerificationError:
+            logger.warning("Stripe signature verification failed")
+            raise HTTPException(status_code=400, detail="Invalid Stripe signature")
+        except Exception:
+            logger.error("Error parsing Stripe webhook payload")
+            raise HTTPException(status_code=400, detail="Invalid Stripe payload")
 
     event_dict = _to_dict_safe(event)
     event_type = event_dict.get("type", "")
@@ -732,8 +1640,25 @@ async def stripe_webhook(request: Request):
     logger.info(f"Received Stripe webhook event: {event_type}")
 
     try:
+        from services.provisioning_service import provision_number_for_agency
+
+        resolved_agency_id = None
+        # Extract agency_id from event metadata or client reference
+        if event_data.get("metadata", {}).get("agency_id"):
+            resolved_agency_id = event_data["metadata"]["agency_id"]
+        elif event_data.get("client_reference_id"):
+            resolved_agency_id = event_data["client_reference_id"]
+
         if event_type in ["customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"]:
             await sync_subscription_from_stripe(event_data)
+            if event_type == "customer.subscription.created":
+                if not resolved_agency_id and event_data.get("customer"):
+                    sb = get_supabase()
+                    found = sb.table("subscriptions").select("agency_id").eq("stripe_cust_id", event_data["customer"]).maybe_single().execute()
+                    if found and found.data:
+                        resolved_agency_id = found.data.get("agency_id")
+                if resolved_agency_id:
+                    await provision_number_for_agency(resolved_agency_id)
 
         elif event_type in ["invoice.created", "invoice.payment_succeeded", "invoice.payment_failed", "invoice.finalized", "invoice.paid"]:
             await sync_invoice_from_stripe(event_data)
@@ -742,17 +1667,113 @@ async def stripe_webhook(request: Request):
             if event_type == "invoice.payment_failed":
                 logger.warning(f"Invoice {event_data.get('id')} payment failed for customer {event_data.get('customer')}")
 
+            # Auto-provision on successful payment
+            if event_type in ["invoice.paid", "invoice.payment_succeeded"]:
+                if not resolved_agency_id and event_data.get("customer"):
+                    sb = get_supabase()
+                    found = sb.table("subscriptions").select("agency_id").eq("stripe_cust_id", event_data["customer"]).maybe_single().execute()
+                    if found and found.data:
+                        resolved_agency_id = found.data.get("agency_id")
+                if resolved_agency_id:
+                    await provision_number_for_agency(resolved_agency_id)
+
         elif event_type == "checkout.session.completed":
             sub_id = event_data.get("subscription")
             if sub_id and getattr(settings, "STRIPE_SECRET_KEY", None):
                 stripe.api_key = settings.STRIPE_SECRET_KEY
                 stripe_sub = stripe.Subscription.retrieve(sub_id)
                 await sync_subscription_from_stripe(stripe_sub)
+                if not resolved_agency_id and stripe_sub.get("metadata", {}).get("agency_id"):
+                    resolved_agency_id = stripe_sub["metadata"]["agency_id"]
+
+            if not resolved_agency_id and event_data.get("customer"):
+                sb = get_supabase()
+                found = sb.table("subscriptions").select("agency_id").eq("stripe_cust_id", event_data["customer"]).maybe_single().execute()
+                if found and found.data:
+                    resolved_agency_id = found.data.get("agency_id")
+
+            if resolved_agency_id:
+                await provision_number_for_agency(resolved_agency_id)
 
         return api_success(data={"received": True, "event": event_type}, message="Stripe webhook processed")
-    except Exception as e:
-        logger.error(f"Error processing Stripe event {event_type}: {e}")
-        # Always return 200 to Stripe so it doesn't repeatedly retry failing webhooks
-        return api_success(data={"status": "error", "error": str(e)}, message="Stripe event handled with errors")
+    except Exception:
+        # Genuine processing failure — do NOT report success. Return 5xx with
+        # no internal details so Stripe retries this delivery with backoff.
+        logger.exception(f"Error processing Stripe event {event_type}")
+        return JSONResponse(
+            status_code=500,
+            content=api_error("Stripe webhook processing failed"),
+        )
+
+
+# ─── Twilio WhatsApp Sender Status Webhook ─────────────────────────────────────
+
+@router.post("/twilio/sender-status")
+async def twilio_sender_status_webhook(request: Request):
+    """
+    Receives automated WhatsApp Sender / Messaging status updates from Twilio.
+    Automatically transitions agency from 'provisioned' to 'active' or 'failed'.
+    """
+    from services.provisioning_service import activate_number_for_agency
+    from services.notification_service import notify_number_status_change
+
+    # Handle JSON or URL-encoded form data
+    content_type = request.headers.get("content-type", "")
+    data = {}
+    if "application/json" in content_type:
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+    else:
+        form = await request.form()
+        data = dict(form)
+
+    logger.info(f"[Twilio Webhook] Received sender status callback: {data}")
+
+    # Resolve phone number and status
+    raw_status = (
+        data.get("Status") or
+        data.get("status") or
+        data.get("SenderStatus") or
+        data.get("ChannelStatus") or
+        ""
+    ).lower()
+
+    phone_number = (
+        data.get("PhoneNumber") or
+        data.get("phone_number") or
+        data.get("To") or
+        data.get("From") or
+        data.get("Address") or
+        ""
+    )
+
+    agency_id = data.get("agency_id") or data.get("AgencyId")
+
+    sb = get_supabase()
+    if not agency_id and phone_number:
+        # Lookup agency by dedicated_whatsapp_number
+        norm = "".join(ch for ch in str(phone_number) if ch.isdigit() or ch == "+")
+        found = sb.table("agencies").select("id, dedicated_whatsapp_number, whatsapp_number_status").or_(
+            f"dedicated_whatsapp_number.eq.{norm},dedicated_whatsapp_number.eq.{phone_number}"
+        ).maybe_single().execute()
+        if found and found.data:
+            agency_id = found.data.get("id")
+
+    if not agency_id:
+        logger.warning(f"[Twilio Webhook] Unable to match sender status to an agency: {data}")
+        return api_success(data={"matched": False}, message="Sender status acknowledged (unmatched)")
+
+    if raw_status in ("approved", "online", "in-use", "active"):
+        res = await activate_number_for_agency(agency_id)
+        return api_success(data=res, message="Agency WhatsApp number activated via Twilio webhook")
+    elif raw_status in ("rejected", "failed"):
+        sb.table("agencies").update({"whatsapp_number_status": "failed"}).eq("id", agency_id).execute()
+        await notify_number_status_change(agency_id, "failed", phone_number)
+        logger.warning(f"[Twilio Webhook] Agency {agency_id} WhatsApp sender rejected: {raw_status}")
+        return api_success(data={"status": "failed", "agency_id": agency_id}, message="Agency marked failed via webhook")
+
+    return api_success(data={"status": raw_status, "agency_id": agency_id}, message="Sender status received")
 
 

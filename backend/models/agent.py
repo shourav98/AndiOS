@@ -40,7 +40,8 @@ class AgentResponse(BaseModel):
     role: str
     calendar_id: Optional[str]
     whatsapp_number: Optional[str]
-    branch: Optional[str]
+    branch: Optional[str] = None
+    branch_id: Optional[str] = None
     is_active: bool
     created_at: datetime
     updated_at: datetime

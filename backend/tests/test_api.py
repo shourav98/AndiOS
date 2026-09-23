@@ -6,13 +6,15 @@ import pytest
 import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
+from config import settings
 
 
 # ─── Test Client Setup ────────────────────────────────────────────────────────
 @pytest.fixture
 def client():
     """FastAPI test client with mocked Supabase."""
-    with patch("database.supabase_client.get_supabase") as mock_sb:
+    with patch("database.supabase_client.get_supabase") as mock_sb, \
+         patch("routers.leads.get_supabase", new=mock_sb):
         mock_sb.return_value = MagicMock()
         from main import app
         with TestClient(app) as c:
@@ -42,42 +44,67 @@ def test_property_finder_webhook_new_lead(client):
         "status": "new",
     }]
 
-    with patch("services.whatsapp_service.send_whatsapp_message", new_callable=AsyncMock) as mock_wa:
+    import hmac
+    import hashlib
+    import json
+    secret = getattr(settings, "PROPERTY_FINDER_WEBHOOK_SECRET", "fake_pf_webhook_secret_test_123")
+    payload = {
+        "lead": {
+            "id": "PF-12345",
+            "name": "John Doe",
+            "phone": "+971501234567",
+            "email": "john@example.com",
+            "property_ref": "MRN-001",
+            "property_title": "2BR Marina",
+            "bedrooms": 2,
+            "budget": 120000,
+            "community": "Dubai Marina",
+        }
+    }
+    body_bytes = json.dumps(payload).encode("utf-8")
+    sig = "sha256=" + hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+
+    with patch("services.whatsapp_service.send_whatsapp_for_agency", new_callable=AsyncMock) as mock_wa, \
+         patch("services.whatsapp_service.send_whatsapp_message", new_callable=AsyncMock):
         mock_wa.return_value = {"status": "sent"}
-        with patch("services.dedup_service.is_duplicate", new_callable=AsyncMock) as mock_dedup:
+        with patch("routers.webhooks.is_duplicate", new_callable=AsyncMock) as mock_dedup:
             mock_dedup.return_value = False
             with patch("services.dedup_service.get_existing_lead_by_phone", new_callable=AsyncMock) as mock_phone:
                 mock_phone.return_value = None
                 with patch("routers.webhooks.resolve_agency_and_agent", new_callable=AsyncMock) as mock_route:
                     mock_route.return_value = ("test-agency-id", "test-agent-id")
-                    resp = c.post("/webhooks/property-finder", json={
-                        "lead": {
-                            "id": "PF-12345",
-                            "name": "John Doe",
-                            "phone": "+971501234567",
-                            "email": "john@example.com",
-                            "property_ref": "MRN-001",
-                            "property_title": "2BR Marina",
-                            "bedrooms": 2,
-                            "budget": 120000,
-                            "community": "Dubai Marina",
-                        }
-                    })
+                    resp = c.post(
+                        "/webhooks/property-finder",
+                        content=body_bytes,
+                        headers={"Content-Type": "application/json", "X-Hub-Signature-256": sig},
+                    )
     assert resp.status_code == 200
     assert resp.json()["success"] is True
 
 
 def test_property_finder_webhook_duplicate(client):
     c, _ = client
-    with patch("services.dedup_service.is_duplicate", new_callable=AsyncMock) as mock_dedup:
+    import hmac
+    import hashlib
+    import json
+    secret = getattr(settings, "PROPERTY_FINDER_WEBHOOK_SECRET", "fake_pf_webhook_secret_test_123")
+    payload = {
+        "lead": {
+            "id": "PF-EXISTING",
+            "name": "Jane",
+            "phone": "+971509999999",
+        }
+    }
+    body_bytes = json.dumps(payload).encode("utf-8")
+    sig = "sha256=" + hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+
+    with patch("routers.webhooks.is_duplicate", new_callable=AsyncMock) as mock_dedup:
         mock_dedup.return_value = True
-        resp = c.post("/webhooks/property-finder", json={
-            "lead": {
-                "id": "PF-EXISTING",
-                "name": "Jane",
-                "phone": "+971509999999",
-            }
-        })
+        resp = c.post(
+            "/webhooks/property-finder",
+            content=body_bytes,
+            headers={"Content-Type": "application/json", "X-Hub-Signature-256": sig},
+        )
     assert resp.status_code == 200
     assert resp.json()["data"]["status"] == "duplicate"
 

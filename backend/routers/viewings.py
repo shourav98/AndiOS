@@ -35,7 +35,10 @@ router = APIRouter(prefix="/viewings", tags=["Viewings"])
 
 
 def _get_calendar_token(sb, agency_id: str) -> tuple[str, dict]:
-    """Get Google Calendar token and calendar ID from connectors table."""
+    """Get Google Calendar token and calendar ID from THIS agency's connector.
+
+    Tenant isolation: never falls back to another agency's connector.
+    """
     connector = (
         sb.table("connectors")
         .select("auth_data")
@@ -45,16 +48,6 @@ def _get_calendar_token(sb, agency_id: str) -> tuple[str, dict]:
         .limit(1)
         .execute()
     )
-    if not connector.data or not connector.data[0].get("auth_data"):
-        # Fallback: legacy global connector (no agency_id)
-        connector = (
-            sb.table("connectors")
-            .select("auth_data")
-            .eq("name", "google_calendar")
-            .eq("is_connected", True)
-            .limit(1)
-            .execute()
-        )
     if not connector.data or not connector.data[0].get("auth_data"):
         raise HTTPException(status_code=400, detail="Google Calendar not connected. Go to Connectors to connect.")
     auth_data = connector.data[0]["auth_data"]
@@ -128,10 +121,18 @@ async def available_slots(
     try:
         calendar_id, token_data = _get_calendar_token(sb, agency_id)
 
-        # Per-agent mode: use agent's calendar
+        # Per-agent mode: use agent's calendar (agent must belong to caller's agency)
         if agent_id:
-            agent = sb.table("agents").select("calendar_id, name").eq("id", str(agent_id)).execute()
-            if agent.data and agent.data[0].get("calendar_id"):
+            agent = (
+                sb.table("agents")
+                .select("calendar_id, name")
+                .eq("id", str(agent_id))
+                .eq("agency_id", agency_id)
+                .execute()
+            )
+            if not agent.data:
+                raise HTTPException(status_code=404, detail="Agent not found in your agency")
+            if agent.data[0].get("calendar_id"):
                 calendar_id = agent.data[0]["calendar_id"]
 
         slots = get_available_slots(token_data, calendar_id, date_from, date_to, duration_minutes)
@@ -140,7 +141,7 @@ async def available_slots(
         raise
     except Exception as e:
         logger.error(f"Error getting slots: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to retrieve available slots")
 
 
 @router.post("", response_model=ApiResponse[ViewingResponse])
@@ -225,7 +226,7 @@ async def create_viewing(body: ViewingCreate, current_user: dict = Depends(verif
     sb.table("leads").update({"status": "viewing_booked"}).eq("id", str(body.lead_id)).execute()
 
     # Send confirmation WhatsApp to lead
-    from services.whatsapp_service import send_whatsapp_message
+    from services.whatsapp_service import send_whatsapp_for_agency
     dt_str = body.viewing_datetime.strftime("%A, %d %B at %I:%M %p")
     confirm_msg = (
         f"✅ Your viewing is confirmed!\n\n"
@@ -235,7 +236,7 @@ async def create_viewing(body: ViewingCreate, current_user: dict = Depends(verif
         f"{'🎥 Google Meet: ' + google_meet_link if google_meet_link else ''}\n\n"
         f"We'll send you a reminder 24 hours before. See you there! 🏠"
     )
-    await send_whatsapp_message(lead_data["phone"], confirm_msg)
+    await send_whatsapp_for_agency(agency_id, lead_data["phone"], confirm_msg, agent_id=str(body.agent_id) if body.agent_id else None)
     sb.table("conversations").insert({
         "lead_id": str(body.lead_id),
         "agency_id": agency_id,
@@ -283,12 +284,12 @@ async def update_viewing(viewing_id: UUID, body: ViewingUpdate, current_user: di
         lead_id = existing_data["lead_id"]
         lead = sb.table("leads").select("phone, name").eq("id", lead_id).execute()
         if lead.data:
-            from services.whatsapp_service import send_whatsapp_message
+            from services.whatsapp_service import send_whatsapp_for_agency
             cancel_msg = (
                 f"Hi {lead.data[0]['name'].split()[0]}, your viewing has been cancelled. "
                 f"Please contact us to reschedule. 📅"
             )
-            await send_whatsapp_message(lead.data[0]["phone"], cancel_msg)
+            await send_whatsapp_for_agency(agency_id, lead.data[0]["phone"], cancel_msg)
 
     result = sb.table("viewings").update(update_data).eq("id", str(viewing_id)).execute()
     return api_success(data=result.data[0], message="Viewing updated successfully")

@@ -267,7 +267,18 @@ async def create_checkout_session(
     price_id = get_or_create_stripe_price(plan_tier, is_addon=False)
 
     if not getattr(settings, "STRIPE_SECRET_KEY", None) or not price_id:
-        logger.warning("Stripe credentials or Price ID not configured. Simulating checkout locally.")
+        # Simulation is a development-only convenience. In production, never
+        # fabricate an active paid plan without real Stripe credentials.
+        from config import settings as _settings
+        if getattr(_settings, "APP_ENV", "development") != "development":
+            logger.error(
+                "Stripe checkout requested but STRIPE_SECRET_KEY/Price ID is not "
+                "configured — refusing (fail closed)"
+            )
+            raise ValueError(
+                "Stripe billing is not configured. Contact support or try again later."
+            )
+        logger.warning("Stripe credentials or Price ID not configured. Simulating checkout locally (development only).")
         now = datetime.utcnow()
         _upsert_local_subscription(agency_id, {
             "plan_tier": plan_tier,
@@ -429,6 +440,7 @@ async def purchase_subscription_addon(agency_id: str, addon_code: str) -> Dict[s
 async def remove_subscription_addon(agency_id: str, addon_code: str) -> Dict[str, Any]:
     """
     Remove a recurring call pack add-on from the agency's subscription.
+    Also removes the corresponding Stripe SubscriptionItem so billing stops.
     """
     addon_code = addon_code.lower()
     sb = get_supabase()
@@ -445,6 +457,26 @@ async def remove_subscription_addon(agency_id: str, addon_code: str) -> Dict[str
         current_addons.remove(addon_code)
 
     total_addon_calls = sum(ADDONS_METADATA.get(code, {}).get("calls", 0) for code in current_addons)
+
+    # Stop Stripe from continuing to bill the removed pack
+    stripe_sub_id = sub_data.get("stripe_sub_id")
+    price_env = ADDONS_METADATA.get(addon_code, {}).get("price_id_env")
+    if getattr(settings, "STRIPE_SECRET_KEY", None) and stripe_sub_id and price_env:
+        target_price_id = getattr(settings, price_env, "")
+        if target_price_id:
+            try:
+                stripe.api_key = settings.STRIPE_SECRET_KEY
+                stripe_sub = stripe.Subscription.retrieve(stripe_sub_id)
+                item_id = next(
+                    (item.id for item in stripe_sub["items"]["data"] if item.price.id == target_price_id),
+                    None,
+                )
+                if item_id:
+                    stripe.Subscription.delete_item(item_id)
+                    logger.info(f"Removed Stripe add-on item {item_id} ({addon_code}) for agency {agency_id}")
+            except Exception as e:
+                logger.error(f"Failed to remove Stripe add-on item for {agency_id} ({addon_code}): {e}")
+                raise ValueError("Failed to remove add-on from payment provider. Please try again.")
 
     _upsert_local_subscription(agency_id, {
         "active_addons": current_addons,
@@ -494,12 +526,14 @@ async def record_call_usage(agency_id: str, count: int = 1) -> Dict[str, Any]:
 async def get_saved_payment_method_info(agency_id: str) -> Dict[str, Any]:
     """Retrieve actual saved payment card details from Stripe customer account."""
     if not getattr(settings, "STRIPE_SECRET_KEY", None):
+        # Honest response — no fabricated card details
         return {
-            "card_brand": "visa",
-            "card_last4": "4242",
-            "card_expiry": "10/50",
-            "is_primary": True,
-            "used_for": "all invoices",
+            "saved": False,
+            "card_brand": None,
+            "card_last4": None,
+            "card_expiry": None,
+            "is_primary": False,
+            "used_for": None,
         }
 
     sb = get_supabase()
@@ -535,6 +569,16 @@ async def get_saved_payment_method_info(agency_id: str) -> Dict[str, Any]:
     except Exception as e:
         logger.debug(f"Stripe payment method fetch note: {e}")
 
+    # No card found (or lookup failed) — honest empty state
+    return {
+        "saved": False,
+        "card_brand": None,
+        "card_last4": None,
+        "card_expiry": None,
+        "is_primary": False,
+        "used_for": None,
+    }
+
 async def update_saved_payment_method_info(
     agency_id: str,
     card_number: Optional[str] = None,
@@ -544,10 +588,16 @@ async def update_saved_payment_method_info(
     card_last4: Optional[str] = None,
     card_brand: Optional[str] = None,
     is_primary: bool = True,
+    payment_method_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Save or update agency payment card details.
     Attaches to Stripe Customer when available.
+
+    Preferred flow: pass `payment_method_id` (a pm_… token created client-side
+    via Stripe.js/Elements) so raw card data never reaches this server.
+    The raw card_number/cvc path is legacy and should be retired once the
+    frontend tokenizes payments.
     """
     # 1. Clean and normalize card details
     clean_num = (card_number or "").replace(" ", "").replace("-", "")
@@ -576,7 +626,24 @@ async def update_saved_payment_method_info(
             sub_res = sb.table("subscriptions").select("stripe_cust_id").eq("agency_id", agency_id).maybe_single().execute()
             cust_id = sub_res.data.get("stripe_cust_id") if sub_res and sub_res.data else None
 
-            if cust_id and clean_num and len(clean_num) >= 15:
+            if cust_id and payment_method_id:
+                # Preferred tokenized flow: attach a client-created pm_… token.
+                stripe.PaymentMethod.attach(payment_method_id, customer=cust_id)
+                stripe.Customer.modify(
+                    cust_id,
+                    invoice_settings={"default_payment_method": payment_method_id},
+                )
+                logger.info(f"Attached tokenized payment method {payment_method_id} for agency {agency_id}")
+                try:
+                    pm_card = _to_dict_safe(stripe.PaymentMethod.retrieve(payment_method_id)).get("card", {})
+                    last4 = str(pm_card.get("last4")) if pm_card.get("last4") else last4
+                    if isinstance(pm_card.get("brand"), str):
+                        brand = pm_card["brand"].lower()
+                    if pm_card.get("exp_month") and pm_card.get("exp_year"):
+                        exp = f"{int(pm_card['exp_month']):02d}/{str(pm_card['exp_year'])[-2:]}"
+                except Exception as e:
+                    logger.debug(f"PM detail fetch note: {e}")
+            elif cust_id and clean_num and len(clean_num) >= 15:
                 # Parse expiry
                 parts = exp.split("/")
                 exp_month = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 12
@@ -616,6 +683,50 @@ async def update_saved_payment_method_info(
     }
 
 
+async def cancel_subscription(agency_id: str, at_period_end: bool = True) -> Dict[str, Any]:
+    """
+    Cancel the agency's subscription.
+
+    at_period_end=True  → Stripe cancels at cycle end; access retained until then.
+    at_period_end=False → immediate cancellation; local status set to 'canceled'.
+    """
+    sb = get_supabase()
+    sub_res = sb.table("subscriptions").select("*").eq("agency_id", agency_id).maybe_single().execute()
+    sub_data = sub_res.data if sub_res and sub_res.data else {}
+    stripe_sub_id = sub_data.get("stripe_sub_id")
+
+    if getattr(settings, "STRIPE_SECRET_KEY", None):
+        if not stripe_sub_id:
+            raise ValueError("No active Stripe subscription found for this agency.")
+        stripe.api_key = settings.STRIPE_SECRET_KEY
+        try:
+            if at_period_end:
+                stripe.Subscription.modify(stripe_sub_id, cancel_at_period_end=True)
+            else:
+                stripe.Subscription.cancel(stripe_sub_id)
+        except Exception as e:
+            logger.error(f"Stripe cancellation failed for agency {agency_id}: {e}")
+            raise ValueError("Failed to cancel subscription with the payment provider. Please try again.")
+    else:
+        # No Stripe configured: allowed only in explicit development
+        if getattr(settings, "APP_ENV", "development") != "development":
+            raise ValueError("Stripe billing is not configured. Contact support.")
+
+    if not at_period_end or not stripe_sub_id:
+        _upsert_local_subscription(agency_id, {"status": "canceled"})
+        try:
+            sb.table("agencies").update({"subscription_status": "cancelled"}).eq("id", agency_id).execute()
+        except Exception as e:
+            logger.debug(f"Agencies cancel note: {e}")
+
+    return {
+        "agency_id": agency_id,
+        "cancel_at_period_end": at_period_end,
+        "access_until": sub_data.get("billing_cycle_end"),
+        "status": "active_until_period_end" if (at_period_end and stripe_sub_id) else "canceled",
+    }
+
+
 # ─── Live Stripe Invoice Sync ──────────────────────────────────────────────
 
 
@@ -652,10 +763,12 @@ async def fetch_and_sync_live_invoices(agency_id: str, status_filter: Optional[s
 
     sb = get_supabase()
     cust_id = None
+    stripe_sub_ref = None
     try:
-        sub_res = sb.table("subscriptions").select("stripe_cust_id").eq("agency_id", agency_id).maybe_single().execute()
+        sub_res = sb.table("subscriptions").select("stripe_cust_id, stripe_sub_id").eq("agency_id", agency_id).maybe_single().execute()
         if sub_res and sub_res.data and sub_res.data.get("stripe_cust_id"):
             cust_id = sub_res.data["stripe_cust_id"]
+            stripe_sub_ref = sub_res.data.get("stripe_sub_id")
     except Exception as e:
         logger.debug(f"Subscription lookup note: {e}")
 
@@ -697,7 +810,7 @@ async def fetch_and_sync_live_invoices(agency_id: str, status_filter: Optional[s
             item = {
                 "id": inv.get("id"),
                 "invoice_number": inv_num,
-                "contract_number": "139350",
+                "contract_number": stripe_sub_ref or "",
                 "frequency": "Monthly",
                 "mode": "Card",
                 "due_date": due_date,

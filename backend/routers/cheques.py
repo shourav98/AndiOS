@@ -27,7 +27,7 @@ async def create_cheque(cheque: ChequeCreate, current_user: dict = Depends(verif
     if not contract.data:
         raise HTTPException(status_code=404, detail="Contract not found")
 
-    cheque_data = cheque.model_dump()
+    cheque_data = cheque.model_dump(mode="json")
     cheque_data["agency_id"] = agency_id
     result = await log_cheque(str(cheque.contract_id), cheque_data)
     if not result:

@@ -196,3 +196,166 @@ async def get_agency_detail(agency_id: str, current_user: dict = Depends(require
     except Exception as e:
         logger.error(f"Error fetching agency {agency_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch agency")
+
+
+# ─── Shared Gateway: Number Provisioning ─────────────────────────────────────
+
+class ProvisionNumberRequest(BaseModel):
+    country_code: Optional[str] = None         # ISO country code (defaults to agency country or 'AE')
+
+
+@router.post("/agencies/{agency_id}/provision-number")
+async def provision_agency_number(
+    agency_id: str,
+    body: ProvisionNumberRequest,
+    current_user: dict = Depends(require_super_admin),
+):
+    """
+    Purchase a dedicated Twilio phone number from the master account and
+    assign it to the agency (Manual Admin Fallback).
+
+    ⚠️  WhatsApp numbers require Meta Business Manager approval AFTER provisioning.
+    Status: 'provisioned' → (Meta approval) → 'active'
+    """
+    from services.provisioning_service import provision_number_for_agency
+
+    res = await provision_number_for_agency(
+        agency_id=agency_id,
+        country_code=body.country_code,
+        is_manual_admin=True,
+    )
+    return api_success(
+        data={
+            "agency_id": agency_id,
+            "dedicated_whatsapp_number": res.get("dedicated_whatsapp_number"),
+            "twilio_sid": res.get("twilio_sid"),
+            "whatsapp_number_status": res.get("status"),
+            "next_step": "Register in Meta Business Manager or await automated webhook approval.",
+        },
+        message=res.get("message", "Number provisioned successfully."),
+    )
+
+
+@router.post("/agencies/{agency_id}/activate-number")
+async def activate_agency_number(
+    agency_id: str,
+    current_user: dict = Depends(require_super_admin),
+):
+    """Mark agency WhatsApp number as 'active' (Manual Admin Fallback)."""
+    from services.provisioning_service import activate_number_for_agency
+
+    res = await activate_number_for_agency(
+        agency_id=agency_id,
+        is_manual_admin=True,
+    )
+    return api_success(
+        data={
+            "agency_id": agency_id,
+            "whatsapp_number_status": res.get("status"),
+            "number": res.get("dedicated_whatsapp_number"),
+        },
+        message="WhatsApp number is now active.",
+    )
+
+
+@router.post("/agencies/{agency_id}/deprovision-number")
+async def deprovision_agency_number(
+    agency_id: str,
+    current_user: dict = Depends(require_super_admin),
+):
+    """
+    Release the agency's dedicated Twilio number (stops monthly fees).
+    Call when agency subscription is cancelled.
+    """
+    import os
+    from config import settings
+
+    sb = get_supabase()
+    agency = sb.table("agencies").select("id, dedicated_whatsapp_number").eq("id", agency_id).single().execute()
+    if not agency.data:
+        raise HTTPException(status_code=404, detail="Agency not found")
+    number = agency.data.get("dedicated_whatsapp_number")
+    if not number:
+        return api_success(message="Agency has no dedicated number to deprovision")
+
+    account_sid = (os.getenv("TWILIO_ACCOUNT_SID") or settings.TWILIO_ACCOUNT_SID).strip()
+    auth_token = (os.getenv("TWILIO_AUTH_TOKEN") or settings.TWILIO_AUTH_TOKEN).strip()
+    try:
+        from twilio.rest import Client  # type: ignore
+        twilio = Client(account_sid, auth_token)
+        numbers = twilio.incoming_phone_numbers.list(phone_number=number)
+        for num in numbers:
+            num.delete()
+        sb.table("agencies").update({
+            "dedicated_whatsapp_number": None,
+            "whatsapp_number_status": "none",
+        }).eq("id", agency_id).execute()
+        logger.info(f"[Admin] Released number {number} for agency {agency_id}")
+        return api_success(
+            data={"agency_id": agency_id, "released_number": number},
+            message=f"Number {number} released. Twilio monthly fees stopped.",
+        )
+    except Exception as e:
+        logger.error(f"[Admin] Deprovision error for agency {agency_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"Deprovision failed: {e}")
+
+
+# ─── Shared Gateway: Quota Management ────────────────────────────────────────
+
+@router.get("/agencies/{agency_id}/usage")
+async def get_agency_usage(
+    agency_id: str,
+    current_user: dict = Depends(require_super_admin),
+):
+    """Current quota usage stats for an agency."""
+    from services.quota_service import get_agency_quota_status
+    stats = get_agency_quota_status(agency_id)
+    if not stats:
+        raise HTTPException(status_code=404, detail="Agency not found")
+    return api_success(data=stats, message="Usage stats retrieved")
+
+
+@router.post("/agencies/{agency_id}/reset-quota")
+async def reset_agency_quota(
+    agency_id: str,
+    current_user: dict = Depends(require_super_admin),
+):
+    """Manually reset quota for one agency (e.g. after Add-on purchase)."""
+    from services.quota_service import reset_all_quotas
+    count = await reset_all_quotas(agency_ids=[agency_id])
+    return api_success(data={"agencies_reset": count}, message=f"Quota reset for agency {agency_id}")
+
+
+@router.post("/quota/monthly-reset")
+async def monthly_quota_reset(current_user: dict = Depends(require_super_admin)):
+    """
+    Reset quotas for ALL active agencies.
+    Triggered by GitHub Actions on 1st of each month (or pg_cron if available).
+    """
+    from services.quota_service import reset_all_quotas
+    count = await reset_all_quotas()
+    logger.info(f"[Admin] Monthly quota reset: {count} agencies")
+    return api_success(
+        data={"agencies_reset": count},
+        message=f"Monthly reset complete. {count} agencies reset.",
+    )
+
+
+@router.post("/agencies/{agency_id}/freeze")
+async def freeze_agency_route(
+    agency_id: str, current_user: dict = Depends(require_super_admin),
+):
+    """Manually freeze agency AI messaging and calls (payment failure, abuse)."""
+    from services.quota_service import freeze_agency
+    await freeze_agency(agency_id, reason="manual_admin_freeze")
+    return api_success(data={"agency_id": agency_id, "is_quota_frozen": True}, message="Agency frozen")
+
+
+@router.post("/agencies/{agency_id}/unfreeze")
+async def unfreeze_agency_route(
+    agency_id: str, current_user: dict = Depends(require_super_admin),
+):
+    """Unfreeze agency after Add-on purchase or payment resolved."""
+    from services.quota_service import unfreeze_agency
+    await unfreeze_agency(agency_id)
+    return api_success(data={"agency_id": agency_id, "is_quota_frozen": False}, message="Agency unfrozen")
