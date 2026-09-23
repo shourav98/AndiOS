@@ -100,22 +100,27 @@ def _mock_sb(candidate_leads):
 async def _run_dialog(sb, request, ai_reply="AI reply text"):
     with patch("routers.webhooks.get_supabase", return_value=sb), \
          patch.object(settings, "WHATSAPP_PROVIDER", "360dialog"), \
+         patch("routers.webhooks._check_and_mark_message_id", return_value=True), \
          patch("routers.webhooks.qualify_and_respond", new_callable=AsyncMock) as mock_ai, \
          patch("routers.webhooks.detect_handover", new_callable=AsyncMock) as mock_handover, \
          patch("routers.webhooks.extract_lead_qualifications", new_callable=AsyncMock) as mock_extract, \
-         patch("routers.webhooks.send_whatsapp_message", new_callable=AsyncMock) as mock_send:
+         patch("routers.webhooks.send_whatsapp_message", new_callable=AsyncMock) as mock_send, \
+         patch("routers.webhooks.send_whatsapp_for_agency", new_callable=AsyncMock) as mock_send_agency:
         mock_ai.return_value = ai_reply
         mock_handover.return_value = {"needs_handover": False}
         mock_extract.return_value = {}
         mock_send.return_value = {"status": "sent", "sid": "SM1"}
+        mock_send_agency.return_value = {"status": "sent", "sid": "SM1"}
         result = await whatsapp_inbound(request)
         return result, mock_ai, mock_send
+
 
 
 async def _run_twilio(sb, request, ai_reply="AI reply text"):
     with patch("routers.webhooks.get_supabase", return_value=sb), \
          patch.object(settings, "WHATSAPP_PROVIDER", "twilio"), \
          patch.object(settings, "TWILIO_AUTH_TOKEN", TWILIO_AUTH_TOKEN), \
+         patch("routers.webhooks._check_and_mark_message_id", return_value=True), \
          patch("routers.webhooks.qualify_and_respond", new_callable=AsyncMock) as mock_ai, \
          patch("routers.webhooks.detect_handover", new_callable=AsyncMock) as mock_handover, \
          patch("routers.webhooks.extract_lead_qualifications", new_callable=AsyncMock) as mock_extract, \

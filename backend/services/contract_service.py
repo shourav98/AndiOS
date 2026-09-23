@@ -207,7 +207,8 @@ async def send_contract_for_esign(contract_id: str) -> dict:
     landlord_sign_url = f"{base_url}/contracts/{contract_id}/sign?token={landlord_token}&role=landlord"
     tenant_sign_url = f"{base_url}/contracts/{contract_id}/sign?token={tenant_token}&role=tenant"
 
-    from services.whatsapp_service import send_whatsapp_message
+    from services.whatsapp_service import send_whatsapp_for_agency
+    agency_id = contract.get("agency_id") or lead.get("agency_id")
 
     # Send to landlord
     owner_phone = contract.get("owner_phone", "")
@@ -221,7 +222,11 @@ async def send_contract_for_esign(contract_id: str) -> dict:
             f"This link expires in 7 days.\n"
             f"— AndiOS Platform"
         )
-        await send_whatsapp_message(owner_phone, landlord_msg)
+        if agency_id:
+            await send_whatsapp_for_agency(agency_id, owner_phone, landlord_msg)
+        else:
+            from services.whatsapp_service import send_whatsapp_message
+            await send_whatsapp_message(owner_phone, landlord_msg)
 
     # Send to tenant
     tenant_phone = lead.get("phone", "")
@@ -235,7 +240,11 @@ async def send_contract_for_esign(contract_id: str) -> dict:
             f"This link expires in 7 days.\n"
             f"— AndiOS Platform"
         )
-        await send_whatsapp_message(tenant_phone, tenant_msg)
+        if agency_id:
+            await send_whatsapp_for_agency(agency_id, tenant_phone, tenant_msg)
+        else:
+            from services.whatsapp_service import send_whatsapp_message
+            await send_whatsapp_message(tenant_phone, tenant_msg)
 
     # Update status
     sb.table("contracts").update({"status": "sent"}).eq("id", contract_id).execute()

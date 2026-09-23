@@ -286,7 +286,7 @@ async def test_whatsapp_test_agent_forbidden_owner_scoped_write():
     assert e.value.status_code == 403
 
     sb = _sb()
-    with patch("routers.connectors.send_whatsapp_message", new_callable=AsyncMock) as mock_send, \
+    with patch("services.whatsapp_service.send_whatsapp_for_agency", new_callable=AsyncMock) as mock_send, \
          patch("routers.connectors.get_supabase", return_value=sb), \
          patch("routers.connectors.require_agency_id", return_value="ag-1"), \
          patch.object(settings, "WHATSAPP_PROVIDER", "twilio"):

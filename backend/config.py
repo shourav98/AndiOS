@@ -7,11 +7,14 @@ import os
 
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+# Do not load real .env during test runs to ensure complete test isolation
+if os.getenv("APP_ENV") != "test" and not os.getenv("PYTEST_CURRENT_TEST"):
+    load_dotenv(override=True)
 
 # Allow OAuth over HTTP for localhost ONLY in development
 if os.getenv("APP_ENV", "development") == "development":
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+
 
 
 class Settings(BaseSettings):
@@ -25,23 +28,51 @@ class Settings(BaseSettings):
     OPENAI_MODEL: str = "gpt-4o"
 
     # WhatsApp
-    WHATSAPP_PROVIDER: str = "360dialog"
+    WHATSAPP_PROVIDER: str = "meta"  # Default provider: meta | twilio | 360dialog
     WHATSAPP_API_KEY: str = ""
+    # Meta Graph API version — single configurable version.
+    # Latest stable version per official changelog: v26.0 (released July 29, 2026).
+    META_GRAPH_API_VERSION: str = "v26.0"
     WHATSAPP_PHONE_NUMBER_ID: str = ""
     WHATSAPP_VERIFY_TOKEN: str = "andios_verify_token"
     META_APP_SECRET: str = ""  # App Secret for Meta Cloud API X-Hub-Signature-256 verification
+    META_APP_ID: str = ""      # Meta App ID — required for Embedded Signup token exchange
+    ENABLE_META_WHATSAPP: bool = True  # Master switch for Meta WhatsApp Embedded Signup and background sync
     # Shared secret required on INBOUND WhatsApp webhooks (header 'X-Webhook-Token'
     # or '?token=' query param). Mandatory in production — requests are rejected
     # without it (fail closed). Configure the callback URL accordingly in 360dialog.
     WHATSAPP_WEBHOOK_TOKEN: str = ""
     # Twilio — Master account credentials (Centralized Shared Gateway model).
-    # All agencies share this single Twilio account. Each agency gets a
-    # dedicated phone number purchased from this master account and stored
-    # in agencies.dedicated_whatsapp_number / dedicated_voice_number.
+    # DEPRECATED: New agencies use Meta Embedded Signup (BYON). Existing agencies
+    # provisioned with Twilio continue to work. Guarded by ENABLE_TWILIO_PROVISIONING.
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""
     # Default outbound number used when an agency has no dedicated number yet
     TWILIO_WHATSAPP_NUMBER: str = ""
+    # Feature flag: set True ONLY to allow legacy Twilio auto-provisioning for existing agencies.
+    # New agencies must use Embedded Signup. Default: False (disabled).
+    ENABLE_TWILIO_PROVISIONING: bool = False
+
+    # When agent_id is passed to get_whatsapp_provider_for_agency but the agent has no
+    # active communication_accounts row, allow falling back to the agency-default row.
+    # Default: False — fail explicitly so misconfigured agents are caught early.
+    ALLOW_AGENCY_NUMBER_FALLBACK_FOR_AGENTS: bool = False
+
+    # Allow the platform-default Meta/env credentials to be used when an agency has no
+    # active communication_accounts row AND no legacy dedicated Twilio number.
+    # Only safe for the single-agency / default-agency deployment. Default: False.
+    ALLOW_PLATFORM_DEFAULT_FALLBACK: bool = False
+
+    # Feature flag: Voice BYON via Vapi SIP.
+    # Default False (disabled) until UAE TDRA regulations (Federal Law No. 3, Cabinet Res. 56/2024)
+    # and licensed domestic carrier (du/Etisalat e&) SIP trunking are verified.
+    ENABLE_VOICE_BYON: bool = False
+
+    # Dedicated Token Encryption Key (MultiFernet).
+    # NEVER derives from SECRET_KEY. Supports comma-separated keys for zero-downtime rotation.
+    # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    TOKEN_ENCRYPTION_KEY: str = ""
+    ALLOW_LEGACY_PLAINTEXT_TOKENS: bool = True
 
     # ─── Quota Enforcement ────────────────────────────────────────────────────
     # Set to False in development to bypass all quota checks (allow unlimited usage).
@@ -125,8 +156,33 @@ class Settings(BaseSettings):
     FRONTEND_URL: str = "http://localhost:3000"
     API_BASE_URL: str = "http://localhost:8000"
 
+    def __repr__(self) -> str:
+        sensitive_keywords = (
+            "KEY", "SECRET", "TOKEN", "PASSWORD", "AUTH", "CREDENTIAL",
+            "PRIVATE", "SID", "URL", "URI"
+        )
+        fields = []
+        field_names = getattr(self.__class__, "model_fields", None)
+        if field_names is not None:
+            keys = list(field_names.keys())
+        elif hasattr(self, "__fields__"):
+            keys = list(self.__fields__.keys())
+        else:
+            keys = list(self.__dict__.keys())
+
+        for k in keys:
+            v = getattr(self, k, None)
+            if any(kw in k.upper() for kw in sensitive_keywords):
+                fields.append(f"{k}='***REDACTED***'")
+            else:
+                fields.append(f"{k}={repr(v)}")
+        return f"Settings({', '.join(fields)})"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
     class Config:
-        env_file = ".env"
+        env_file = None if (os.getenv("APP_ENV") == "test" or os.getenv("PYTEST_CURRENT_TEST")) else ".env"
         extra = "ignore"
 
 
@@ -136,3 +192,4 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+

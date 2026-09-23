@@ -5,6 +5,19 @@ Provisioning Service — Centralizes phone number lifecycle management:
   - Market country code resolution (default: 'AE')
   - Meta approval polling & auto-activation
   - Notifications for agency and administrators
+
+DEPRECATED: This service handles legacy Twilio auto-provisioning for agencies
+that were onboarded before the BYON/Embedded Signup migration. It is kept to
+ensure existing agencies continue to work without disruption.
+
+New agencies must connect their own WhatsApp numbers via Meta Embedded Signup
+(see routers/connectors.py → POST /connectors/whatsapp/embedded-signup-callback).
+
+This service is gated behind the ENABLE_TWILIO_PROVISIONING feature flag.
+Set ENABLE_TWILIO_PROVISIONING=true in .env ONLY for platforms still onboarding
+agencies via Twilio. Default is False (disabled).
+
+DO NOT DELETE this file — existing agencies depend on it.
 """
 import os
 import logging
@@ -27,6 +40,22 @@ except ImportError:
     Client = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+_PROVISIONING_DISABLED_MSG = (
+    "Twilio auto-provisioning is disabled (ENABLE_TWILIO_PROVISIONING=false). "
+    "New agencies must connect via Meta Embedded Signup. "
+    "Set ENABLE_TWILIO_PROVISIONING=true only for legacy Twilio onboarding."
+)
+
+
+def _check_provisioning_enabled() -> None:
+    """Raise HTTPException if ENABLE_TWILIO_PROVISIONING feature flag is off."""
+    if not getattr(settings, "ENABLE_TWILIO_PROVISIONING", False):
+        logger.warning("[Provisioning] %s", _PROVISIONING_DISABLED_MSG)
+        raise HTTPException(
+            status_code=403,
+            detail=_PROVISIONING_DISABLED_MSG,
+        )
 
 
 def claim_agency_number_provisioning(agency_id: str, stale_minutes: int = 10) -> bool:

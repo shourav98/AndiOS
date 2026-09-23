@@ -6,9 +6,12 @@ Phase 1: AI Lead Management, WhatsApp Automation,
 
 Run with: uvicorn main:app --reload
 """
+import os
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+if os.getenv("APP_ENV") != "test" and not os.getenv("PYTEST_CURRENT_TEST"):
+    load_dotenv(override=True)
+
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,11 +64,61 @@ def _validate_production_config() -> None:
     if not str(settings.API_BASE_URL or "").startswith("https://"):
         logger.critical("API_BASE_URL should use HTTPS in production (webhook callback URLs depend on it).")
 
+    # Fail-fast validation of dedicated token encryption key in production
+    from utils.crypto import validate_token_encryption_key
+    try:
+        validate_token_encryption_key()
+    except Exception as key_err:
+        logger.critical("FATAL: TOKEN_ENCRYPTION_KEY startup validation failed: %s", key_err)
+        raise RuntimeError(f"TOKEN_ENCRYPTION_KEY startup validation failed: {key_err}") from key_err
+
+
+def _check_communication_accounts_configuration() -> None:
+    """Non-fatal startup check: detect active rows requiring tokens that will fail under factory logic."""
+    if settings.APP_ENV == "test":
+        return
+    if settings.ALLOW_PLATFORM_DEFAULT_FALLBACK:
+        return
+    try:
+        from database.supabase_client import get_supabase
+        sb = get_supabase()
+        res = (
+            sb.table("communication_accounts")
+            .select("id, agency_id, provider, status, access_token_enc, access_token")
+            .eq("status", "active")
+            .execute()
+        )
+        if not res or not hasattr(res, "data") or not res.data:
+            return
+
+        problem_agency_ids = set()
+        for row in res.data:
+            prov = (row.get("provider") or "").lower().strip()
+            if prov in ("meta", "360dialog"):
+                has_token = bool(row.get("access_token_enc") or row.get("access_token"))
+                if not has_token:
+                    agency_id = row.get("agency_id")
+                    if agency_id != settings.DEFAULT_AGENCY_ID:
+                        problem_agency_ids.add(agency_id)
+
+        if problem_agency_ids:
+            logger.critical(
+                "CRITICAL CONFIGURATION MISMATCH: Active communication_accounts found with provider in ('meta', '360dialog') "
+                "and no stored token, but agency_id(s) %s do NOT match DEFAULT_AGENCY_ID (%s) and "
+                "ALLOW_PLATFORM_DEFAULT_FALLBACK is False! Outbound WhatsApp messages for these agencies will FAIL. "
+                "Align DEFAULT_AGENCY_ID, enable ALLOW_PLATFORM_DEFAULT_FALLBACK=true, or store encrypted tokens.",
+                sorted(problem_agency_ids),
+                settings.DEFAULT_AGENCY_ID,
+            )
+    except Exception as e:
+        logger.warning("Could not verify communication_accounts configuration at startup: %s", e)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 AndiOS Backend starting up...")
     _validate_production_config()
+    _check_communication_accounts_configuration()
     scheduler.start()
     logger.info("⏰ Scheduler started")
     yield

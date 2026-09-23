@@ -2,7 +2,7 @@
 Meta Cloud API WhatsApp Adapter.
 
 Handles:
-  - Outbound text messages via graph.facebook.com/v19.0/{phone_number_id}/messages
+  - Outbound text messages via graph.facebook.com/{version}/{phone_number_id}/messages
   - Inbound webhook verification (X-Hub-Signature-256 HMAC-SHA256)
   - Inbound payload parsing (Meta Cloud API webhook format)
 
@@ -10,7 +10,11 @@ This adapter is initialized per-agency using the agency's own
 CommunicationAccount credentials (WABA ID, phone_number_id, access_token).
 It does NOT read from global .env settings — credentials come from the DB.
 
+Graph API version is controlled by META_GRAPH_API_VERSION in .env (default: v22.0).
+Do NOT hardcode versions here — Meta deprecates old versions regularly.
+
 Reference: https://developers.facebook.com/docs/whatsapp/cloud-api/messages
+Changelog: https://developers.facebook.com/docs/graph-api/changelog
 """
 from __future__ import annotations
 
@@ -31,7 +35,14 @@ from services.communication.base import (
 
 logger = logging.getLogger(__name__)
 
-META_GRAPH_URL = "https://graph.facebook.com/v19.0"
+META_GRAPH_BASE = "https://graph.facebook.com"
+
+
+def _graph_url() -> str:
+    """Return the versioned Graph API base URL from settings."""
+    from config import settings
+    version = getattr(settings, "META_GRAPH_API_VERSION", "v26.0") or "v26.0"
+    return f"{META_GRAPH_BASE}/{version}"
 
 
 class MetaWhatsAppAdapter(WhatsAppProvider):
@@ -41,7 +52,7 @@ class MetaWhatsAppAdapter(WhatsAppProvider):
     Initialized with a CommunicationAccount that contains:
       - phone_number_id: Meta's phone number ID for this agency
       - access_token:    Long-lived System User token (stored encrypted in DB)
-      - metadata["app_secret"]: Meta App Secret (for HMAC webhook verification)
+      - global META_APP_SECRET: Meta App Secret (for HMAC webhook verification)
     """
 
     def __init__(
@@ -53,8 +64,8 @@ class MetaWhatsAppAdapter(WhatsAppProvider):
         self._account = account
         self._phone_number_id = (account.phone_number_id if account else "") or getattr(settings, "WHATSAPP_PHONE_NUMBER_ID", "") or ""
         self._access_token = (account.access_token if account else "") or getattr(settings, "WHATSAPP_API_KEY", "") or ""
-        # App secret used for webhook HMAC verification (optional in dev)
-        self._app_secret: str = app_secret or (account.metadata.get("app_secret", "") if account else "") or getattr(settings, "META_APP_SECRET", "") or ""
+        # App secret used for webhook HMAC verification (global META_APP_SECRET)
+        self._app_secret: str = app_secret or getattr(settings, "META_APP_SECRET", "") or ""
 
     @property
     def provider_name(self) -> str:
@@ -78,7 +89,7 @@ class MetaWhatsAppAdapter(WhatsAppProvider):
         For free-form text (within the 24h window):
           pass only body.
         """
-        url = f"{META_GRAPH_URL}/{self._phone_number_id}/messages"
+        url = f"{_graph_url()}/{self._phone_number_id}/messages"
         headers = {
             "Authorization": f"Bearer {self._access_token}",
             "Content-Type": "application/json",
