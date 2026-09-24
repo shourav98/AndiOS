@@ -16,6 +16,7 @@ import time
 import json
 import hmac
 import hashlib
+import re
 from typing import Any, Optional, Dict, List
 from fastapi import APIRouter, Request, HTTPException, Query, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -239,6 +240,19 @@ def _parse_bedrooms(val: Any) -> int | None:
 
 
 # ─── Safe Lead Resolution ─────────────────────────────────────────────────────
+
+_PF_REF_PATTERN = re.compile(r'\b(?:REF[-\s]?|Listing\s*#?\s*)(\d+)\b', re.IGNORECASE)
+
+
+def _extract_property_ref_from_wame_body(body: str) -> str | None:
+    """Extract Property Finder or listing reference from inbound message body."""
+    if not body:
+        return None
+    m = _PF_REF_PATTERN.search(body)
+    if m:
+        return f"REF-{m.group(1)}"
+    return None
+
 
 def _normalize_phone(phone: str) -> str:
     """Digits-only normalization for sender/lead comparison."""
@@ -1057,12 +1071,18 @@ async def whatsapp_inbound(
         else:
             payload = json.loads(raw_body) if raw_body else {}
 
+        contact_names: dict[str, str] = {}
         # ── Meta Event Dispatching (smb_message_echoes, account_update, templates) ──
         if isinstance(payload, dict):
             for entry in payload.get("entry", []):
                 for change in entry.get("changes", []):
                     field = change.get("field", "")
                     val = change.get("value", {})
+                    for c in val.get("contacts", []):
+                        wa = c.get("wa_id")
+                        pname = c.get("profile", {}).get("name")
+                        if wa and pname:
+                            contact_names[str(wa)] = str(pname)
                     if field == "smb_message_echoes" or "message_echoes" in val:
                         await _handle_smb_message_echoes(sb, val)
                     elif field == "account_update":
@@ -1084,6 +1104,7 @@ async def whatsapp_inbound(
                 "message": m.body,
                 "message_id": m.message_id,
                 "is_meta": True,
+                "sender_name": contact_names.get(str(m.from_phone)) or "WhatsApp Lead",
             }
             for m in inbound_items
         ]
@@ -1091,7 +1112,10 @@ async def whatsapp_inbound(
         form = await request.form()
         if not _verify_twilio_request(request, dict(form)):
             raise HTTPException(status_code=403, detail="Invalid webhook signature")
-        messages = [parse_twilio_inbound(dict(form))]
+        form_dict = dict(form)
+        twilio_msg = parse_twilio_inbound(form_dict)
+        twilio_msg["sender_name"] = form_dict.get("ProfileName") or "WhatsApp Lead"
+        messages = [twilio_msg]
 
     for msg in messages:
         from_phone = msg.get("from_phone", "")
@@ -1175,10 +1199,70 @@ async def whatsapp_inbound(
                     logger.error(f"[Gateway] Agency lookup error for {to_phone}: {lookup_err} — skipping")
                     continue
     
+            # Safeguard: verify resolved_agency_id exists in agencies table if resolved from channel
+            if resolved_agency_id:
+                try:
+                    check_agency = sb.table("agencies").select("id").eq("id", resolved_agency_id).execute()
+                    if not (check_agency and check_agency.data):
+                        logger.warning(
+                            f"[Inbound] Resolved agency_id {resolved_agency_id} does not exist in agencies table; falling back to default agency."
+                        )
+                        default_aid = getattr(settings, "DEFAULT_AGENCY_ID", "") or "d8798ea7-1b47-40be-ba3e-8e9593871393"
+                        check_def = sb.table("agencies").select("id").eq("id", default_aid).execute()
+                        if check_def and check_def.data:
+                            resolved_agency_id = default_aid
+                        else:
+                            first_agency = sb.table("agencies").select("id").limit(1).execute()
+                            resolved_agency_id = first_agency.data[0]["id"] if (first_agency and first_agency.data) else default_aid
+                except Exception as ex_agency:
+                    logger.debug(f"[Inbound] Could not verify agency {resolved_agency_id}: {ex_agency}")
+
+            if resolved_agent_id:
+                try:
+                    check_agent = sb.table("agents").select("id").eq("id", resolved_agent_id).execute()
+                    if not (check_agent and check_agent.data):
+                        resolved_agent_id = None
+                except Exception:
+                    resolved_agent_id = None
+
             # Find lead by sender phone scoped to agency and agent
             lead, match_reason = _find_lead_by_sender_phone(
                 sb, from_phone, agency_id=resolved_agency_id, agent_id=resolved_agent_id
             )
+
+            # Auto-create lead on Inbound WhatsApp only for organic / new inquiries where:
+            # 1. Channel resolved a specific agency
+            # 2. Number is completely unknown (match_reason == "unknown", NOT ambiguous or invalid)
+            if lead is None and resolved_agency_id and match_reason == "unknown":
+                norm_phone = from_phone if from_phone.startswith("+") else f"+{from_phone}"
+                property_ref = _extract_property_ref_from_wame_body(message_body)
+                try:
+                    new_lead_row = {
+                        "name": msg.get("sender_name") or "WhatsApp Lead",
+                        "phone": norm_phone,
+                        "source": "whatsapp",
+                        "status": "new",
+                        "ai_stage": "greeting",
+                        "is_ai_handling": True,
+                        "agency_id": resolved_agency_id,
+                        "assigned_agent_id": resolved_agent_id,
+                    }
+                    if property_ref:
+                        new_lead_row["property_ref"] = property_ref
+
+                    insert_res = sb.table("leads").insert(new_lead_row).execute()
+                    if insert_res and insert_res.data and len(insert_res.data) > 0:
+                        lead = insert_res.data[0]
+                        match_reason = "auto_created"
+                        logger.info(
+                            f"[WA Inbound] Auto-created new lead {lead.get('id')} "
+                            f"('{new_lead_row['name']}', phone: ***{_normalize_phone(norm_phone)[-3:]}) for agency {resolved_agency_id}"
+                        )
+                except Exception as create_err:
+                    logger.error(f"[WA Inbound] Error auto-creating lead: {create_err}")
+                    # Attempt safe re-query in case of race condition / unique constraint
+                    lead, _ = _find_lead_by_sender_phone(sb, from_phone, agency_id=resolved_agency_id)
+
             if lead is None:
                 if match_reason in ("unknown", "invalid"):
                     masked = f"***{_normalize_phone(from_phone)[-3:]}" if from_phone else "(empty)"
