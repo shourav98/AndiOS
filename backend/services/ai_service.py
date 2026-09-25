@@ -95,37 +95,27 @@ QUALIFY_TOOLS = [
 async def _execute_check_slots(lead_context: dict) -> str:
     """Fetch available calendar slots for the lead's agency."""
     from database.supabase_client import get_supabase
-    from services.calendar_service import get_available_slots
+    from services.calendar_service import get_available_slots, get_calendar_token_for_agent_or_agency
     from datetime import datetime, timedelta
     import pytz
 
     sb = get_supabase()
     agency_id = lead_context.get("agency_id")
-
-    connector = (
-        sb.table("connectors")
-        .select("auth_data")
-        .eq("name", "google_calendar")
-        .eq("agency_id", agency_id)
-        .eq("is_connected", True)
-        .limit(1)
-        .execute()
-    )
+    assigned_agent_id = lead_context.get("assigned_agent_id")
 
     tz = pytz.timezone("Asia/Dubai")
     now = datetime.now(tz)
     date_from = now
     date_to = now + timedelta(days=3)
-    calendar_id = settings.GOOGLE_SHARED_CALENDAR_ID or "primary"
 
     slots = []
-    if connector.data and connector.data[0].get("auth_data"):
-        try:
-            auth_data = connector.data[0]["auth_data"]
-            slots = get_available_slots(auth_data, calendar_id, date_from, date_to)
-        except Exception as e:
-            logger.warning(f"Google Calendar slot fetch failed: {e}, falling back to standard slots")
-            slots = []
+    try:
+        calendar_id, token_data, _ = get_calendar_token_for_agent_or_agency(sb, agency_id, assigned_agent_id)
+        slots = get_available_slots(token_data, calendar_id, date_from, date_to)
+    except Exception as e:
+        logger.warning(f"Google Calendar slot fetch failed: {e}, falling back to standard slots")
+        slots = []
+
 
     # Fallback to standard agency slots (10:00, 14:00, 16:00, 18:00) if no calendar or token expired
     if not slots:
@@ -189,33 +179,26 @@ async def _execute_book_viewing(lead_context: dict, slot_start: str, slot_end: s
         if agent.data:
             agent_name = agent.data[0]["name"]
 
-    # Create Google Calendar event
+    # Create Google Calendar event (Agent personal calendar priority + Agency shared fallback)
     google_event_id = None
     google_meet_link = None
     try:
-        connector = (
-            sb.table("connectors")
-            .select("auth_data")
-            .eq("name", "google_calendar")
-            .eq("agency_id", agency_id)
-            .eq("is_connected", True)
-            .limit(1)
-            .execute()
+        from services.calendar_service import get_calendar_token_for_agent_or_agency
+        assigned_id = lead_context.get("assigned_agent_id") or agent_id
+        calendar_id, token_data, _ = get_calendar_token_for_agent_or_agency(sb, agency_id, assigned_id)
+        cal_result = create_viewing_event(
+            token_data=token_data,
+            calendar_id=calendar_id,
+            lead_name=lead_name,
+            lead_phone=lead_phone,
+            property_address=property_address,
+            start_datetime=viewing_dt,
+            agent_name=agent_name,
+            lead_email=lead_context.get("email"),
+            create_meet_link=True,
         )
-        if connector.data and connector.data[0].get("auth_data"):
-            token_data = connector.data[0]["auth_data"]
-            calendar_id = settings.GOOGLE_SHARED_CALENDAR_ID or "primary"
-            cal_result = create_viewing_event(
-                token_data=token_data,
-                calendar_id=calendar_id,
-                lead_name=lead_name,
-                lead_phone=lead_phone,
-                property_address=property_address,
-                start_datetime=viewing_dt,
-                agent_name=agent_name,
-            )
-            google_event_id = cal_result.get("event_id")
-            google_meet_link = cal_result.get("meet_link")
+        google_event_id = cal_result.get("event_id")
+        google_meet_link = cal_result.get("meet_link")
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"Calendar event creation failed during AI booking: {e}")
