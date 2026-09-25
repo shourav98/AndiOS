@@ -152,20 +152,23 @@ def create_viewing_event(
     start_datetime: datetime,
     duration_minutes: int = 60,
     agent_name: Optional[str] = None,
+    lead_email: Optional[str] = None,
+    create_meet_link: bool = True,
 ) -> dict:
-    """Create a Google Calendar event for a property viewing."""
+    """
+    Create a Google Calendar event for a property viewing.
+    - Adds lead_email to attendees with sendUpdates='all' to send native Google Calendar invite
+    - Requests Google Meet conference room (hangoutsMeet) with conferenceDataVersion=1
+    """
     try:
         service = _build_service(token_data)
         end_datetime = start_datetime + timedelta(minutes=duration_minutes)
 
         # Ensure datetime is in RFC3339 format for Google Calendar
-        # If timezone-aware, format directly; if naive, treat as UTC and append Z
         def _format_dt(dt: datetime) -> str:
             if dt.tzinfo is not None:
-                # Already timezone-aware: convert to UTC ISO string
                 return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt.utcoffset().total_seconds() == 0 else dt.isoformat()
             else:
-                # Naive: treat as UTC
                 return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         # Format Dubai time display for cross-timezone clarity
@@ -177,15 +180,23 @@ def create_viewing_event(
         except Exception:
             dubai_time_str = start_datetime.strftime("%I:%M %p")
 
+        desc_lines = [
+            f"Lead: {lead_name}",
+            f"Phone: {lead_phone}",
+        ]
+        if lead_email:
+            desc_lines.append(f"Email: {lead_email}")
+        desc_lines.extend([
+            f"Property: {property_address}",
+            f"Time: {dubai_time_str} (Dubai Time, GMT+4)",
+            "Booked via AndiOS AI",
+        ])
+        if agent_name:
+            desc_lines.append(f"Agent: {agent_name}")
+
         event = {
             "summary": f"🏠 Viewing: {lead_name} — {property_address} ({dubai_time_str} Dubai Time)",
-            "description": (
-                f"Lead: {lead_name}\nPhone: {lead_phone}\n"
-                f"Property: {property_address}\n"
-                f"Time: {dubai_time_str} (Dubai Time, GMT+4)\n"
-                f"Booked via AndiOS AI"
-                + (f"\nAgent: {agent_name}" if agent_name else "")
-            ),
+            "description": "\n".join(desc_lines),
             "location": property_address,
             "start": {
                 "dateTime": _format_dt(start_datetime),
@@ -204,20 +215,63 @@ def create_viewing_event(
             },
         }
 
-        created = service.events().insert(
-            calendarId=calendar_id,
-            body=event,
-        ).execute()
+        # 1. Add Client to Google Calendar Attendees
+        if lead_email and str(lead_email).strip():
+            event["attendees"] = [
+                {
+                    "email": str(lead_email).strip(),
+                    "displayName": lead_name,
+                    "responseStatus": "needsAction",
+                }
+            ]
+
+        # 2. Enable Google Meet / Conference Link Generation
+        import uuid
+        if create_meet_link:
+            event["conferenceData"] = {
+                "createRequest": {
+                    "requestId": f"andios-{uuid.uuid4().hex[:12]}",
+                    "conferenceSolutionKey": {"type": "hangoutsMeet"},
+                }
+            }
+
+        insert_kwargs = {
+            "calendarId": calendar_id,
+            "body": event,
+        }
+        if create_meet_link:
+            insert_kwargs["conferenceDataVersion"] = 1
+        if lead_email and str(lead_email).strip():
+            insert_kwargs["sendUpdates"] = "all"
+
+        try:
+            created = service.events().insert(**insert_kwargs).execute()
+        except Exception as conf_err:
+            if create_meet_link:
+                logger.warning(f"Google Meet conference creation failed ({conf_err}), retrying standard event...")
+                insert_kwargs.pop("conferenceDataVersion", None)
+                event.pop("conferenceData", None)
+                created = service.events().insert(**insert_kwargs).execute()
+            else:
+                raise
+
+        # Extract meet_link from created event
+        meet_link = created.get("hangoutLink")
+        if not meet_link and "conferenceData" in created:
+            entry_points = created["conferenceData"].get("entryPoints", [])
+            for ep in entry_points:
+                if ep.get("entryPointType") == "video":
+                    meet_link = ep.get("uri")
+                    break
 
         return {
-            "event_id": created["id"],
+            "event_id": created.get("id"),
             "html_link": created.get("htmlLink"),
-            "meet_link": None,
+            "meet_link": meet_link,
         }
     except Exception as e:
         logger.error(f"Error creating calendar event: {e}")
         return {}
-
 
 
 def cancel_viewing_event(token_data: dict, calendar_id: str, event_id: str) -> bool:
@@ -229,3 +283,87 @@ def cancel_viewing_event(token_data: dict, calendar_id: str, event_id: str) -> b
     except Exception as e:
         logger.error(f"Error cancelling event: {e}")
         return False
+
+
+def get_calendar_token_for_agent_or_agency(
+    sb,
+    agency_id: str,
+    agent_id: Optional[str] = None,
+) -> tuple[str, dict, str]:
+    """
+    Resolve Google Calendar credentials with Agent Priority + Agency Fallback:
+    1. If agent_id provided: check if agent has their own connected Google Calendar tokens.
+    2. Fallback gracefully to the agency's shared Google Calendar if agent hasn't connected theirs.
+    Returns: (calendar_id, token_data, source: 'agent' | 'agency')
+    Raises: HTTPException(400) if neither is connected.
+    """
+    from fastapi import HTTPException
+    from utils.crypto import decrypt_token, is_encrypted
+
+    # 1. Check Agent's Personal Google Calendar
+    if agent_id:
+        try:
+            agent_res = (
+                sb.table("agents")
+                .select("id, name, calendar_id, google_token_data, is_calendar_connected")
+                .eq("id", str(agent_id))
+                .eq("agency_id", agency_id)
+                .maybe_single()
+                .execute()
+            )
+            agent_row = agent_res.data if agent_res else None
+            if agent_row and agent_row.get("google_token_data"):
+                raw_token = agent_row["google_token_data"]
+                token_dict = None
+                if isinstance(raw_token, str):
+                    try:
+                        decrypted = decrypt_token(raw_token, account_id=f"agent-{agent_id}")
+                        token_dict = json.loads(decrypted) if decrypted else None
+                    except Exception:
+                        try:
+                            token_dict = json.loads(raw_token)
+                        except Exception:
+                            token_dict = None
+                elif isinstance(raw_token, dict):
+                    token_dict = raw_token
+
+                if token_dict and token_dict.get("token"):
+                    cal_id = agent_row.get("calendar_id") or "primary"
+                    return cal_id, token_dict, "agent"
+        except Exception as e:
+            logger.warning(f"Error checking agent {agent_id} personal calendar: {e}")
+
+    # 2. Fallback to Agency's Shared Google Calendar
+    connector = (
+        sb.table("connectors")
+        .select("auth_data")
+        .eq("name", "google_calendar")
+        .eq("agency_id", agency_id)
+        .eq("is_connected", True)
+        .limit(1)
+        .execute()
+    )
+    if connector.data and connector.data[0].get("auth_data"):
+        raw_auth = connector.data[0]["auth_data"]
+        token_dict = None
+        if isinstance(raw_auth, str):
+            try:
+                decrypted = decrypt_token(raw_auth, account_id=f"agency-{agency_id}")
+                token_dict = json.loads(decrypted) if decrypted else None
+            except Exception:
+                try:
+                    token_dict = json.loads(raw_auth)
+                except Exception:
+                    token_dict = None
+        elif isinstance(raw_auth, dict):
+            token_dict = raw_auth
+
+        if token_dict and token_dict.get("token"):
+            cal_id = settings.GOOGLE_SHARED_CALENDAR_ID or "primary"
+            return cal_id, token_dict, "agency"
+
+    raise HTTPException(
+        status_code=400,
+        detail="Google Calendar not connected. Please connect Google Calendar in settings.",
+    )
+
