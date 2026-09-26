@@ -184,7 +184,11 @@ async def _execute_book_viewing(lead_context: dict, slot_start: str, slot_end: s
     google_meet_link = None
     try:
         from services.calendar_service import get_calendar_token_for_agent_or_agency
-        assigned_id = lead_context.get("assigned_agent_id") or agent_id
+        assigned_id = lead_context.get("assigned_agent_id")
+        if not assigned_id:
+            fallback_agent = sb.table("agents").select("id").eq("agency_id", agency_id).eq("is_active", True).limit(1).execute()
+            if fallback_agent.data:
+                assigned_id = fallback_agent.data[0]["id"]
         calendar_id, token_data, _ = get_calendar_token_for_agent_or_agency(sb, agency_id, assigned_id)
         cal_result = create_viewing_event(
             token_data=token_data,

@@ -128,6 +128,7 @@ async def list_available_plans(_: dict = Depends(verify_token)):
 
 # ─── 2. Current Plan & Usage ───────────────────────────────────────────────────
 
+@router.get("/current")
 @router.get("/my-plan")
 async def get_current_agency_plan(
     request: Request,

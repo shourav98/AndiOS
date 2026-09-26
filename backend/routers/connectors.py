@@ -1128,10 +1128,12 @@ async def connect_connector(
     """
     Step 1 of wizard: Save API credentials for a generic connector.
     """
-    if connector_name in RESERVED_SPECIFIC_CONNECTORS:
+    norm_name = connector_name.replace("-", "_")
+    if norm_name in {"meta_esu", "google_calendar"} or connector_name in RESERVED_SPECIFIC_CONNECTORS:
         raise HTTPException(status_code=404, detail=f"Use dedicated endpoint for {connector_name}")
-    if connector_name not in CONNECTOR_NAMES:
+    if norm_name not in CONNECTOR_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown connector: {connector_name}. Valid: {list(CONNECTOR_NAMES)}")
+    connector_name = norm_name
 
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
@@ -1173,10 +1175,12 @@ async def get_connector_listings(
     """
     Step 2 of wizard: Fetch available listings for this connector from stored feed/credentials.
     """
-    if connector_name in RESERVED_SPECIFIC_CONNECTORS:
+    norm_name = connector_name.replace("-", "_")
+    if norm_name in {"meta_esu", "google_calendar"} or connector_name in RESERVED_SPECIFIC_CONNECTORS:
         raise HTTPException(status_code=404, detail=f"Use dedicated endpoint for {connector_name}")
-    if connector_name not in {"property_finder", "bayut", "dubizzle"}:
+    if norm_name not in {"property_finder", "bayut", "dubizzle"}:
         raise HTTPException(status_code=400, detail=f"Listings not supported for: {connector_name}")
+    connector_name = norm_name
 
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
@@ -1217,10 +1221,12 @@ async def activate_connector(
     """
     Step 3 of wizard: 'Finish & Activate' connector.
     """
-    if connector_name in RESERVED_SPECIFIC_CONNECTORS:
+    norm_name = connector_name.replace("-", "_")
+    if norm_name in {"meta_esu", "google_calendar"} or connector_name in RESERVED_SPECIFIC_CONNECTORS:
         raise HTTPException(status_code=404, detail=f"Use dedicated endpoint for {connector_name}")
-    if connector_name not in CONNECTOR_NAMES:
+    if norm_name not in CONNECTOR_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown connector: {connector_name}")
+    connector_name = norm_name
 
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
@@ -1261,10 +1267,12 @@ async def get_webhook_url(
     _: dict = Depends(verify_token),
 ):
     """Return the webhook URL for a given connector."""
-    if connector_name in RESERVED_SPECIFIC_CONNECTORS:
+    norm_name = connector_name.replace("-", "_")
+    if norm_name in {"meta_esu", "google_calendar"} or connector_name in RESERVED_SPECIFIC_CONNECTORS:
         raise HTTPException(status_code=404, detail=f"Use dedicated endpoint for {connector_name}")
-    if connector_name not in CONNECTOR_NAMES:
+    if norm_name not in CONNECTOR_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown connector: {connector_name}")
+    connector_name = norm_name
 
     webhook_url = WEBHOOK_URLS.get(
         connector_name,
@@ -1282,10 +1290,12 @@ async def disconnect_connector(
     current_user: dict = Depends(verify_token),
 ):
     """Disconnect any generic connector — sets is_connected=False and clears auth_data."""
-    if connector_name in RESERVED_SPECIFIC_CONNECTORS:
+    norm_name = connector_name.replace("-", "_")
+    if norm_name in {"meta_esu", "google_calendar"} or connector_name in RESERVED_SPECIFIC_CONNECTORS:
         raise HTTPException(status_code=404, detail=f"Use dedicated endpoint for {connector_name}")
-    if connector_name not in CONNECTOR_NAMES:
+    if norm_name not in CONNECTOR_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown connector: {connector_name}")
+    connector_name = norm_name
 
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
