@@ -228,6 +228,7 @@ from routers import (
     subscription,
     branches,
     agent_phone_settings,
+    privacy,
 )
 
 app.include_router(auth.router)
@@ -249,6 +250,7 @@ app.include_router(call_campaigns.router)
 app.include_router(calls.router)
 app.include_router(subscription.router)
 app.include_router(agent_phone_settings.router)
+app.include_router(privacy.router)
 
 
 # ─── Health Check ─────────────────────────────────────────────────────────────

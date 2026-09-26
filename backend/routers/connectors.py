@@ -128,25 +128,99 @@ async def list_connectors(current_user: dict = Depends(verify_token)):
 # ─── Google Calendar OAuth (Specific Routes) ───────────────────────────────────
 
 @router.get("/google-calendar/auth")
-async def google_calendar_auth(current_user: dict = Depends(verify_token)):
-    """Initiate Google Calendar OAuth2 flow. Returns the auth URL."""
+async def google_calendar_auth(
+    agent_id: Optional[str] = Query(None),
+    current_user: dict = Depends(verify_token),
+):
+    """
+    Initiate Google Calendar OAuth2 flow.
+    Supports either agency-level shared calendar (for managers/owners)
+    or per-agent personal calendar (for agents or managers configuring an agent).
+    """
     if not settings.GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=400, detail="Google OAuth not configured. Set GOOGLE_CLIENT_ID in .env")
     agency_id = require_agency_id(current_user)
-    auth_url = get_auth_url(state=agency_id)
+
+    target_agent_id = None
+    if agent_id:
+        target_agent_id = str(agent_id)
+        if not is_management_role(current_user.get("role")):
+            user_agent_id = str(current_user.get("agent_id") or current_user.get("id"))
+            if target_agent_id != user_agent_id:
+                raise HTTPException(status_code=403, detail="Agents can only connect their own Google Calendar")
+        sb = get_supabase()
+        agent_res = sb.table("agents").select("id").eq("id", target_agent_id).eq("agency_id", agency_id).maybe_single().execute()
+        if not agent_res or not agent_res.data:
+            raise HTTPException(status_code=404, detail="Agent not found in your agency")
+    elif not is_management_role(current_user.get("role")):
+        target_agent_id = str(current_user.get("agent_id") or current_user.get("id"))
+
+    if target_agent_id:
+        state_val = f"agent:{agency_id}:{target_agent_id}"
+    else:
+        state_val = f"agency:{agency_id}"
+
+    auth_url = get_auth_url(state=state_val)
     return api_success(data={"auth_url": auth_url}, message="Google OAuth URL generated")
 
 
 @router.get("/google-calendar/callback")
 async def google_calendar_callback(code: str = Query(...), state: str = Query(None)):
-    """Google OAuth2 callback. Exchanges code for tokens and stores in Supabase."""
+    """Google OAuth2 callback. Exchanges code for tokens and stores encrypted tokens in Supabase."""
     try:
         tokens = exchange_code_for_tokens(code)
         sb = get_supabase()
-        agency_id = state
-        if not agency_id:
-            raise ValueError("Agency ID missing from state")
+        if not state:
+            raise ValueError("Agency ID or state missing from state")
 
+        is_agent_mode = False
+        target_agent_id = None
+        agency_id = state
+
+        if state.startswith("agent:"):
+            parts = state.split(":")
+            if len(parts) >= 3:
+                is_agent_mode = True
+                agency_id = parts[1]
+                target_agent_id = parts[2]
+        elif state.startswith("agency:"):
+            parts = state.split(":")
+            agency_id = parts[1]
+        elif ":" in state:
+            parts = state.split(":")
+            if len(parts) == 2:
+                agency_id = parts[0]
+                target_agent_id = parts[1]
+                is_agent_mode = True
+
+        from utils.crypto import encrypt_token
+        import json
+
+        if is_agent_mode and target_agent_id:
+            # 1. Fetch agent's primary calendar ID
+            cal_id = "primary"
+            try:
+                from services.calendar_service import _build_service
+                service = _build_service(tokens)
+                cal = service.calendars().get(calendarId="primary").execute()
+                cal_id = cal.get("id") or "primary"
+            except Exception as cal_err:
+                logger.warning(f"Could not fetch primary calendar id for agent {target_agent_id}: {cal_err}")
+
+            encrypted_tokens = encrypt_token(json.dumps(tokens))
+            sb.table("agents").update({
+                "calendar_id": cal_id,
+                "google_token_data": encrypted_tokens,
+                "is_calendar_connected": True,
+            }).eq("id", target_agent_id).eq("agency_id", agency_id).execute()
+
+            agent_row = sb.table("agents").select("role").eq("id", target_agent_id).maybe_single().execute()
+            target_role = (agent_row.data.get("role") if agent_row and agent_row.data else "agent") or "agent"
+            redirect_path = "/owner-dashboard/calendar" if target_role == "owner" else "/agent-dashboard/calendar"
+            logger.info(f"Agent {target_agent_id} Google Calendar connected successfully ({cal_id}) -> redirecting to {redirect_path}")
+            return RedirectResponse(url=f"{settings.FRONTEND_URL}{redirect_path}?connected=google_calendar")
+
+        # Agency-level connection
         existing = sb.table("connectors").select("id").eq("name", "google_calendar").eq("agency_id", agency_id).execute()
         if existing.data:
             sb.table("connectors").update({
@@ -164,16 +238,33 @@ async def google_calendar_callback(code: str = Query(...), state: str = Query(No
             }).execute()
 
         logger.info("Google Calendar connected successfully")
-        return RedirectResponse(url=f"{settings.FRONTEND_URL}/connectors?connected=google_calendar")
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}/owner-dashboard/calendar?connected=google_calendar")
     except Exception as e:
         logger.error(f"Google Calendar OAuth error: {e}")
-        return RedirectResponse(url=f"{settings.FRONTEND_URL}/connectors?error=google_calendar")
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}/owner-dashboard/calendar?error=google_calendar")
 
 
 @router.post("/google-calendar/disconnect")
-async def google_calendar_disconnect(current_user: dict = Depends(verify_token)):
-    """Disconnect Google Calendar integration for the current agency."""
+async def google_calendar_disconnect(
+    agent_id: Optional[str] = Query(None),
+    current_user: dict = Depends(verify_token),
+):
+    """Disconnect Google Calendar integration for the current agency or a specific agent."""
     sb = get_supabase()
+    agency_id = require_agency_id(current_user)
+
+    if agent_id:
+        target_agent_id = str(agent_id)
+        if not is_management_role(current_user.get("role")):
+            user_agent_id = str(current_user.get("agent_id") or current_user.get("id"))
+            if target_agent_id != user_agent_id:
+                raise HTTPException(status_code=403, detail="Agents can only disconnect their own Google Calendar")
+        sb.table("agents").update({
+            "google_token_data": None,
+            "is_calendar_connected": False,
+        }).eq("id", target_agent_id).eq("agency_id", agency_id).execute()
+        return api_success(message="Agent Google Calendar disconnected")
+
     apply_agency_scope(
         sb.table("connectors").update({"is_connected": False, "auth_data": None}),
         current_user,
@@ -181,30 +272,88 @@ async def google_calendar_disconnect(current_user: dict = Depends(verify_token))
     return api_success(message="Google Calendar disconnected")
 
 
-@router.post("/google-calendar/test")
-async def test_google_calendar(current_user: dict = Depends(verify_token)):
-    """Test Google Calendar connection by listing upcoming events."""
+@router.get("/google-calendar/status")
+async def google_calendar_status(
+    agent_id: Optional[str] = Query(None),
+    current_user: dict = Depends(verify_token),
+):
+    """Get Google Calendar connection status for agent and agency."""
     sb = get_supabase()
-    require_agency_id(current_user)
-    connector = (
-        apply_agency_scope(
-            sb.table("connectors").select("auth_data"),
-            current_user,
+    agency_id = require_agency_id(current_user)
+    target_agent_id = str(agent_id) if agent_id else (
+        str(current_user.get("agent_id") or current_user.get("id"))
+        if not is_management_role(current_user.get("role"))
+        else None
+    )
+
+    agent_connected = False
+    agent_cal_id = None
+    if target_agent_id:
+        res = (
+            sb.table("agents")
+            .select("calendar_id, google_token_data, is_calendar_connected")
+            .eq("id", target_agent_id)
+            .eq("agency_id", agency_id)
+            .maybe_single()
+            .execute()
         )
+        if res and res.data:
+            agent_connected = bool(res.data.get("google_token_data")) or bool(res.data.get("is_calendar_connected"))
+            agent_cal_id = res.data.get("calendar_id")
+
+    agency_connector = (
+        sb.table("connectors")
+        .select("is_connected, last_sync")
         .eq("name", "google_calendar")
-        .eq("is_connected", True)
+        .eq("agency_id", agency_id)
         .limit(1)
         .execute()
     )
-    if not connector.data or not connector.data[0].get("auth_data"):
-        raise HTTPException(status_code=400, detail="Google Calendar not connected")
+    agency_connected = bool(agency_connector.data and agency_connector.data[0].get("is_connected"))
 
+    is_connected = agent_connected if target_agent_id else (agent_connected or agency_connected)
+
+    return api_success(
+        data={
+            "is_connected": is_connected,
+            "agent_calendar_connected": agent_connected,
+            "agent_calendar_id": agent_cal_id,
+            "agency_calendar_connected": agency_connected,
+            "mode": "agent" if agent_connected else ("agency_fallback" if agency_connected else "none"),
+        },
+        message="Google Calendar status retrieved",
+    )
+
+
+@router.post("/google-calendar/test")
+async def test_google_calendar(
+    agent_id: Optional[str] = Query(None),
+    current_user: dict = Depends(verify_token),
+):
+
+    """Test Google Calendar connection by querying calendar summary."""
+    sb = get_supabase()
+    agency_id = require_agency_id(current_user)
+    from services.calendar_service import get_calendar_token_for_agent_or_agency, _build_service
+
+    target_agent_id = str(agent_id) if agent_id else (
+        str(current_user.get("agent_id") or current_user.get("id"))
+        if not is_management_role(current_user.get("role"))
+        else None
+    )
+
+    calendar_id, token_data, source = get_calendar_token_for_agent_or_agency(sb, agency_id, target_agent_id)
     try:
-        from services.calendar_service import _build_service
-        service = _build_service(connector.data[0]["auth_data"])
-        calendar_id = settings.GOOGLE_SHARED_CALENDAR_ID or "primary"
+        service = _build_service(token_data)
         cal = service.calendars().get(calendarId=calendar_id).execute()
-        return api_success(data={"calendar_name": cal.get("summary"), "calendar_id": calendar_id}, message="Google Calendar connected")
+        return api_success(
+            data={
+                "calendar_name": cal.get("summary"),
+                "calendar_id": calendar_id,
+                "source": source,
+            },
+            message="Google Calendar connected",
+        )
     except Exception as e:
         logger.error(f"Google Calendar test failed: {e}")
         raise HTTPException(status_code=500, detail="Calendar test failed — check connector credentials")
@@ -979,10 +1128,12 @@ async def connect_connector(
     """
     Step 1 of wizard: Save API credentials for a generic connector.
     """
-    if connector_name in RESERVED_SPECIFIC_CONNECTORS:
+    norm_name = connector_name.replace("-", "_")
+    if norm_name in {"meta_esu", "google_calendar"} or connector_name in RESERVED_SPECIFIC_CONNECTORS:
         raise HTTPException(status_code=404, detail=f"Use dedicated endpoint for {connector_name}")
-    if connector_name not in CONNECTOR_NAMES:
+    if norm_name not in CONNECTOR_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown connector: {connector_name}. Valid: {list(CONNECTOR_NAMES)}")
+    connector_name = norm_name
 
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
@@ -1024,10 +1175,12 @@ async def get_connector_listings(
     """
     Step 2 of wizard: Fetch available listings for this connector from stored feed/credentials.
     """
-    if connector_name in RESERVED_SPECIFIC_CONNECTORS:
+    norm_name = connector_name.replace("-", "_")
+    if norm_name in {"meta_esu", "google_calendar"} or connector_name in RESERVED_SPECIFIC_CONNECTORS:
         raise HTTPException(status_code=404, detail=f"Use dedicated endpoint for {connector_name}")
-    if connector_name not in {"property_finder", "bayut", "dubizzle"}:
+    if norm_name not in {"property_finder", "bayut", "dubizzle"}:
         raise HTTPException(status_code=400, detail=f"Listings not supported for: {connector_name}")
+    connector_name = norm_name
 
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
@@ -1068,10 +1221,12 @@ async def activate_connector(
     """
     Step 3 of wizard: 'Finish & Activate' connector.
     """
-    if connector_name in RESERVED_SPECIFIC_CONNECTORS:
+    norm_name = connector_name.replace("-", "_")
+    if norm_name in {"meta_esu", "google_calendar"} or connector_name in RESERVED_SPECIFIC_CONNECTORS:
         raise HTTPException(status_code=404, detail=f"Use dedicated endpoint for {connector_name}")
-    if connector_name not in CONNECTOR_NAMES:
+    if norm_name not in CONNECTOR_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown connector: {connector_name}")
+    connector_name = norm_name
 
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
@@ -1112,10 +1267,12 @@ async def get_webhook_url(
     _: dict = Depends(verify_token),
 ):
     """Return the webhook URL for a given connector."""
-    if connector_name in RESERVED_SPECIFIC_CONNECTORS:
+    norm_name = connector_name.replace("-", "_")
+    if norm_name in {"meta_esu", "google_calendar"} or connector_name in RESERVED_SPECIFIC_CONNECTORS:
         raise HTTPException(status_code=404, detail=f"Use dedicated endpoint for {connector_name}")
-    if connector_name not in CONNECTOR_NAMES:
+    if norm_name not in CONNECTOR_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown connector: {connector_name}")
+    connector_name = norm_name
 
     webhook_url = WEBHOOK_URLS.get(
         connector_name,
@@ -1133,10 +1290,12 @@ async def disconnect_connector(
     current_user: dict = Depends(verify_token),
 ):
     """Disconnect any generic connector — sets is_connected=False and clears auth_data."""
-    if connector_name in RESERVED_SPECIFIC_CONNECTORS:
+    norm_name = connector_name.replace("-", "_")
+    if norm_name in {"meta_esu", "google_calendar"} or connector_name in RESERVED_SPECIFIC_CONNECTORS:
         raise HTTPException(status_code=404, detail=f"Use dedicated endpoint for {connector_name}")
-    if connector_name not in CONNECTOR_NAMES:
+    if norm_name not in CONNECTOR_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown connector: {connector_name}")
+    connector_name = norm_name
 
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
