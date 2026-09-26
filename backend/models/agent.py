@@ -43,5 +43,6 @@ class AgentResponse(BaseModel):
     branch: Optional[str] = None
     branch_id: Optional[str] = None
     is_active: bool
+    is_calendar_connected: Optional[bool] = False
     created_at: datetime
     updated_at: datetime
