@@ -146,17 +146,28 @@ app = FastAPI(
 def _cors_allow_origins() -> list[str]:
     origins = []
     if settings.FRONTEND_URL:
-        fe = settings.FRONTEND_URL.rstrip("/")
-        origins.append(fe)
-    api = (settings.API_BASE_URL or "").rstrip("/")
-    if api and api.startswith("http"):
-        # same-origin API calls don't need CORS, but harmless to allow
-        pass
-    if settings.APP_ENV == "development":
+        for url in str(settings.FRONTEND_URL).split(","):
+            cleaned = url.strip().rstrip("/")
+            if cleaned:
+                origins.append(cleaned)
+
+    extra_cors = os.getenv("CORS_ORIGINS") or os.getenv("ADDITIONAL_CORS_ORIGINS") or ""
+    if extra_cors:
+        for url in extra_cors.split(","):
+            cleaned = url.strip().rstrip("/")
+            if cleaned:
+                origins.append(cleaned)
+
+    if settings.APP_ENV == "development" or os.getenv("ALLOW_LOCALHOST_CORS", "false").lower() in ("true", "1"):
         origins += [
             "http://localhost:3000",
             "http://localhost:5173",
+            "http://localhost:5174",
+            "http://localhost:5175",
             "http://127.0.0.1:3000",
+            "http://127.0.0.1:5173",
+            "http://127.0.0.1:5174",
+            "http://127.0.0.1:5175",
         ]
     return list(dict.fromkeys(o for o in origins if o))
 
