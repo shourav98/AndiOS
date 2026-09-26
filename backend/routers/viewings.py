@@ -271,3 +271,41 @@ async def update_viewing(viewing_id: UUID, body: ViewingUpdate, current_user: di
 
     result = sb.table("viewings").update(update_data).eq("id", str(viewing_id)).execute()
     return api_success(data=result.data[0], message="Viewing updated successfully")
+
+
+@router.delete("/{viewing_id}", response_model=ApiResponse[dict])
+async def cancel_and_delete_viewing(viewing_id: UUID, current_user: dict = Depends(verify_token)):
+    """Cancel and delete/mark a viewing as cancelled, canceling Google Calendar event."""
+    sb = get_supabase()
+    agency_id = require_agency_id(current_user)
+    existing_data = await verify_viewing_access(str(viewing_id), current_user)
+
+    event_id = existing_data.get("google_event_id")
+    if event_id:
+        try:
+            calendar_id, token_data, _ = get_calendar_token_for_agent_or_agency(
+                sb, agency_id, existing_data.get("agent_id")
+            )
+            cancel_viewing_event(token_data, calendar_id, event_id)
+        except Exception as e:
+            logger.error(f"Failed to cancel calendar event: {e}")
+    cancel_viewing_jobs(str(viewing_id))
+
+    # Notify lead
+    lead_id = existing_data.get("lead_id")
+    if lead_id:
+        lead = sb.table("leads").select("phone, name").eq("id", lead_id).execute()
+        if lead.data:
+            try:
+                from services.whatsapp_service import send_whatsapp_for_agency
+                cancel_msg = (
+                    f"Hi {lead.data[0]['name'].split()[0]}, your viewing has been cancelled. "
+                    f"Please contact us to reschedule. 📅"
+                )
+                await send_whatsapp_for_agency(agency_id, lead.data[0]["phone"], cancel_msg)
+            except Exception as wa_err:
+                logger.warning(f"Failed to send cancellation WhatsApp message: {wa_err}")
+
+    sb.table("viewings").update({"status": "cancelled"}).eq("id", str(viewing_id)).execute()
+    return api_success(data={"viewing_id": str(viewing_id), "status": "cancelled"}, message="Viewing cancelled successfully")
+
