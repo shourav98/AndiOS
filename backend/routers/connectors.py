@@ -214,8 +214,11 @@ async def google_calendar_callback(code: str = Query(...), state: str = Query(No
                 "is_calendar_connected": True,
             }).eq("id", target_agent_id).eq("agency_id", agency_id).execute()
 
-            logger.info(f"Agent {target_agent_id} Google Calendar connected successfully ({cal_id})")
-            return RedirectResponse(url=f"{settings.FRONTEND_URL}/settings?tab=calendar&connected=google_calendar")
+            agent_row = sb.table("agents").select("role").eq("id", target_agent_id).maybe_single().execute()
+            target_role = (agent_row.data.get("role") if agent_row and agent_row.data else "agent") or "agent"
+            redirect_path = "/owner-dashboard/calendar" if target_role == "owner" else "/agent-dashboard/calendar"
+            logger.info(f"Agent {target_agent_id} Google Calendar connected successfully ({cal_id}) -> redirecting to {redirect_path}")
+            return RedirectResponse(url=f"{settings.FRONTEND_URL}{redirect_path}?connected=google_calendar")
 
         # Agency-level connection
         existing = sb.table("connectors").select("id").eq("name", "google_calendar").eq("agency_id", agency_id).execute()
@@ -235,10 +238,10 @@ async def google_calendar_callback(code: str = Query(...), state: str = Query(No
             }).execute()
 
         logger.info("Google Calendar connected successfully")
-        return RedirectResponse(url=f"{settings.FRONTEND_URL}/connectors?connected=google_calendar")
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}/owner-dashboard/calendar?connected=google_calendar")
     except Exception as e:
         logger.error(f"Google Calendar OAuth error: {e}")
-        return RedirectResponse(url=f"{settings.FRONTEND_URL}/connectors?error=google_calendar")
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}/owner-dashboard/calendar?error=google_calendar")
 
 
 @router.post("/google-calendar/disconnect")
