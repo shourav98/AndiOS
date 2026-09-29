@@ -39,7 +39,7 @@ Run the additive migration script in your **Supabase SQL Editor**:
 - Create a configuration (`config_id`):
   - Add products: **WhatsApp Cloud API**.
   - Add permissions: `whatsapp_business_management`, `whatsapp_business_messaging`.
-  - Add Allowed Domains: `https://andi-os.vercel.app`.
+  - Add Allowed Domains: `https://andi-os.netlify.app`.
   - Set Webhook URL: `https://andreearizan.softvencealpha.com/webhooks/whatsapp`.
   - Verify Token: Match `WHATSAPP_VERIFY_TOKEN` (e.g. `andios_verify_token`).
 
@@ -64,7 +64,7 @@ Ensure the following variables are configured:
 APP_ENV=production
 SECRET_KEY=your_production_secret_key_here
 API_BASE_URL=https://andreearizan.softvencealpha.com
-FRONTEND_URL=https://andi-os.vercel.app
+FRONTEND_URL=https://andi-os.netlify.app
 
 # Supabase
 SUPABASE_URL=https://your-project.supabase.co
