@@ -134,7 +134,7 @@ class Settings(BaseSettings):
     # ─── Stripe Billing ──────────────────────────────────────────────────────
     STRIPE_SECRET_KEY: str = ""             # sk_test_... or sk_live_...
     STRIPE_WEBHOOK_SECRET: str = ""         # whsec_... from stripe CLI or dashboard
-    STRIPE_PORTAL_RETURN_URL: str = "http://localhost:3000/owner-dashboard/plan-billing"
+    STRIPE_PORTAL_RETURN_URL: str = "https://andi-os.netlify.app/owner-dashboard/plan-billing"
 
     # Stripe Price IDs — create these once in Stripe Dashboard
     STRIPE_PRICE_BASIC: str = ""            # AED 1,400/mo — Basic plan

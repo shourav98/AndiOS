@@ -15,7 +15,7 @@ PRIVACY_POLICY_DATA = {
     "company": {
         "name": "AndiOS Technologies",
         "email": "privacy@andios.com",
-        "website": "https://andi-os.vercel.app",
+        "website": "https://andi-os.netlify.app",
         "address": "Dubai, United Arab Emirates",
     },
     "introduction": (
@@ -280,7 +280,7 @@ PRIVACY_POLICY_DATA = {
                 "If you have questions about this Privacy Policy or wish to exercise your data privacy rights, please contact us:\n"
                 "• Company: AndiOS Technologies\n"
                 "• Email: privacy@andios.com\n"
-                "• Website: https://andi-os.vercel.app\n"
+                "• Website: https://andi-os.netlify.app\n"
                 "• Address: Dubai, United Arab Emirates"
             )
         },

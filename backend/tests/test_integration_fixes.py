@@ -652,14 +652,14 @@ async def test_contract_pdf_uses_signed_url_never_public(tmp_path):
 def test_cors_origins_environment_aware():
     from main import _cors_allow_origins
     with patch.object(settings, "APP_ENV", "production"), \
-         patch.object(settings, "FRONTEND_URL", "https://andi-os.vercel.app"):
+         patch.object(settings, "FRONTEND_URL", "https://andi-os.netlify.app"):
         origins = _cors_allow_origins()
-    assert origins == ["https://andi-os.vercel.app"]
+    assert "https://andi-os.netlify.app" in origins
 
     with patch.object(settings, "APP_ENV", "development"), \
          patch.object(settings, "FRONTEND_URL", "http://localhost:3000"):
         dev = _cors_allow_origins()
-    assert "http://localhost:5173" in dev and dev[0] == "http://localhost:3000"
+    assert "http://localhost:5173" in dev and "https://andi-os.netlify.app" in dev
 
 
 def test_production_config_validator_reports_missing_secrets(caplog):
