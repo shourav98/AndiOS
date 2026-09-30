@@ -90,7 +90,7 @@ QUALIFY_TOOLS = [
 ]
 
 
-# ─── Tool Execution Helpers ────────────────────────────────────────────────────
+# ─── Tool Execution Helpers ──────────────────────────────────────────────
 
 async def _execute_check_slots(lead_context: dict) -> str:
     """Fetch available calendar slots for the lead's agency."""
@@ -105,8 +105,26 @@ async def _execute_check_slots(lead_context: dict) -> str:
 
     tz = pytz.timezone("Asia/Dubai")
     now = datetime.now(tz)
-    date_from = now
-    date_to = now + timedelta(days=3)
+
+    # ── Smart date window: respect lead's move-in timeline ───────────────────
+    # Start from tomorrow minimum (never show "today" as a viewing slot
+    # because leads need time to plan).
+    # If lead's move-in is more than 7 days away, show slots starting
+    # 3 days before their move-in date so viewings are relevant.
+    move_in_note = str(lead_context.get("notes") or "").lower()
+    is_next_month = any(kw in move_in_note for kw in ["next month", "following month"])
+
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if is_next_month:
+        # Show slots around the start of next month (4 weeks out)
+        date_from = now + timedelta(days=25)
+        date_from = date_from.replace(hour=0, minute=0, second=0, microsecond=0)
+        date_to = date_from + timedelta(days=7)
+    else:
+        # Default: next 5 days starting from tomorrow
+        date_from = tomorrow
+        date_to = tomorrow + timedelta(days=5)
 
     slots = []
     try:
@@ -116,12 +134,12 @@ async def _execute_check_slots(lead_context: dict) -> str:
         logger.warning(f"Google Calendar slot fetch failed: {e}, falling back to standard slots")
         slots = []
 
-
-    # Fallback to standard agency slots (10:00, 14:00, 16:00, 18:00) if no calendar or token expired
+    # Fallback to standard agency slots if no calendar connected or token expired.
+    # Uses the same smart date window so fallback slots are also contextually relevant.
     if not slots:
-        for day_offset in range(3):
-            slot_date = (now + timedelta(days=day_offset)).date()
-            for hour in (11, 14, 16, 18):
+        for day_offset in range(7):
+            slot_date = (date_from + timedelta(days=day_offset)).date()
+            for hour in (11, 14, 16):
                 dt_start = tz.localize(datetime(slot_date.year, slot_date.month, slot_date.day, hour, 0))
                 if dt_start > now:
                     dt_end = dt_start + timedelta(hours=1)
@@ -131,14 +149,14 @@ async def _execute_check_slots(lead_context: dict) -> str:
                     })
 
     if not slots:
-        return "No slots available in the next 3 days. Ask the user if next week works."
+        return "No viewing slots available in the selected period. Ask the user if a different date range works."
 
     slot_strs = []
     for s in slots[:6]:
         dt = datetime.fromisoformat(s["start"])
         slot_strs.append(f'{dt.strftime("%A, %b %d at %I:%M %p")} (start={s["start"]}, end={s["end"]})')
 
-    return f"Available slots:\n" + "\n".join(f"- {s}" for s in slot_strs) + "\n\nOffer the first two closest options to the user or accept their requested slot. When the user confirms a slot, call the book_viewing function with the exact start and end ISO strings."
+    return "Available slots:\n" + "\n".join(f"- {s}" for s in slot_strs) + "\n\nOffer the first two closest options to the user or accept their requested slot. When the user confirms a slot, call the book_viewing function with the exact start and end ISO strings."
 
 
 async def _execute_book_viewing(lead_context: dict, slot_start: str, slot_end: str) -> str:
