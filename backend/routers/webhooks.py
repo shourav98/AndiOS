@@ -1292,9 +1292,10 @@ async def whatsapp_inbound(
     
             # Update last_inbound_at on leads (tracks per-lead 24h customer service window)
             if lead_id:
+                from datetime import datetime, timezone
+                now_iso = datetime.now(timezone.utc).isoformat()
+                lead["last_inbound_at"] = now_iso
                 try:
-                    from datetime import datetime, timezone
-                    now_iso = datetime.now(timezone.utc).isoformat()
                     sb.table("leads").update({"last_inbound_at": now_iso}).eq("id", lead_id).execute()
                 except Exception as lead_err:
                     logger.debug("[WA] Error updating last_inbound_at on lead: %s", lead_err)
