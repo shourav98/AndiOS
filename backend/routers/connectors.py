@@ -1167,6 +1167,91 @@ async def connect_connector(
     )
 
 
+async def _fetch_property_finder_listings(auth_data: dict) -> list[dict]:
+    """Fetch live listings from Property Finder Atlas API."""
+    import base64
+    import httpx
+
+    api_key = (
+        auth_data.get("api_key")
+        or auth_data.get("client_id")
+        or getattr(settings, "PROPERTY_FINDER_API_KEY", "")
+        or "oYgqX.1lxQ5OIJZCQ2vbwAul5zQcKmiN1nSc0rLB"
+    )
+    api_secret = (
+        auth_data.get("api_secret")
+        or auth_data.get("client_secret")
+        or getattr(settings, "PROPERTY_FINDER_API_SECRET", "")
+        or getattr(settings, "PROPERTY_FINDER_WEBHOOK_SECRET", "")
+        or "ZOTnuAyUuSkQ9uyC86fLxUgsjQh785Zd"
+    )
+    if not api_key or not api_secret:
+        return []
+
+    try:
+        credentials = f"{api_key}:{api_secret}"
+        encoded = base64.b64encode(credentials.encode()).decode()
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            token_resp = await client.post(
+                "https://auth.propertyfinder.com/auth/oauth/v1/token",
+                headers={"Authorization": f"Basic {encoded}", "Content-Type": "application/json"},
+                json={"grant_type": "client_credentials", "scope": "openid"},
+            )
+            if token_resp.status_code != 200:
+                logger.warning(f"[Property Finder] OAuth token failed: {token_resp.status_code} {token_resp.text}")
+                return []
+            token = token_resp.json().get("access_token")
+            if not token:
+                return []
+
+            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+            listings_resp = await client.get(
+                "https://atlas.propertyfinder.com/v1/listings",
+                headers=headers
+            )
+            if listings_resp.status_code != 200:
+                logger.warning(f"[Property Finder] Listings fetch failed: {listings_resp.status_code} {listings_resp.text}")
+                return []
+
+            data = listings_resp.json()
+            raw_results = data.get("results", [])
+            formatted = []
+            for item in raw_results:
+                title = item.get("title")
+                if isinstance(title, dict):
+                    title_str = title.get("en") or next(iter(title.values()), "")
+                else:
+                    title_str = str(title or "")
+
+                price_info = item.get("price") or {}
+                amounts = price_info.get("amounts") or {}
+                price_val = amounts.get("yearly") or amounts.get("sale") or amounts.get("monthly") or 0
+
+                loc = item.get("location") or {}
+                location_id = loc.get("id") if isinstance(loc, dict) else loc
+
+                formatted.append({
+                    "id": item.get("id"),
+                    "reference": item.get("reference"),
+                    "title": title_str,
+                    "type": item.get("type"),
+                    "category": item.get("category"),
+                    "bedrooms": item.get("bedrooms"),
+                    "bathrooms": item.get("bathrooms"),
+                    "price": price_val,
+                    "price_type": price_info.get("type"),
+                    "location_id": location_id,
+                    "state": item.get("state"),
+                    "amenities": item.get("amenities", []),
+                    "created_at": item.get("createdAt"),
+                    "updated_at": item.get("updatedAt"),
+                })
+            return formatted
+    except Exception as e:
+        logger.error(f"[Property Finder] Error fetching listings: {e}")
+        return []
+
+
 @router.get("/{connector_name}/listings")
 async def get_connector_listings(
     connector_name: str,
@@ -1194,6 +1279,22 @@ async def get_connector_listings(
 
     auth_data = connector.data[0].get("auth_data") or {}
     listings = auth_data.get("listings", [])
+
+    # Fetch live listings if empty and connector is property_finder
+    if (not listings or len(listings) == 0) and connector_name == "property_finder":
+        live_listings = await _fetch_property_finder_listings(auth_data)
+        if live_listings:
+            listings = live_listings
+            auth_data["listings"] = listings
+            try:
+                sb.table("connectors").update({
+                    "auth_data": auth_data,
+                    "is_connected": True,
+                    "last_sync": "now()",
+                }).eq("name", connector_name).eq("agency_id", agency_id).execute()
+            except Exception as update_err:
+                logger.warning(f"Failed to cache listings in connector: {update_err}")
+
     if isinstance(listings, list) and len(listings) > 0:
         total = len(listings)
         msg = f"Retrieved {total} listings for {CONNECTOR_DISPLAY.get(connector_name, connector_name)}"
@@ -1207,7 +1308,7 @@ async def get_connector_listings(
             "connector": connector_name,
             "listings": listings,
             "total": total,
-            "is_connected": connector.data[0].get("is_connected", False),
+            "is_connected": connector.data[0].get("is_connected", False) or (len(listings) > 0),
         },
         message=msg
     )
