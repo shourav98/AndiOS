@@ -106,10 +106,23 @@ def get_available_slots(
     try:
         service = _build_service(token_data)
 
+        # Ensure proper RFC3339 format for Google Calendar freebusy query
+        from datetime import timezone as dt_tz
+        time_min_str = (
+            date_from.astimezone(dt_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if date_from.tzinfo
+            else date_from.strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
+        time_max_str = (
+            date_to.astimezone(dt_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if date_to.tzinfo
+            else date_to.strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
+
         # Query busy times
         body = {
-            "timeMin": date_from.isoformat() + "Z",
-            "timeMax": date_to.isoformat() + "Z",
+            "timeMin": time_min_str,
+            "timeMax": time_max_str,
             "items": [{"id": calendar_id}],
         }
         freebusy = service.freebusy().query(body=body).execute()
@@ -291,17 +304,50 @@ def get_calendar_token_for_agent_or_agency(
     agent_id: Optional[str] = None,
 ) -> tuple[str, dict, str]:
     """
-    Resolve Google Calendar credentials with Agent Priority + Agency Fallback:
-    1. If agent_id provided: check if agent has their own connected Google Calendar tokens.
-    2. Fallback gracefully to the agency's shared Google Calendar if agent hasn't connected theirs.
+    Resolve Google Calendar credentials with Mode Support + Fallback:
+    1. If GOOGLE_CALENDAR_MODE == "shared", prefer agency shared calendar first, fallback to agent.
+    2. Otherwise, check if agent has their own connected Google Calendar (is_calendar_connected=True), fallback to agency.
     Returns: (calendar_id, token_data, source: 'agent' | 'agency')
     Raises: HTTPException(400) if neither is connected.
     """
     from fastapi import HTTPException
     from utils.crypto import decrypt_token, is_encrypted
 
-    # 1. Check Agent's Personal Google Calendar
-    if agent_id:
+    mode = getattr(settings, "GOOGLE_CALENDAR_MODE", "shared")
+
+    def _get_agency_token():
+        connector = (
+            sb.table("connectors")
+            .select("auth_data")
+            .eq("name", "google_calendar")
+            .eq("agency_id", agency_id)
+            .eq("is_connected", True)
+            .limit(1)
+            .execute()
+        )
+        if connector.data and connector.data[0].get("auth_data"):
+            raw_auth = connector.data[0]["auth_data"]
+            token_dict = None
+            if isinstance(raw_auth, str):
+                try:
+                    decrypted = decrypt_token(raw_auth, account_id=f"agency-{agency_id}")
+                    token_dict = json.loads(decrypted) if decrypted else None
+                except Exception:
+                    try:
+                        token_dict = json.loads(raw_auth)
+                    except Exception:
+                        token_dict = None
+            elif isinstance(raw_auth, dict):
+                token_dict = raw_auth
+
+            if token_dict and token_dict.get("token"):
+                cal_id = settings.GOOGLE_SHARED_CALENDAR_ID or "primary"
+                return cal_id, token_dict, "agency"
+        return None
+
+    def _get_agent_token():
+        if not agent_id:
+            return None
         try:
             agent_res = (
                 sb.table("agents")
@@ -312,7 +358,7 @@ def get_calendar_token_for_agent_or_agency(
                 .execute()
             )
             agent_row = agent_res.data if agent_res else None
-            if agent_row and agent_row.get("google_token_data"):
+            if agent_row and agent_row.get("is_calendar_connected") and agent_row.get("google_token_data"):
                 raw_token = agent_row["google_token_data"]
                 token_dict = None
                 if isinstance(raw_token, str):
@@ -332,35 +378,15 @@ def get_calendar_token_for_agent_or_agency(
                     return cal_id, token_dict, "agent"
         except Exception as e:
             logger.warning(f"Error checking agent {agent_id} personal calendar: {e}")
+        return None
 
-    # 2. Fallback to Agency's Shared Google Calendar
-    connector = (
-        sb.table("connectors")
-        .select("auth_data")
-        .eq("name", "google_calendar")
-        .eq("agency_id", agency_id)
-        .eq("is_connected", True)
-        .limit(1)
-        .execute()
-    )
-    if connector.data and connector.data[0].get("auth_data"):
-        raw_auth = connector.data[0]["auth_data"]
-        token_dict = None
-        if isinstance(raw_auth, str):
-            try:
-                decrypted = decrypt_token(raw_auth, account_id=f"agency-{agency_id}")
-                token_dict = json.loads(decrypted) if decrypted else None
-            except Exception:
-                try:
-                    token_dict = json.loads(raw_auth)
-                except Exception:
-                    token_dict = None
-        elif isinstance(raw_auth, dict):
-            token_dict = raw_auth
+    if mode == "shared":
+        res = _get_agency_token() or _get_agent_token()
+    else:
+        res = _get_agent_token() or _get_agency_token()
 
-        if token_dict and token_dict.get("token"):
-            cal_id = settings.GOOGLE_SHARED_CALENDAR_ID or "primary"
-            return cal_id, token_dict, "agency"
+    if res:
+        return res
 
     raise HTTPException(
         status_code=400,
