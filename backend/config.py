@@ -82,7 +82,7 @@ class Settings(BaseSettings):
     # Google Calendar
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
-    GOOGLE_REDIRECT_URI: str = "https://andreearizan.softvencealpha.com/connectors/google-calendar/callback"
+    GOOGLE_REDIRECT_URI: str = "https://andreearizan.dmango.online/connectors/google-calendar/callback"
     GOOGLE_CALENDAR_MODE: str = "shared"
     GOOGLE_SHARED_CALENDAR_ID: str = ""
 
