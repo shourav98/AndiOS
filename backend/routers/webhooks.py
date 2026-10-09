@@ -168,7 +168,10 @@ def _verify_meta_request(request: Request, raw_body: bytes) -> bool:
     signature = request.headers.get("x-hub-signature-256") or request.headers.get("X-Hub-Signature-256")
     is_development = getattr(settings, "APP_ENV", "development") == "development"
 
-    if not secret:
+    secrets_raw = (getattr(settings, "META_APP_SECRET", "") or getattr(settings, "WHATSAPP_APP_SECRET", "") or "").strip()
+    secret_list = [s.strip() for s in secrets_raw.split(",") if s.strip()]
+
+    if not secret_list:
         if not is_development:
             logger.critical("META_APP_SECRET is not configured — rejecting Meta webhook (fail closed)")
             return False
@@ -181,13 +184,20 @@ def _verify_meta_request(request: Request, raw_body: bytes) -> bool:
             return True
         return False
 
-    expected = "sha256=" + hmac.new(
-        key=secret.encode("utf-8"),
-        msg=raw_body,
-        digestmod=hashlib.sha256,
-    ).hexdigest()
+    for s in secret_list:
+        expected = "sha256=" + hmac.new(
+            key=s.encode("utf-8"),
+            msg=raw_body,
+            digestmod=hashlib.sha256,
+        ).hexdigest()
+        if hmac.compare_digest(expected, signature):
+            return True
 
-    return hmac.compare_digest(expected, signature)
+    logger.warning(
+        "Meta webhook X-Hub-Signature-256 mismatch! Verified against %d secret(s). Please check META_APP_SECRET in .env.",
+        len(secret_list),
+    )
+    return False
 
 
 def _parse_numeric_budget(val: Any) -> float | None:
