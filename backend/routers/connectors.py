@@ -238,7 +238,8 @@ async def google_calendar_callback(code: str = Query(...), state: str = Query(No
             }).execute()
 
         logger.info("Google Calendar connected successfully")
-        return RedirectResponse(url=f"{settings.FRONTEND_URL}/owner-dashboard/calendar?connected=google_calendar")
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}/owner-dashboard/calendar")
+        # return RedirectResponse(url=f"{settings.FRONTEND_URL}/owner-dashboard/calendar?connected=google_calendar")
     except Exception as e:
         logger.error(f"Google Calendar OAuth error: {e}")
         return RedirectResponse(url=f"{settings.FRONTEND_URL}/owner-dashboard/calendar?error=google_calendar")
