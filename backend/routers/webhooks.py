@@ -1501,6 +1501,8 @@ async def whatsapp_inbound(
                 update_data["location_pref"] = qualifications["location_pref"]
             if qualifications.get("purpose"):
                 update_data["purpose"] = qualifications["purpose"]
+            if qualifications.get("payment_method"):
+                update_data["notes"] = f"Payment Method: {qualifications['payment_method']}"
             if update_data:
                 try:
                     sb.table("leads").update(update_data).eq("id", lead_id).execute()
