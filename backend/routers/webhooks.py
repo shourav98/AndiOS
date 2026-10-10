@@ -251,16 +251,81 @@ def _parse_bedrooms(val: Any) -> int | None:
 
 # ─── Safe Lead Resolution ─────────────────────────────────────────────────────
 
+# Matches legacy "REF-123456" or "Listing #123456" patterns in message body
 _PF_REF_PATTERN = re.compile(r'\b(?:REF[-\s]?|Listing\s*#?\s*)(\d+)\b', re.IGNORECASE)
+
+# Matches Property Finder short-link slug: propertyfinder.ae/go/<SLUG>
+# e.g. https://www.propertyfinder.ae/go/CMVYT7MAQ990YSR4ZYMSG8CG14/en?...
+_PF_GO_SLUG_PATTERN = re.compile(
+    r'propertyfinder\.ae/go/([A-Z0-9]{10,30})',
+    re.IGNORECASE,
+)
+
+# Matches PLP listing numeric ID from full Property Finder listing URL:
+# e.g. /rent/townhouse-for-rent-dubai-...-155075886.html
+_PF_PLP_ID_PATTERN = re.compile(
+    r'propertyfinder\.ae/en/plp/[^\s"]+-(\d{6,12})\.html',
+    re.IGNORECASE,
+)
+
+# Relay messages that Property Finder sends to the AGENT's WhatsApp number.
+# These arrive from PF's system, NOT from a real buyer — they must be silently dropped.
+# Indicators: utm_medium=lead_reply in URL or "Property Finder passed on your enquiry" phrase.
+_PF_RELAY_PATTERNS = [
+    re.compile(r'utm_medium=lead_reply', re.IGNORECASE),
+    re.compile(r'property finder passed on your enquir', re.IGNORECASE),
+    re.compile(r'passed on your enquiry about the following', re.IGNORECASE),
+]
+
+
+def _is_pf_relay_message(body: str) -> bool:
+    """Return True if the message is a Property Finder automated relay to the agent.
+    These should be silently dropped — they are NOT buyer inquiries."""
+    if not body:
+        return False
+    return any(p.search(body) for p in _PF_RELAY_PATTERNS)
+
+
+def _extract_pf_go_slug(body: str) -> str | None:
+    """Extract the unique Property Finder short-link tracking slug from a message body.
+    e.g. 'CMVYT7MAQ990YSR4ZYMSG8CG14' from propertyfinder.ae/go/CMVYT7MAQ990YSR4ZYMSG8CG14/..."""
+    if not body:
+        return None
+    m = _PF_GO_SLUG_PATTERN.search(body)
+    return m.group(1).upper() if m else None
+
+
+def _extract_pf_listing_id(body: str) -> str | None:
+    """Extract numeric listing ID from a full Property Finder PLP URL in the message body.
+    e.g. '155075886' from .../townhouse-for-rent-...-155075886.html"""
+    if not body:
+        return None
+    m = _PF_PLP_ID_PATTERN.search(body)
+    return m.group(1) if m else None
 
 
 def _extract_property_ref_from_wame_body(body: str) -> str | None:
-    """Extract Property Finder or listing reference from inbound message body."""
+    """Extract Property Finder or listing reference from inbound WhatsApp message body.
+
+    Supports three real-world message formats sent by Property Finder:
+    1. Legacy: "REF-123456" or "Listing #123456"
+    2. PF short-link slug: propertyfinder.ae/go/CMVYT7MAQ990YSR4ZYMSG8CG14/...
+    3. Full PLP URL: propertyfinder.ae/en/plp/rent/...-155075886.html
+    """
     if not body:
         return None
+    # Priority 1: legacy REF pattern
     m = _PF_REF_PATTERN.search(body)
     if m:
         return f"REF-{m.group(1)}"
+    # Priority 2: full PLP listing numeric ID
+    plp_id = _extract_pf_listing_id(body)
+    if plp_id:
+        return f"PF-{plp_id}"
+    # Priority 3: PF go-link slug (opaque tracking slug — store as-is)
+    slug = _extract_pf_go_slug(body)
+    if slug:
+        return f"PF-GO-{slug[:16]}"  # truncate to 20 chars for DB column safety
     return None
 
 
@@ -1137,6 +1202,19 @@ async def whatsapp_inbound(
         if not from_phone or not message_body:
             continue
 
+        # ── Property Finder Relay Guard ──────────────────────────────────────────
+        # PF sends an automated relay to the AGENT's number when a buyer enquires.
+        # These messages contain "utm_medium=lead_reply" or "Property Finder passed
+        # on your enquiry..." — they are NOT from a real buyer.
+        # Drop them silently so the AI never replies to PF's own system messages.
+        if _is_pf_relay_message(message_body):
+            logger.info(
+                "[WA] Dropping Property Finder relay/system message from %s "
+                "(utm_medium=lead_reply or relay phrase detected)",
+                f"***{_normalize_phone(from_phone)[-4:]}" if from_phone else "?",
+            )
+            continue
+
         # ── Idempotency: skip already-processed messages (replay protection) ──
         if message_id and not _check_and_mark_message_id(sb, message_id):
             continue
@@ -1246,11 +1324,18 @@ async def whatsapp_inbound(
             if lead is None and resolved_agency_id and match_reason == "unknown":
                 norm_phone = from_phone if from_phone.startswith("+") else f"+{from_phone}"
                 property_ref = _extract_property_ref_from_wame_body(message_body)
+                # Detect if message came via Property Finder WhatsApp lead flow
+                # (buyer message contains propertyfinder.ae/go/<SLUG> + utm_medium=lead_user)
+                is_pf_lead = bool(
+                    _extract_pf_go_slug(message_body) or
+                    "utm_medium=lead_user" in message_body or
+                    "interested in your listing on Property Finder" in message_body
+                )
                 try:
                     new_lead_row = {
                         "name": msg.get("sender_name") or "WhatsApp Lead",
                         "phone": norm_phone,
-                        "source": "whatsapp",
+                        "source": "property_finder" if is_pf_lead else "whatsapp",
                         "status": "new",
                         "ai_stage": "greeting",
                         "is_ai_handling": True,
