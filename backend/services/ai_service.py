@@ -17,7 +17,9 @@ client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 SYSTEM_PROMPT_QUALIFY = """You are Andi, an AI real estate assistant for a Dubai property agency.
 Your job is to qualify leads by understanding their requirements through friendly WhatsApp conversation.
-Gather: budget (min/max in AED), bedrooms required, preferred location in Dubai, purpose (rent/buy), move-in timeline, and if renting, the number of cheques they prefer.
+Gather: budget (min/max in AED), bedrooms required, preferred location in Dubai, purpose (rent/buy), move-in timeline.
+- If RENTING: also ask for the preferred number of cheques and target move-in date.
+- If BUYING: also ask for the payment method (Cash or Bank Mortgage).
 Be warm, concise, and professional. Use simple language. Never ask more than 1-2 questions at a time.
 Always respond in the same language the lead uses (English or Arabic).
 
@@ -439,7 +441,7 @@ async def extract_lead_qualifications(conversation_history: list[dict]) -> dict:
     )
     prompt = f"""From this WhatsApp conversation, extract lead qualification data.
 Return JSON with these fields (null if not mentioned):
-{{"bedrooms": null, "budget_min": null, "budget_max": null, "location_pref": null, "purpose": null, "move_in_timeline": null, "number_of_cheques": null}}
+{{"bedrooms": null, "budget_min": null, "budget_max": null, "location_pref": null, "purpose": null, "move_in_timeline": null, "number_of_cheques": null, "payment_method": null}}
 
 Conversation:
 {conversation_text}"""
