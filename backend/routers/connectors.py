@@ -217,8 +217,8 @@ async def google_calendar_callback(code: str = Query(...), state: str = Query(No
             agent_row = sb.table("agents").select("role").eq("id", target_agent_id).maybe_single().execute()
             target_role = (agent_row.data.get("role") if agent_row and agent_row.data else "agent") or "agent"
             redirect_path = "/owner-dashboard/calendar" if target_role == "owner" else "/agent-dashboard/calendar"
-            logger.info(f"Agent {target_agent_id} Google Calendar connected successfully ({cal_id}) -> redirecting to {redirect_path}")
-            return RedirectResponse(url=f"{settings.FRONTEND_URL}{redirect_path}?connected=google_calendar")
+            base_fe = (settings.FRONTEND_URL or "https://andi-os.netlify.app").rstrip("/")
+            return RedirectResponse(url=f"{base_fe}{redirect_path}?connected=google_calendar")
 
         # Agency-level connection
         existing = sb.table("connectors").select("id").eq("name", "google_calendar").eq("agency_id", agency_id).execute()
@@ -238,11 +238,14 @@ async def google_calendar_callback(code: str = Query(...), state: str = Query(No
             }).execute()
 
         logger.info("Google Calendar connected successfully")
-        return RedirectResponse(url=f"{settings.FRONTEND_URL}owner-dashboard/calendar")
-        # return RedirectResponse(url=f"{settings.FRONTEND_URL}/owner-dashboard/calendar?connected=google_calendar")
+        base_fe = (settings.FRONTEND_URL or "https://andi-os.netlify.app").rstrip("/")
+        return RedirectResponse(url=f"{base_fe}/owner-dashboard/calendar?connected=google_calendar")
     except Exception as e:
-        logger.error(f"Google Calendar OAuth error: {e}")
-        return RedirectResponse(url=f"{settings.FRONTEND_URL}/owner-dashboard/calendar?error=google_calendar")
+        logger.error(f"Google Calendar OAuth error: {e}", exc_info=True)
+        base_fe = (settings.FRONTEND_URL or "https://andi-os.netlify.app").rstrip("/")
+        import urllib.parse
+        err_param = urllib.parse.quote(str(e)[:150]) if str(e) else "google_calendar"
+        return RedirectResponse(url=f"{base_fe}/owner-dashboard/calendar?error={err_param}")
 
 
 @router.post("/google-calendar/disconnect")
