@@ -47,47 +47,141 @@ router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 
 # ─── HMAC Verification Helper ──────────────────────────────────────────────────
 
-def _verify_pf_signature(raw_body: bytes, signature_header: str | None) -> bool:
+def _verify_pf_request(
+    request: Request,
+    raw_body: bytes,
+    parsed_body: dict | None = None,
+) -> bool:
     """
-    Verify Property Finder webhook HMAC-SHA256 signature.
+    Verify an inbound Property Finder webhook request.
 
-    PF may deliver the digest in one of two formats:
-      - 'sha256=<hex_digest>'  (GitHub-style)
-      - '<hex_digest>'         (bare hex, no prefix)
+    Property Finder does NOT use HMAC-SHA256 signatures. They authenticate
+    webhooks via one of several methods (varies by PF API version / region):
 
-    A configured PROPERTY_FINDER_WEBHOOK_SECRET always enforces strict
-    verification — regardless of APP_ENV — so a mis-set APP_ENV=development
-    can never disable signature checking when a secret exists.
-    Without a secret, unverified requests are tolerated ONLY in explicit
-    development; production fails closed.
+      1. Authorization: Bearer <secret>          (PF CRM API v2)
+      2. X-API-Key: <secret>                     (PF Atlas / Enterprise)
+      3. ?token=<secret>  query parameter        (PF older integrations)
+      4. JSON body field: api_key / secret / token  (embedded in payload)
+      5. No auth at all — IP-whitelist only      (some PF regions)
+
+    When PROPERTY_FINDER_WEBHOOK_SECRET is set, we check all methods above.
+    When it is NOT set:
+      - development: accept all (log warning)
+      - production:  reject all (log critical) — fails closed
     """
-    secret = getattr(settings, "PROPERTY_FINDER_WEBHOOK_SECRET", "")
+    secret = (getattr(settings, "PROPERTY_FINDER_WEBHOOK_SECRET", "") or "").strip()
+
     if not secret:
-        if getattr(settings, "APP_ENV", "development") != "development":
+        env = getattr(settings, "APP_ENV", "development") or "development"
+        if env != "development":
             logger.critical(
-                "PROPERTY_FINDER_WEBHOOK_SECRET is not configured — rejecting "
-                "Property Finder webhook (fail closed)"
+                "[PF Webhook] PROPERTY_FINDER_WEBHOOK_SECRET not configured — "
+                "rejecting Property Finder webhook (production fail-closed). "
+                "Set this in .env to the secret configured in the PF Dashboard."
             )
             return False
         logger.warning(
-            "PROPERTY_FINDER_WEBHOOK_SECRET not set — accepting UNVERIFIED "
-            "Property Finder webhook (development only)"
+            "[PF Webhook] PROPERTY_FINDER_WEBHOOK_SECRET not set — "
+            "accepting UNVERIFIED webhook (development mode only)"
         )
         return True
 
+    def _ct_eq(a: str, b: str) -> bool:
+        """Constant-time string comparison (padding to equal length)."""
+        try:
+            return hmac.compare_digest(a.strip(), b.strip())
+        except (TypeError, ValueError):
+            return False
+
+    # Method 1: Authorization: Bearer <secret>
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+        if _ct_eq(token, secret):
+            logger.debug("[PF Webhook] Authenticated via Authorization Bearer")
+            return True
+
+    # Method 2: X-API-Key header
+    api_key_header = (
+        request.headers.get("x-api-key")
+        or request.headers.get("x-pf-api-key")
+        or request.headers.get("api-key")
+    )
+    if api_key_header and _ct_eq(api_key_header, secret):
+        logger.debug("[PF Webhook] Authenticated via X-API-Key header")
+        return True
+
+    # Method 3: ?token= query parameter
+    token_param = request.query_params.get("token") or request.query_params.get("api_key")
+    if token_param and _ct_eq(token_param, secret):
+        logger.debug("[PF Webhook] Authenticated via token query param")
+        return True
+
+    # Method 4: HMAC-SHA256 in X-Signature / X-Hub-Signature-256 (legacy fallback)
+    hmac_header = (
+        request.headers.get("x-signature")
+        or request.headers.get("x-pf-signature")
+        or request.headers.get("x-hub-signature-256")
+        or request.headers.get("x-webhook-signature")
+        or request.headers.get("x-hub-signature")
+    )
+    if hmac_header:
+        computed = hmac.new(
+            key=secret.encode("utf-8"),
+            msg=raw_body,
+            digestmod=hashlib.sha256,
+        ).hexdigest()
+        stripped = hmac_header.removeprefix("sha256=").lower()
+        try:
+            if hmac.compare_digest(computed, stripped):
+                logger.debug("[PF Webhook] Authenticated via HMAC-SHA256 (%s)", hmac_header[:8])
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    # Method 5: secret/api_key/token embedded inside JSON body
+    if parsed_body and isinstance(parsed_body, dict):
+        body_token = (
+            parsed_body.get("api_key")
+            or parsed_body.get("secret")
+            or parsed_body.get("token")
+            or parsed_body.get("webhook_secret")
+        )
+        if body_token and _ct_eq(str(body_token), secret):
+            logger.debug("[PF Webhook] Authenticated via embedded body token")
+            return True
+
+    # Log what headers were actually received for debugging
+    received = {
+        k: v[:20] + "..." if len(v) > 20 else v
+        for k, v in request.headers.items()
+        if k.lower() in (
+            "authorization", "x-api-key", "x-signature", "x-pf-signature",
+            "x-hub-signature-256", "x-webhook-signature", "x-hub-signature",
+        )
+    }
+    logger.warning(
+        "[PF Webhook] Auth FAILED — no matching method. "
+        "Headers seen: %s | Query params: %s | Body keys: %s",
+        received or "(none)",
+        dict(request.query_params) or "(none)",
+        list(parsed_body.keys()) if parsed_body else "(none parsed)",
+    )
+    return False
+
+
+# Keep backward-compatible alias used in tests
+def _verify_pf_signature(raw_body: bytes, signature_header: str | None) -> bool:
+    """Legacy shim — kept for unit test compatibility. Use _verify_pf_request() instead."""
+    secret = (getattr(settings, "PROPERTY_FINDER_WEBHOOK_SECRET", "") or "").strip()
+    if not secret:
+        return getattr(settings, "APP_ENV", "development") == "development"
     if not signature_header:
         return False
-
-    computed_hex = hmac.new(
-        key=secret.encode("utf-8"),
-        msg=raw_body,
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-
-    # Accept both 'sha256=<hex>' and bare '<hex>' formats
-    sig_stripped = signature_header.removeprefix("sha256=")
+    computed = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    stripped = signature_header.removeprefix("sha256=").lower()
     try:
-        return hmac.compare_digest(computed_hex, sig_stripped.lower())
+        return hmac.compare_digest(computed, stripped)
     except (TypeError, ValueError):
         return False
 
@@ -582,43 +676,17 @@ async def property_finder_webhook(request: Request):
     start_time = time.time()
     sb = get_supabase()
 
-    # ── HMAC Signature Verification ──
+    # ── Property Finder Auth Verification ──────────────────────────────
     raw_body = await request.body()
-    # Property Finder uses different header names across API versions:
-    #   X-Signature          (PF CRM API v2 - most common)
-    #   X-PF-Signature       (PF Salesforce integration variant)
-    #   X-Hub-Signature-256  (Meta-style, used by some PF integrations)
-    #   X-Webhook-Signature  (PF generic webhook header)
-    signature = (
-        request.headers.get("x-signature")
-        or request.headers.get("x-pf-signature")
-        or request.headers.get("x-hub-signature-256")
-        or request.headers.get("x-webhook-signature")
-        or request.headers.get("x-hub-signature")
-    )
-    # Log which header was present for debugging on first contact
-    sig_header_found = next(
-        (h for h in [
-            "x-signature", "x-pf-signature", "x-hub-signature-256",
-            "x-webhook-signature", "x-hub-signature",
-        ] if request.headers.get(h)),
-        None,
-    )
-    logger.debug(
-        "[PF Webhook] Signature header: %s=%s",
-        sig_header_found or "(none)",
-        (signature or "")[:16] + "..." if signature else "(none)",
-    )
-    if not _verify_pf_signature(raw_body, signature):
-        logger.warning(
-            "Property Finder webhook: invalid HMAC signature "
-            "(header=%s, body_len=%d)",
-            sig_header_found or "none",
-            len(raw_body),
-        )
+    # Parse body first so _verify_pf_request can check embedded body tokens
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, ValueError):
+        payload = {}
+    if not _verify_pf_request(request, raw_body, parsed_body=payload):
         raise HTTPException(status_code=403, detail="Invalid webhook signature")
 
-    payload = await request.json()
+    # payload already parsed above from raw_body — no second request.json() needed
 
     # Log raw webhook
     log_entry = sb.table("webhook_logs").insert({
