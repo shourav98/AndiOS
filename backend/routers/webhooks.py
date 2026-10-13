@@ -55,117 +55,131 @@ def _verify_pf_request(
     """
     Verify an inbound Property Finder webhook request.
 
-    Property Finder does NOT use HMAC-SHA256 signatures. They authenticate
-    webhooks via one of several methods (varies by PF API version / region):
+    Property Finder does NOT send HMAC signatures or Bearer tokens.
+    Their webhook security model is: the URL itself is secret (obscurity).
+    Optionally, operators may append ?token=<secret> to the webhook URL
+    configured in the PF dashboard, which we then validate.
 
-      1. Authorization: Bearer <secret>          (PF CRM API v2)
-      2. X-API-Key: <secret>                     (PF Atlas / Enterprise)
-      3. ?token=<secret>  query parameter        (PF older integrations)
-      4. JSON body field: api_key / secret / token  (embedded in payload)
-      5. No auth at all — IP-whitelist only      (some PF regions)
+    Auth priority:
+      1. ?token= / ?api_key= query param matches PROPERTY_FINDER_WEBHOOK_SECRET
+      2. Authorization: Bearer <secret> header matches
+      3. X-API-Key / X-Signature header matches (HMAC or plain)
+      4. JSON body contains api_key/secret/token field that matches
+      5. No PROPERTY_FINDER_WEBHOOK_SECRET configured AND body looks like
+         a valid PF event envelope — accept with a warning (PF sends no auth)
 
-    When PROPERTY_FINDER_WEBHOOK_SECRET is set, we check all methods above.
-    When it is NOT set:
-      - development: accept all (log warning)
-      - production:  reject all (log critical) — fails closed
+    When PROPERTY_FINDER_WEBHOOK_SECRET is set, steps 1-4 must match.
+    When it is NOT set, step 5 applies (accept all valid PF-shaped requests).
     """
     secret = (getattr(settings, "PROPERTY_FINDER_WEBHOOK_SECRET", "") or "").strip()
 
-    if not secret:
-        env = getattr(settings, "APP_ENV", "development") or "development"
-        if env != "development":
-            logger.critical(
-                "[PF Webhook] PROPERTY_FINDER_WEBHOOK_SECRET not configured — "
-                "rejecting Property Finder webhook (production fail-closed). "
-                "Set this in .env to the secret configured in the PF Dashboard."
-            )
-            return False
-        logger.warning(
-            "[PF Webhook] PROPERTY_FINDER_WEBHOOK_SECRET not set — "
-            "accepting UNVERIFIED webhook (development mode only)"
-        )
-        return True
-
     def _ct_eq(a: str, b: str) -> bool:
-        """Constant-time string comparison (padding to equal length)."""
         try:
             return hmac.compare_digest(a.strip(), b.strip())
         except (TypeError, ValueError):
             return False
 
-    # Method 1: Authorization: Bearer <secret>
-    auth_header = request.headers.get("authorization", "")
-    if auth_header.lower().startswith("bearer "):
-        token = auth_header[7:].strip()
-        if _ct_eq(token, secret):
-            logger.debug("[PF Webhook] Authenticated via Authorization Bearer")
+    def _is_pf_envelope(body: dict | None) -> bool:
+        """Returns True if body looks like a PF webhook event envelope."""
+        if not isinstance(body, dict):
+            return False
+        # PF envelope always has: id, type, timestamp, entity, payload
+        pf_keys = {"id", "type", "timestamp"}
+        return bool(pf_keys.issubset(body.keys()))
+
+    # ── If secret IS configured: require it via one of several methods ──────
+    if secret:
+        # Method 1: ?token= or ?api_key= query parameter (recommended for PF)
+        token_param = (
+            request.query_params.get("token")
+            or request.query_params.get("api_key")
+        )
+        if token_param and _ct_eq(token_param, secret):
+            logger.debug("[PF Webhook] Authenticated via token query param")
             return True
 
-    # Method 2: X-API-Key header
-    api_key_header = (
-        request.headers.get("x-api-key")
-        or request.headers.get("x-pf-api-key")
-        or request.headers.get("api-key")
-    )
-    if api_key_header and _ct_eq(api_key_header, secret):
-        logger.debug("[PF Webhook] Authenticated via X-API-Key header")
-        return True
-
-    # Method 3: ?token= query parameter
-    token_param = request.query_params.get("token") or request.query_params.get("api_key")
-    if token_param and _ct_eq(token_param, secret):
-        logger.debug("[PF Webhook] Authenticated via token query param")
-        return True
-
-    # Method 4: HMAC-SHA256 in X-Signature / X-Hub-Signature-256 (legacy fallback)
-    hmac_header = (
-        request.headers.get("x-signature")
-        or request.headers.get("x-pf-signature")
-        or request.headers.get("x-hub-signature-256")
-        or request.headers.get("x-webhook-signature")
-        or request.headers.get("x-hub-signature")
-    )
-    if hmac_header:
-        computed = hmac.new(
-            key=secret.encode("utf-8"),
-            msg=raw_body,
-            digestmod=hashlib.sha256,
-        ).hexdigest()
-        stripped = hmac_header.removeprefix("sha256=").lower()
-        try:
-            if hmac.compare_digest(computed, stripped):
-                logger.debug("[PF Webhook] Authenticated via HMAC-SHA256 (%s)", hmac_header[:8])
+        # Method 2: Authorization: Bearer <secret>
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+            if _ct_eq(token, secret):
+                logger.debug("[PF Webhook] Authenticated via Authorization Bearer")
                 return True
-        except (TypeError, ValueError):
-            pass
 
-    # Method 5: secret/api_key/token embedded inside JSON body
-    if parsed_body and isinstance(parsed_body, dict):
-        body_token = (
-            parsed_body.get("api_key")
-            or parsed_body.get("secret")
-            or parsed_body.get("token")
-            or parsed_body.get("webhook_secret")
+        # Method 3: X-API-Key header
+        api_key_header = (
+            request.headers.get("x-api-key")
+            or request.headers.get("x-pf-api-key")
+            or request.headers.get("api-key")
         )
-        if body_token and _ct_eq(str(body_token), secret):
-            logger.debug("[PF Webhook] Authenticated via embedded body token")
+        if api_key_header and _ct_eq(api_key_header, secret):
+            logger.debug("[PF Webhook] Authenticated via X-API-Key header")
             return True
 
-    # Log what headers were actually received for debugging
-    received = {
-        k: v[:20] + "..." if len(v) > 20 else v
-        for k, v in request.headers.items()
-        if k.lower() in (
-            "authorization", "x-api-key", "x-signature", "x-pf-signature",
-            "x-hub-signature-256", "x-webhook-signature", "x-hub-signature",
+        # Method 4: HMAC signature in X-Signature / X-Hub-Signature-256
+        hmac_header = (
+            request.headers.get("x-signature")
+            or request.headers.get("x-pf-signature")
+            or request.headers.get("x-hub-signature-256")
+            or request.headers.get("x-webhook-signature")
         )
-    }
+        if hmac_header:
+            computed = hmac.new(
+                key=secret.encode("utf-8"),
+                msg=raw_body,
+                digestmod=hashlib.sha256,
+            ).hexdigest()
+            stripped = hmac_header.removeprefix("sha256=").lower()
+            try:
+                if hmac.compare_digest(computed, stripped):
+                    logger.debug("[PF Webhook] Authenticated via HMAC-SHA256")
+                    return True
+            except (TypeError, ValueError):
+                pass
+
+        # Method 5: secret embedded in JSON body
+        if parsed_body and isinstance(parsed_body, dict):
+            body_token = (
+                parsed_body.get("api_key")
+                or parsed_body.get("secret")
+                or parsed_body.get("token")
+                or parsed_body.get("webhook_secret")
+            )
+            if body_token and _ct_eq(str(body_token), secret):
+                logger.debug("[PF Webhook] Authenticated via embedded body token")
+                return True
+
+        # Secret IS set but no method matched — reject
+        logger.warning(
+            "[PF Webhook] Auth FAILED — PROPERTY_FINDER_WEBHOOK_SECRET is set "
+            "but no matching auth method found. "
+            "Add ?token=<secret> to your PF dashboard webhook URL. "
+            "Headers: %s | Query params: %s | Body keys: %s",
+            {k: v[:12]+"..." for k, v in request.headers.items()
+             if k.lower() in ("authorization", "x-api-key", "x-signature")} or "(none)",
+            dict(request.query_params) or "(none)",
+            list(parsed_body.keys()) if parsed_body else "(none)",
+        )
+        return False
+
+    # ── No secret configured: accept valid PF envelope shapes ──────────────
+    # PF sends webhooks with no auth headers — their security is URL-secrecy.
+    # We accept if the body looks like a genuine PF event envelope.
+    if _is_pf_envelope(parsed_body):
+        logger.warning(
+            "[PF Webhook] PROPERTY_FINDER_WEBHOOK_SECRET not set — accepting "
+            "unverified PF webhook (body keys: %s). "
+            "RECOMMENDED: append ?token=<secret> to the PF dashboard webhook URL "
+            "and set PROPERTY_FINDER_WEBHOOK_SECRET=<secret> in .env",
+            list(parsed_body.keys()),
+        )
+        return True
+
+    # Not a PF envelope and no secret — reject
     logger.warning(
-        "[PF Webhook] Auth FAILED — no matching method. "
-        "Headers seen: %s | Query params: %s | Body keys: %s",
-        received or "(none)",
-        dict(request.query_params) or "(none)",
-        list(parsed_body.keys()) if parsed_body else "(none parsed)",
+        "[PF Webhook] Auth FAILED — no secret configured and body does not "
+        "look like a PF event. Body keys: %s",
+        list(parsed_body.keys()) if parsed_body else "(empty)",
     )
     return False
 
@@ -698,11 +712,29 @@ async def property_finder_webhook(request: Request):
 
     try:
         # ── Parse Property Finder payload ──
-        # Standard PF lead webhook format (handles flat, {"lead": {...}}, or {"leads": [{...}]})
-        if isinstance(payload.get("leads"), list) and len(payload["leads"]) > 0:
+        # PF Webhooks API sends an event envelope:
+        #   {"id": "...", "type": "lead.created", "timestamp": "...",
+        #    "entity": "lead", "payload": { <actual lead fields> }}
+        # We must unwrap payload["payload"] first, then fall back to
+        # legacy flat / {"lead": {...}} / {"leads": [...]} formats.
+
+        # Format 1: PF event envelope (new format — confirmed from production logs)
+        if "payload" in payload and isinstance(payload["payload"], dict):
+            lead_data = payload["payload"]
+            # Also log the event type for observability
+            event_type = payload.get("type", "unknown")
+            logger.info("[PF Webhook] Event type: %s, entity: %s", event_type, payload.get("entity"))
+            # Skip non-lead events (e.g. listing updates, status changes)
+            if event_type and "lead" not in event_type.lower() and payload.get("entity", "").lower() not in ("lead", "inquiry", ""):
+                logger.info("[PF Webhook] Ignoring non-lead event type: %s", event_type)
+                return api_success(message="Non-lead event ignored", data={"event_type": event_type})
+        # Format 2: {"leads": [{...}, ...]}
+        elif isinstance(payload.get("leads"), list) and len(payload["leads"]) > 0:
             lead_data = payload["leads"][0]
+        # Format 3: {"lead": {...}}
         elif isinstance(payload.get("lead"), dict):
             lead_data = payload["lead"]
+        # Format 4: flat root object
         else:
             lead_data = payload
 
