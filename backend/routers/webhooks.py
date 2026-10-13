@@ -1361,6 +1361,21 @@ async def whatsapp_inbound(
                         pname = c.get("profile", {}).get("name")
                         if wa and pname:
                             contact_names[str(wa)] = str(pname)
+                    for s in val.get("statuses", []):
+                        s_id = s.get("id")
+                        s_stat = s.get("status")
+                        s_recipient = s.get("recipient_id")
+                        s_errors = s.get("errors")
+                        if s_errors:
+                            logger.error(
+                                "[Meta Delivery Error] msg_id=%s to=%s status=%s errors=%s",
+                                s_id, s_recipient, s_stat, s_errors,
+                            )
+                        else:
+                            logger.info(
+                                "[Meta Delivery Status] msg_id=%s to=%s status=%s",
+                                s_id, s_recipient, s_stat,
+                            )
                     if field == "smb_message_echoes" or "message_echoes" in val:
                         await _handle_smb_message_echoes(sb, val)
                     elif field == "account_update":
