@@ -50,7 +50,10 @@ router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 def _verify_pf_signature(raw_body: bytes, signature_header: str | None) -> bool:
     """
     Verify Property Finder webhook HMAC-SHA256 signature.
-    Header format: 'sha256=<hex_digest>' over the raw request body.
+
+    PF may deliver the digest in one of two formats:
+      - 'sha256=<hex_digest>'  (GitHub-style)
+      - '<hex_digest>'         (bare hex, no prefix)
 
     A configured PROPERTY_FINDER_WEBHOOK_SECRET always enforces strict
     verification — regardless of APP_ENV — so a mis-set APP_ENV=development
@@ -74,12 +77,19 @@ def _verify_pf_signature(raw_body: bytes, signature_header: str | None) -> bool:
 
     if not signature_header:
         return False
-    expected = "sha256=" + hmac.new(
+
+    computed_hex = hmac.new(
         key=secret.encode("utf-8"),
         msg=raw_body,
         digestmod=hashlib.sha256,
     ).hexdigest()
-    return hmac.compare_digest(expected, signature_header)
+
+    # Accept both 'sha256=<hex>' and bare '<hex>' formats
+    sig_stripped = signature_header.removeprefix("sha256=")
+    try:
+        return hmac.compare_digest(computed_hex, sig_stripped.lower())
+    except (TypeError, ValueError):
+        return False
 
 
 # ─── WhatsApp Inbound Authentication ──────────────────────────────────────────
@@ -574,9 +584,38 @@ async def property_finder_webhook(request: Request):
 
     # ── HMAC Signature Verification ──
     raw_body = await request.body()
-    signature = request.headers.get("X-Hub-Signature-256") or request.headers.get("x-hub-signature-256")
+    # Property Finder uses different header names across API versions:
+    #   X-Signature          (PF CRM API v2 - most common)
+    #   X-PF-Signature       (PF Salesforce integration variant)
+    #   X-Hub-Signature-256  (Meta-style, used by some PF integrations)
+    #   X-Webhook-Signature  (PF generic webhook header)
+    signature = (
+        request.headers.get("x-signature")
+        or request.headers.get("x-pf-signature")
+        or request.headers.get("x-hub-signature-256")
+        or request.headers.get("x-webhook-signature")
+        or request.headers.get("x-hub-signature")
+    )
+    # Log which header was present for debugging on first contact
+    sig_header_found = next(
+        (h for h in [
+            "x-signature", "x-pf-signature", "x-hub-signature-256",
+            "x-webhook-signature", "x-hub-signature",
+        ] if request.headers.get(h)),
+        None,
+    )
+    logger.debug(
+        "[PF Webhook] Signature header: %s=%s",
+        sig_header_found or "(none)",
+        (signature or "")[:16] + "..." if signature else "(none)",
+    )
     if not _verify_pf_signature(raw_body, signature):
-        logger.warning("Property Finder webhook: invalid HMAC signature")
+        logger.warning(
+            "Property Finder webhook: invalid HMAC signature "
+            "(header=%s, body_len=%d)",
+            sig_header_found or "none",
+            len(raw_body),
+        )
         raise HTTPException(status_code=403, detail="Invalid webhook signature")
 
     payload = await request.json()

@@ -220,22 +220,15 @@ async def google_calendar_callback(code: str = Query(...), state: str = Query(No
             base_fe = (settings.FRONTEND_URL or "https://andi-os.netlify.app").rstrip("/")
             return RedirectResponse(url=f"{base_fe}{redirect_path}?connected=google_calendar")
 
-        # Agency-level connection
-        existing = sb.table("connectors").select("id").eq("name", "google_calendar").eq("agency_id", agency_id).execute()
-        if existing.data:
-            sb.table("connectors").update({
-                "is_connected": True,
-                "auth_data": tokens,
-                "last_sync": "now()",
-            }).eq("id", existing.data[0]["id"]).execute()
-        else:
-            sb.table("connectors").insert({
-                "name": "google_calendar",
-                "agency_id": agency_id,
-                "is_connected": True,
-                "auth_data": tokens,
-                "last_sync": "now()",
-            }).execute()
+        # Agency-level connection — use upsert to avoid duplicate key on reconnect
+        # (race condition: disconnect → reconnect can arrive before select completes)
+        sb.table("connectors").upsert({
+            "name": "google_calendar",
+            "agency_id": agency_id,
+            "is_connected": True,
+            "auth_data": tokens,
+            "last_sync": "now()",
+        }, on_conflict="name,agency_id").execute()
 
         logger.info("Google Calendar connected successfully")
         base_fe = (settings.FRONTEND_URL or "https://andi-os.netlify.app").rstrip("/")
