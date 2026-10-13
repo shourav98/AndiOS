@@ -824,6 +824,7 @@ async def property_finder_webhook(request: Request):
             property_ref=property_ref or None,
             agent_phone=str(agent_phone) if agent_phone else None,
             agent_email=agent_email,
+            pf_profile_id=pf_agent_profile_id,
         )
         if not agency_id:
             raise ValueError("Could not resolve agency for inbound lead")
