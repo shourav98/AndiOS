@@ -738,22 +738,63 @@ async def property_finder_webhook(request: Request):
         else:
             lead_data = payload
 
+        # Log the full lead_data structure so we can identify PF's actual field names
+        logger.info("[PF Webhook] lead_data keys: %s", list(lead_data.keys()) if isinstance(lead_data, dict) else lead_data)
+
         external_id = str(
             lead_data.get("id") or
             lead_data.get("lead_id") or
             lead_data.get("reference", "")
         )
-        name = lead_data.get("name") or f"{lead_data.get('first_name', '')} {lead_data.get('last_name', '')}".strip()
-        phone = str(lead_data.get("phone") or lead_data.get("mobile") or lead_data.get("telephone", ""))
-        email = lead_data.get("email", "")
-        property_ref = str(lead_data.get("property_ref") or lead_data.get("listing_id") or lead_data.get("reference_no", ""))
+        name = (
+            lead_data.get("name")
+            or lead_data.get("full_name")
+            or lead_data.get("buyer_name")
+            or f"{lead_data.get('first_name', '')} {lead_data.get('last_name', '')}".strip()
+        )
+        # PF uses many phone field names — check all variants including nested objects
+        def _extract_phone(d: dict) -> str:
+            """Extract phone from flat or nested PF lead dict."""
+            direct = (
+                d.get("phone") or d.get("mobile") or d.get("telephone")
+                or d.get("phone_number") or d.get("mobile_number")
+                or d.get("contact_number") or d.get("buyer_phone")
+                or d.get("user_phone") or d.get("from_phone")
+            )
+            if direct:
+                return str(direct)
+            # Check nested contact / buyer / user / from objects
+            for nested_key in ("contact", "buyer", "user", "sender", "from", "lead_user"):
+                nested = d.get(nested_key)
+                if isinstance(nested, dict):
+                    n = _extract_phone(nested)
+                    if n:
+                        return n
+            return ""
+
+        phone = _extract_phone(lead_data)
+        email = (
+            lead_data.get("email") or lead_data.get("email_address")
+            or (lead_data.get("contact") or {}).get("email", "") if isinstance(lead_data.get("contact"), dict) else lead_data.get("email", "")
+        )
+        property_ref = str(
+            lead_data.get("property_ref") or lead_data.get("listing_id")
+            or lead_data.get("reference_no") or lead_data.get("property_id")
+            or lead_data.get("listing_reference") or ""
+        )
         property_address = lead_data.get("property_title") or lead_data.get("property_address", "")
         bedrooms = lead_data.get("bedrooms")
         budget = lead_data.get("budget") or lead_data.get("price")
         location = lead_data.get("community") or lead_data.get("location") or lead_data.get("area", "")
 
         if not phone:
+            # Log full lead_data to diagnose which field PF is using
+            logger.error(
+                "[PF Webhook] No phone found in lead_data. Full lead_data: %s",
+                lead_data,
+            )
             raise ValueError("No phone number in webhook payload")
+
 
         # ── Resolve agency + agent ──
         agent_phone = lead_data.get("agent_phone") or lead_data.get("listing_agent_phone")
