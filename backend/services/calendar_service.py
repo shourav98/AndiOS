@@ -316,6 +316,7 @@ def get_calendar_token_for_agent_or_agency(
     mode = getattr(settings, "GOOGLE_CALENDAR_MODE", "shared")
 
     def _get_agency_token():
+        # 1. Exact match for target agency
         connector = (
             sb.table("connectors")
             .select("auth_data")
@@ -325,6 +326,28 @@ def get_calendar_token_for_agent_or_agency(
             .limit(1)
             .execute()
         )
+        # 2. Fallback to DEFAULT_AGENCY_ID if configured and different
+        if (not connector.data or not connector.data[0].get("auth_data")) and getattr(settings, "DEFAULT_AGENCY_ID", None) and settings.DEFAULT_AGENCY_ID != agency_id:
+            connector = (
+                sb.table("connectors")
+                .select("auth_data")
+                .eq("name", "google_calendar")
+                .eq("agency_id", settings.DEFAULT_AGENCY_ID)
+                .eq("is_connected", True)
+                .limit(1)
+                .execute()
+            )
+        # 3. Fallback to any connected Google Calendar connector in the system
+        if not connector.data or not connector.data[0].get("auth_data"):
+            connector = (
+                sb.table("connectors")
+                .select("auth_data")
+                .eq("name", "google_calendar")
+                .eq("is_connected", True)
+                .limit(1)
+                .execute()
+            )
+
         if connector.data and connector.data[0].get("auth_data"):
             raw_auth = connector.data[0]["auth_data"]
             token_dict = None
