@@ -220,15 +220,46 @@ async def google_calendar_callback(code: str = Query(...), state: str = Query(No
             base_fe = (settings.FRONTEND_URL or "https://andi-os.netlify.app").rstrip("/")
             return RedirectResponse(url=f"{base_fe}{redirect_path}?connected=google_calendar")
 
-        # Agency-level connection — use upsert to avoid duplicate key on reconnect
-        # (race condition: disconnect → reconnect can arrive before select completes)
-        sb.table("connectors").upsert({
-            "name": "google_calendar",
-            "agency_id": agency_id,
-            "is_connected": True,
-            "auth_data": tokens,
-            "last_sync": "now()",
-        }, on_conflict="name,agency_id").execute()
+        # Agency-level connection — look up existing connector by name + agency_id, or unassigned fallback
+        existing = (
+            sb.table("connectors")
+            .select("id")
+            .eq("name", "google_calendar")
+            .eq("agency_id", agency_id)
+            .limit(1)
+            .execute()
+        )
+        if existing and existing.data:
+            sb.table("connectors").update({
+                "is_connected": True,
+                "auth_data": tokens,
+                "last_sync": "now()",
+            }).eq("id", existing.data[0]["id"]).execute()
+        else:
+            # Check if there is an unassociated/seeded row
+            existing_unassigned = (
+                sb.table("connectors")
+                .select("id")
+                .eq("name", "google_calendar")
+                .is_("agency_id", "null")
+                .limit(1)
+                .execute()
+            )
+            if existing_unassigned and existing_unassigned.data:
+                sb.table("connectors").update({
+                    "agency_id": agency_id,
+                    "is_connected": True,
+                    "auth_data": tokens,
+                    "last_sync": "now()",
+                }).eq("id", existing_unassigned.data[0]["id"]).execute()
+            else:
+                sb.table("connectors").insert({
+                    "name": "google_calendar",
+                    "agency_id": agency_id,
+                    "is_connected": True,
+                    "auth_data": tokens,
+                    "last_sync": "now()",
+                }).execute()
 
         logger.info("Google Calendar connected successfully")
         base_fe = (settings.FRONTEND_URL or "https://andi-os.netlify.app").rstrip("/")

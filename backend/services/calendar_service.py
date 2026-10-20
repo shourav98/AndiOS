@@ -126,7 +126,13 @@ def get_available_slots(
             "items": [{"id": calendar_id}],
         }
         freebusy = service.freebusy().query(body=body).execute()
-        busy_times = freebusy["calendars"].get(calendar_id, {}).get("busy", [])
+        cal_data = freebusy.get("calendars", {}).get(calendar_id, {})
+        if cal_data.get("errors") and calendar_id != "primary":
+            logger.warning(f"Freebusy for {calendar_id} returned errors, falling back to 'primary'")
+            body["items"] = [{"id": "primary"}]
+            freebusy = service.freebusy().query(body=body).execute()
+            cal_data = freebusy.get("calendars", {}).get("primary", {})
+        busy_times = cal_data.get("busy", [])
 
         # Generate slots (9am-6pm, every hour)
         slots = []
@@ -259,9 +265,27 @@ def create_viewing_event(
 
         try:
             created = service.events().insert(**insert_kwargs).execute()
-        except Exception as conf_err:
-            if create_meet_link:
-                logger.warning(f"Google Meet conference creation failed ({conf_err}), retrying standard event...")
+        except Exception as err:
+            err_str = str(err).lower()
+            # If the specified calendarId returned 404 Not Found, fall back to 'primary'
+            if ("not found" in err_str or "notfound" in err_str or "404" in err_str) and insert_kwargs.get("calendarId") != "primary":
+                logger.warning(
+                    f"Calendar '{insert_kwargs.get('calendarId')}' not found for authenticated Google account. "
+                    f"Falling back to 'primary' calendar."
+                )
+                insert_kwargs["calendarId"] = "primary"
+                try:
+                    created = service.events().insert(**insert_kwargs).execute()
+                except Exception as meet_err:
+                    if create_meet_link:
+                        logger.warning(f"Google Meet conference creation on primary failed ({meet_err}), retrying standard event...")
+                        insert_kwargs.pop("conferenceDataVersion", None)
+                        event.pop("conferenceData", None)
+                        created = service.events().insert(**insert_kwargs).execute()
+                    else:
+                        raise
+            elif create_meet_link:
+                logger.warning(f"Google Meet conference creation failed ({err}), retrying standard event...")
                 insert_kwargs.pop("conferenceDataVersion", None)
                 event.pop("conferenceData", None)
                 created = service.events().insert(**insert_kwargs).execute()
@@ -316,6 +340,7 @@ def get_calendar_token_for_agent_or_agency(
     mode = getattr(settings, "GOOGLE_CALENDAR_MODE", "shared")
 
     def _get_agency_token():
+        # 1. Exact match for target agency
         connector = (
             sb.table("connectors")
             .select("auth_data")
@@ -325,6 +350,28 @@ def get_calendar_token_for_agent_or_agency(
             .limit(1)
             .execute()
         )
+        # 2. Fallback to DEFAULT_AGENCY_ID if configured and different
+        if (not connector.data or not connector.data[0].get("auth_data")) and getattr(settings, "DEFAULT_AGENCY_ID", None) and settings.DEFAULT_AGENCY_ID != agency_id:
+            connector = (
+                sb.table("connectors")
+                .select("auth_data")
+                .eq("name", "google_calendar")
+                .eq("agency_id", settings.DEFAULT_AGENCY_ID)
+                .eq("is_connected", True)
+                .limit(1)
+                .execute()
+            )
+        # 3. Fallback to any connected Google Calendar connector in the system
+        if not connector.data or not connector.data[0].get("auth_data"):
+            connector = (
+                sb.table("connectors")
+                .select("auth_data")
+                .eq("name", "google_calendar")
+                .eq("is_connected", True)
+                .limit(1)
+                .execute()
+            )
+
         if connector.data and connector.data[0].get("auth_data"):
             raw_auth = connector.data[0]["auth_data"]
             token_dict = None
