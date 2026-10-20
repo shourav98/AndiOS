@@ -146,8 +146,9 @@ app = FastAPI(
 def _cors_allow_origins() -> list[str]:
     origins = []
 
-    # Always allow the production Netlify frontend
-    origins.append("https://andi-os.netlify.app")
+    # Always allow the production frontend
+    origins.append("https://andios.ae")
+    origins.append("https://www.andios.ae")
 
     if settings.FRONTEND_URL:
         for url in str(settings.FRONTEND_URL).split(","):
