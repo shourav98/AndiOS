@@ -16,8 +16,7 @@ def test_privacy_policy_html_endpoint():
     assert "Privacy Policy" in response.text
     assert "AndiOS" in response.text
     assert "WhatsApp" in response.text
-    assert "September 18, 2026" in response.text
-    assert "privacy@andios.com" in response.text
+    assert "hello@funkydiandi.com" in response.text
 
 
 def test_privacy_policy_alias_html_endpoint():
@@ -37,9 +36,9 @@ def test_privacy_policy_json_endpoint():
     assert data["status"] == 200
     assert "data" in data
     policy_data = data["data"]
-    assert policy_data["title"] == "Privacy Policy"
-    assert policy_data["effective_date"] == "September 18, 2026"
-    assert len(policy_data["sections"]) >= 19
+    assert policy_data["title"] == "AndiOS Privacy Policy"
+    assert policy_data["effective_date"] == "October 20, 2026"
+    assert len(policy_data["sections"]) >= 12
 
 
 def test_privacy_policy_alias_json_endpoint():
@@ -49,4 +48,4 @@ def test_privacy_policy_alias_json_endpoint():
     data = response.json()
     assert data["success"] is True
     assert data["status"] == 200
-    assert data["data"]["title"] == "Privacy Policy"
+    assert data["data"]["title"] == "AndiOS Privacy Policy"

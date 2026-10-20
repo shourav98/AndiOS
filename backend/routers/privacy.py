@@ -1,6 +1,7 @@
 """
 Privacy Policy Router for AndiOS
-Provides both HTML web page (for Meta/public verification) and JSON API endpoints.
+Provides both an exact-replica HTML web page (matching the official PDF policy document)
+and structured JSON API endpoints.
 """
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -9,486 +10,755 @@ from utils.response import api_success
 router = APIRouter(tags=["Legal & Compliance"])
 
 PRIVACY_POLICY_DATA = {
-    "title": "Privacy Policy",
-    "effective_date": "September 18, 2026",
-    "last_updated": "September 18, 2026",
+    "title": "AndiOS Privacy Policy",
+    "effective_date": "October 20, 2026",
+    "last_updated": "October 20, 2026",
     "company": {
-        "name": "AndiOS Technologies",
-        "email": "privacy@andios.com",
-        "website": "https://andi-os.netlify.app",
-        "address": "Dubai, United Arab Emirates",
+        "name": "Funky Di Andi for Online Selling",
+        "legal_name": "Funky Di Andi for Online Selling (Sole Establishment)",
+        "licence": "Dubai DET Licence No. 1582068",
+        "email": "hello@funkydiandi.com",
+        "phone": "+971 55 109 4841",
+        "website": "https://andios.ae",
+        "address": "Villa 103, New Dubai, P.O. Box 12345, Dubai, UAE",
     },
-    "introduction": (
-        "AndiOS (\"AndiOS\", \"we\", \"our\", or \"us\") is committed to protecting the privacy and security "
-        "of information processed through our website, application, and services (collectively, the \"Services\"). "
-        "This Privacy Policy explains what information we collect, how we use it, how we protect it, when we may "
-        "share it, and the choices available to you when using AndiOS. By accessing or using the Services, you "
-        "acknowledge that you have read and understood this Privacy Policy."
-    ),
     "sections": [
         {
             "id": 1,
-            "title": "1. About AndiOS",
+            "title": "1. Who we are and what this policy covers",
             "content": (
-                "AndiOS is a business-to-business real-estate CRM and automation platform designed to help real-estate "
-                "agencies manage their teams, agents, brands, leads, contacts, properties, communications, subscriptions, "
-                "and related business operations.\n\n"
-                "Organizations using AndiOS may enter or upload information relating to their agents, employees, customers, "
-                "leads, prospects, property owners, buyers, sellers, and other business contacts.\n\n"
-                "For information that an organization enters into AndiOS on behalf of its customers, leads, or other individuals, "
-                "the organization may determine the purposes and means of processing, while AndiOS processes that information "
-                "to provide the Services."
+                "AndiOS is an AI operating system for real estate brokerages in the UAE. It is operated by Funky Di Andi for Online Selling, "
+                "a sole establishment registered in Dubai, UAE, under Department of Economy and Tourism licence no. 1582068, with its "
+                "registered address at Villa 103, New Dubai, P.O. Box 12345, Dubai, UAE (\"AndiOS\", \"we\", \"us\").\n\n"
+                "This policy explains how we collect, use, share and protect personal data when you:\n"
+                "• visit andios.ae or contact us through it\n"
+                "• request a demo, sign up for early access or become a customer\n"
+                "• use the AndiOS platform as a brokerage owner, manager or agent\n"
+                "• interact with a brokerage that uses AndiOS, for example by messaging it on WhatsApp or receiving a call from its AI assistant\n\n"
+                "Our two roles. For website visitors, prospects and our own customer accounts, we decide how your data is used, so we are the controller. "
+                "For the leads, clients, owners and tenants that a brokerage manages inside AndiOS, the brokerage is the controller and we act as its processor: "
+                "we handle that data only on the brokerage's instructions and under our customer agreement. Our customers own their client data. We do not sell it, "
+                "and we do not use one brokerage's client data to market to anyone or to benefit another brokerage.\n\n"
+                "If you are a brokerage's client and have a question about your data, contact that brokerage first. We will help them respond."
             )
         },
         {
             "id": 2,
-            "title": "2. Information We Collect",
-            "subsections": [
-                {
-                    "title": "2.1 Account and Profile Information",
-                    "items": [
-                        "Full name",
-                        "Email address",
-                        "Phone number",
-                        "Password or authentication information",
-                        "Profile information",
-                        "Company or agency name",
-                        "Business information",
-                        "Role or position within an organization",
-                        "Account preferences",
-                        "Login and authentication information"
+            "title": "2. Information we collect",
+            "table": {
+                "headers": ["Who", "What we collect", "How we get it"],
+                "rows": [
+                    [
+                        "Website visitors",
+                        "IP address, browser and device type, time of visit",
+                        "Automatically, in our hosting provider's server logs"
+                    ],
+                    [
+                        "Prospects and demo requests",
+                        "Name, email, phone or WhatsApp number, brokerage name, role, team size, messages you send us",
+                        "Forms on andios.ae, email, WhatsApp, calls"
+                    ],
+                    [
+                        "Customer account users (owners, managers, agents)",
+                        "Name, work email, phone, role, RERA or BRN number if provided, login details, billing contact, usage and activity logs, support conversations",
+                        "You or your brokerage when the account is set up, and your use of the platform"
+                    ],
+                    [
+                        "Brokerage clients and leads (processed for our customers)",
+                        "Name, phone, email, WhatsApp messages, property interests and requirements, budget, viewing appointments, notes added by agents, listing and transaction details",
+                        "The brokerage, connected channels (WhatsApp, phone, calendar), and the client's own messages"
+                    ],
+                    [
+                        "Payment information",
+                        "Billing name and address, invoice history",
+                        "Our payment provider handles card details; we do not store full card numbers"
                     ]
-                },
-                {
-                    "title": "2.2 Agency and Team Information",
-                    "items": [
-                        "Agency information",
-                        "Brand information",
-                        "Office or business details",
-                        "Agent names and contact details",
-                        "Agent roles and permissions",
-                        "Team membership",
-                        "Subscription and plan information",
-                        "Usage and account activity"
-                    ]
-                },
-                {
-                    "title": "2.3 CRM and Real-Estate Data",
-                    "content": (
-                        "Depending on the features used by an organization, AndiOS may process: lead and contact information, "
-                        "names, email addresses, phone numbers, property information, property preferences, buyer and seller information, "
-                        "notes and follow-up information, communication history, appointment information, agent activity, lead qualification "
-                        "information, CRM records, and related business information. Organizations are responsible for ensuring that they "
-                        "have an appropriate legal basis and authorization to collect and process information they upload to AndiOS."
-                    )
-                },
-                {
-                    "title": "2.4 Communication Data",
-                    "content": (
-                        "If communication features are enabled, AndiOS may process information associated with: WhatsApp messages, "
-                        "SMS messages, voice calls, call metadata, call recordings (where applicable and legally permitted), transcriptions, "
-                        "appointment and scheduling information, automated messages, AI-generated responses, and communication history. "
-                        "The availability and exact processing of this information depends on the communication services and integrations "
-                        "configured by the organization."
-                    )
-                },
-                {
-                    "title": "2.5 Payment and Subscription Information",
-                    "content": (
-                        "When an organization purchases a subscription, plan, add-on, or other paid service, we may process information "
-                        "relating to: subscription plan, billing status, transaction information, invoice information, payment status, "
-                        "subscription dates, and usage and billing-related records. Payment card information is processed directly by our "
-                        "payment service providers (e.g., Stripe). We do not store complete payment card numbers on our own systems."
-                    )
-                },
-                {
-                    "title": "2.6 Technical and Usage Information",
-                    "content": (
-                        "We may automatically collect technical information when you access the Services, including: IP address, browser type, "
-                        "device type, operating system, login timestamps, pages or features accessed, session information, error and diagnostic "
-                        "information, security and audit logs, and general usage information. This information helps us maintain security, "
-                        "troubleshoot technical problems, and improve the reliability of the Services."
-                    )
-                }
-            ]
+                ]
+            },
+            "post_table_content": (
+                "We do not ask for sensitive personal data such as health, religion or biometric data. If a brokerage uploads "
+                "documents that contain it (for example a passport or Emirates ID for a tenancy contract), we process them only "
+                "as that brokerage's processor and only for that purpose."
+            )
         },
         {
             "id": 3,
-            "title": "3. How We Use Information",
-            "items": [
-                "Create and manage user accounts and authenticate users",
-                "Provide CRM and real-estate management functionality",
-                "Manage agencies, teams, agents, and brands",
-                "Manage leads, contacts, and property information",
-                "Provide communication and automation features",
-                "Process authorized WhatsApp, messaging, and calling integrations",
-                "Provide AI-powered features and automation",
-                "Qualify leads and assist with follow-ups",
-                "Support appointment scheduling and related workflows",
-                "Process subscriptions and payments",
-                "Monitor service usage and subscription limits",
-                "Provide customer support",
-                "Maintain and improve the Services",
-                "Detect and prevent fraud, abuse, and unauthorized access",
-                "Maintain system security and troubleshoot technical problems",
-                "Comply with applicable legal obligations and enforce our agreements and policies",
-                "Communicate important service, security, or account-related information"
-            ]
+            "title": "3. How we use information and why",
+            "table": {
+                "headers": ["Purpose", "Data used", "Legal basis under the PDPL"],
+                "rows": [
+                    [
+                        "Run the website and answer enquiries",
+                        "Visitor and prospect data",
+                        "Your consent, or steps you asked us to take before a contract"
+                    ],
+                    [
+                        "Provide the platform: lead capture, WhatsApp replies, AI calling, scheduling, CRM",
+                        "Account and client data",
+                        "Performing our contract with the brokerage; as processor, on its instructions"
+                    ],
+                    [
+                        "Billing, account management and support",
+                        "Account and payment data",
+                        "Performing our contract"
+                    ],
+                    [
+                        "Security, fraud prevention and fixing errors",
+                        "Logs and usage data",
+                        "Our legal obligations and protecting the service"
+                    ],
+                    [
+                        "Improve AndiOS using aggregated, de-identified usage statistics",
+                        "Usage data with names and contact details removed",
+                        "Consent where required; never identifiable client data"
+                    ],
+                    [
+                        "Send product updates and marketing to prospects and customers",
+                        "Name, email, phone",
+                        "Your consent. You can opt out at any time"
+                    ],
+                    [
+                        "Meet legal, tax and regulatory requirements",
+                        "What the law requires",
+                        "Legal obligation"
+                    ]
+                ]
+            },
+            "post_table_content": (
+                "We will not use your data for a new purpose that is unrelated to these without telling you first and, "
+                "where required, asking for your consent."
+            )
         },
         {
             "id": 4,
-            "title": "4. AI Features and Processing",
+            "title": "4. AI, WhatsApp and AI calling",
             "content": (
-                "AndiOS may provide AI-powered features, including automated responses, lead qualification, communication "
-                "assistance, voice automation, appointment-related workflows, and other AI functionality.\n\n"
-                "When you use an AI feature, relevant information may be processed by AndiOS and, where required to provide "
-                "the feature, by trusted third-party AI or technology providers. The information processed may include prompts, "
-                "CRM information, communication content, contact information, property information, call transcripts, and "
-                "other information necessary to provide the requested functionality.\n\n"
-                "We use AI processing only to provide, maintain, secure, and improve the Services. We do NOT sell customer CRM "
-                "data. Where third-party AI providers are used, their processing is also subject to applicable terms, privacy policies, "
-                "and data-processing agreements."
+                "AI processing. AndiOS uses large language models from OpenAI to draft replies, qualify leads, summarise "
+                "conversations and schedule viewings. Message content and relevant lead details are sent to OpenAI only to "
+                "produce a response. Under OpenAI's API terms, it does not use this data to train its models. We do not train "
+                "our own AI models on identifiable client data.\n\n"
+                "Human oversight. AI outputs support agents; they do not replace them. Brokerages decide which actions run "
+                "automatically and can review, edit or stop AI replies. AndiOS does not make decisions that produce legal "
+                "effects for a person, such as approving or refusing a tenancy, without a human at the brokerage.\n\n"
+                "WhatsApp. Messages are sent and received through Meta's WhatsApp Business Platform. Meta processes message "
+                "data under its own terms. Brokerages are responsible for having permission to message their contacts, and "
+                "anyone can reply STOP to opt out.\n\n"
+                "AI Caller. When a brokerage uses the AI Caller, the person called is told at the start that they are speaking "
+                "with an AI assistant on behalf of that brokerage. Calls are not currently recorded. If we add recording, we "
+                "will update this policy and tell people before any recording starts. A person can ask to speak to a human or "
+                "end the call at any time."
             )
         },
         {
             "id": 5,
-            "title": "5. WhatsApp, Voice, and Communication Integrations",
-            "content": (
-                "AndiOS integrates with third-party communication platforms including Meta WhatsApp Cloud API, voice providers, "
-                "and messaging providers. If an organization connects a communication account or phone number to AndiOS, the platform "
-                "processes information required to:\n"
-                "• Receive and send authorized messages\n"
-                "• Automate responses and qualify leads\n"
-                "• Create or update CRM contacts\n"
-                "• Maintain communication history and audit trails\n"
-                "• Schedule reminders, appointments, and follow-ups\n"
-                "• Monitor communication usage and quota limits\n\n"
-                "The organization connecting such services is responsible for ensuring that its use of these communication features "
-                "complies with applicable laws, platform policies (including Meta WhatsApp Business Policy), and required consent requirements."
+            "title": "5. Who we share data with",
+            "pre_table_content": (
+                "We share personal data only with the service providers we need to run AndiOS, under contracts that require "
+                "them to protect it and use it only for our service:"
+            ),
+            "table": {
+                "headers": ["Provider", "What they do", "Location"],
+                "rows": [
+                    ["Supabase", "Database and file storage", "UAE"],
+                    ["OpenAI", "AI language models", "United States"],
+                    ["Meta (WhatsApp Business Platform)", "WhatsApp messaging", "Outside the UAE"],
+                    ["Google", "Calendar sync for viewings, when a user connects it", "Global"]
+                ]
+            },
+            "post_table_content": (
+                "We may also disclose data when UAE law, a court or a regulator requires it, or as part of a merger or "
+                "sale of our business, with the buyer bound by this policy. We never sell personal data.\n\n"
+                "International transfers. Some providers process data outside the UAE. When that happens, we transfer it only "
+                "as the PDPL allows: to countries with adequate protection, or under contractual safeguards with the recipient. "
+                "Ask us for details of the safeguards for any provider."
             )
         },
         {
             "id": 6,
-            "title": "6. Third-Party Services and Integrations",
-            "content": (
-                "AndiOS may use or integrate with third-party services to provide certain functionality, including providers for: "
-                "cloud hosting and infrastructure, database and storage, authentication, email delivery, payment processing, AI services, "
-                "voice and telephony, WhatsApp and messaging, analytics, monitoring, security, customer support, and property portals "
-                "(e.g., Property Finder, Bayut, Dubizzle). Third-party providers process information on our behalf under strict "
-                "security standards."
-            )
+            "title": "6. How long we keep data",
+            "table": {
+                "headers": ["Data", "Kept for"],
+                "rows": [
+                    ["Prospect and demo enquiries", "[24 months] from last contact, unless you become a customer"],
+                    ["Customer account data", "Life of the contract plus [90 days], then deleted"],
+                    ["Brokerage client data", "As the brokerage instructs; exported or deleted within [30 days] of contract end"],
+                    ["Invoices and billing records", "As long as UAE tax and commercial law requires [5 years]"],
+                    ["Security logs", "[12 months]"]
+                ]
+            }
         },
         {
             "id": 7,
-            "title": "7. How We Share Information",
+            "title": "7. How we protect data",
             "content": (
-                "We do NOT sell personal information or customer CRM data. We disclose information only to: trusted service providers "
-                "operating the Services, authorized integrations explicitly connected by users/organizations, legal and regulatory authorities "
-                "when required by law, security personnel to protect against fraud or abuse, and relevant parties in the event of a merger, "
-                "acquisition, or asset transfer."
+                "Data is encrypted in transit and at rest. Access is limited by role, so agents see only what their brokerage "
+                "allows. We use multi-factor authentication for admin access, keep access logs and review our providers' "
+                "security. If a breach affects your personal data, we will notify you, our customers and the UAE Data Office "
+                "as the law requires."
             )
         },
         {
             "id": 8,
-            "title": "8. Data Security",
+            "title": "8. Your rights",
             "content": (
-                "We use reasonable administrative, technical, and organizational safeguards designed to protect information against "
-                "unauthorized access, alteration, disclosure, loss, or destruction. Security measures include: encrypted connections "
-                "(HTTPS/TLS), encryption at rest for sensitive API tokens (AES-256-GCM), access controls, multi-factor authentication, "
-                "role-based permissions, database row-level security (RLS), security monitoring, and regular backups."
+                "Under the PDPL you can ask to:\n\n"
+                "• access the personal data we hold about you\n"
+                "• correct inaccurate data\n"
+                "• delete your data, unless we must keep it by law\n"
+                "• restrict or object to processing, including direct marketing\n"
+                "• receive your data in a portable format\n"
+                "• withdraw consent at any time, without affecting earlier processing\n\n"
+                "Email hello@funkydiandi.com or call or WhatsApp +971 55 109 4841. We will reply within [30 days] and may "
+                "ask you to confirm your identity. If your data is held for a brokerage, we will pass your request to them. "
+                "If you are not satisfied, you can complain to the UAE Data Office."
             )
         },
         {
             "id": 9,
-            "title": "9. Data Retention",
+            "title": "9. Cookies",
             "content": (
-                "We retain information for as long as reasonably necessary to provide the Services, maintain active accounts, "
-                "fulfill contractual obligations, maintain security and audit records, resolve disputes, prevent fraud, and comply "
-                "with legal requirements. Organizations may request account or data deletion at any time."
+                "andios.ae does not currently use analytics, advertising or tracking cookies. It may set strictly necessary "
+                "cookies the site needs to work, such as keeping you signed in. If we add analytics or other cookies, we will "
+                "update this policy and ask for your consent first."
             )
         },
         {
             "id": 10,
-            "title": "10. Data Ownership",
+            "title": "10. Children",
             "content": (
-                "Organizations retain full ownership and control of the business and CRM information they submit to AndiOS. "
-                "AndiOS does not claim ownership of customer CRM records, leads, contacts, or property listings. We process "
-                "such information solely to provide the Services."
+                "AndiOS is a business service. It is not meant for anyone under 18, and we do not knowingly collect their data."
             )
         },
         {
             "id": 11,
-            "title": "11. International Data Processing",
+            "title": "11. Changes to this policy",
             "content": (
-                "AndiOS and its service providers operate globally. Information may be processed and stored in secure data centers "
-                "located in jurisdictions other than your country of residence, utilizing industry-standard transfer safeguards."
+                "We will post updates on this page and change the date at the top. For significant changes, we will email "
+                "customers before they take effect."
             )
         },
         {
             "id": 12,
-            "title": "12. Cookies and Similar Technologies",
+            "title": "12. Contact us",
             "content": (
-                "We use necessary cookies and session tokens to authenticate users, maintain secure sessions, remember preferences, "
-                "and ensure service reliability. You may adjust cookie preferences in your browser settings."
+                "Funky Di Andi for Online Selling (Sole Establishment) Dubai licence no. 1582068 Villa 103, New Dubai, "
+                "P.O. Box 12345, Dubai, UAE Email: hello@funkydiandi.com Phone / WhatsApp: +971 55 109 4841"
             )
-        },
-        {
-            "id": 13,
-            "title": "13. Your Privacy Rights",
-            "content": (
-                "Depending on your location and applicable law (such as GDPR, CCPA, or UAE Data Protection Law), you may have rights "
-                "to access, correct, delete, restrict, or export your personal information, or withdraw consent. Contact us at "
-                "privacy@andios.com to exercise these rights."
-            )
-        },
-        {
-            "id": 14,
-            "title": "14. Account and Data Deletion Requests",
-            "content": (
-                "Users may request deletion of their account or personal data by emailing privacy@andios.com. We verify identity "
-                "prior to fulfilling requests and complete deletions within standard regulatory timelines."
-            )
-        },
-        {
-            "id": 15,
-            "title": "15. Children's Privacy",
-            "content": (
-                "AndiOS is an enterprise B2B platform intended solely for professional business use. We do not knowingly collect "
-                "personal data from individuals under 18 years of age."
-            )
-        },
-        {
-            "id": 16,
-            "title": "16. Third-Party Links",
-            "content": (
-                "The Services may contain links to third-party sites or portals. We are not responsible for the privacy practices "
-                "or content of external third-party sites."
-            )
-        },
-        {
-            "id": 17,
-            "title": "17. Changes to This Privacy Policy",
-            "content": (
-                "We may update this Privacy Policy periodically. Any revisions will be reflected by the 'Last Updated' date at the top "
-                "of this page. Continued use of the Services signifies acceptance of updated terms."
-            )
-        },
-        {
-            "id": 18,
-            "title": "18. Contact Us",
-            "content": (
-                "If you have questions about this Privacy Policy or wish to exercise your data privacy rights, please contact us:\n"
-                "• Company: AndiOS Technologies\n"
-                "• Email: privacy@andios.com\n"
-                "• Website: https://andi-os.netlify.app\n"
-                "• Address: Dubai, United Arab Emirates"
-            )
-        },
-        {
-            "id": 19,
-            "title": "19. Effective Date",
-            "content": "This Privacy Policy is effective as of September 18, 2026."
         }
     ]
 }
 
 
 def _render_privacy_html() -> str:
-    """Generate high-quality, modern, accessible HTML version for web browsers and Meta crawlers."""
-    sections_html = ""
-    for sec in PRIVACY_POLICY_DATA["sections"]:
-        sec_title = sec["title"]
-        sec_body = ""
-        if "content" in sec:
-            paras = sec["content"].split("\n\n")
-            for p in paras:
-                if p.startswith("• "):
-                    items = [f"<li>{line.replace('• ', '')}</li>" for line in p.split("\n") if line.strip()]
-                    sec_body += f"<ul class='list'>{ ''.join(items) }</ul>"
-                else:
-                    sec_body += f"<p>{p.replace(chr(10), '<br>')}</p>"
-        elif "items" in sec:
-            items = "".join(f"<li>{item}</li>" for item in sec["items"])
-            sec_body += f"<ul class='list'>{items}</ul>"
-        elif "subsections" in sec:
-            for sub in sec["subsections"]:
-                sec_body += f"<h3 class='subsection-title'>{sub['title']}</h3>"
-                if "items" in sub:
-                    sub_items = "".join(f"<li>{item}</li>" for item in sub["items"])
-                    sec_body += f"<ul class='list'>{sub_items}</ul>"
-                elif "content" in sub:
-                    sec_body += f"<p>{sub['content']}</p>"
-
-        sections_html += f"""
-        <section class="policy-section">
-            <h2>{sec_title}</h2>
-            {sec_body}
-        </section>
-        """
-
-    return f"""<!DOCTYPE html>
+    """
+    Renders an HTML webpage designed identically to the official PDF document.
+    Clean black & white document aesthetic, precise typography, tables, and spacing.
+    """
+    return """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Privacy Policy | AndiOS CRM</title>
-    <meta name="description" content="AndiOS Real Estate CRM and Automation Platform Privacy Policy. Learn how we handle, protect, and respect your data.">
+    <title>AndiOS Privacy Policy</title>
+    <meta name="description" content="AndiOS Privacy Policy - AI operating system for real estate brokerages in the UAE. Operated by Funky Di Andi for Online Selling.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
-        :root {{
-            --bg-color: #0b0f19;
-            --card-bg: #111827;
-            --border-color: #1f2937;
-            --text-primary: #f3f4f6;
-            --text-secondary: #9ca3af;
-            --text-muted: #6b7280;
-            --accent: #3b82f6;
-            --accent-glow: rgba(59, 130, 246, 0.15);
-        }}
-        * {{
+        * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
-        }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-primary);
-            line-height: 1.7;
-            padding: 40px 20px;
-        }}
-        .container {{
-            max-width: 860px;
-            margin: 0 auto;
-            background: var(--card-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 48px;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-        }}
-        header {{
-            border-bottom: 1px solid var(--border-color);
-            padding-bottom: 28px;
-            margin-bottom: 36px;
-        }}
-        .badge {{
-            display: inline-block;
-            background: var(--accent-glow);
-            color: var(--accent);
+        }
+
+        body {
+            background-color: #f3f4f6;
+            color: #000000;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            font-size: 14.5px;
+            line-height: 1.62;
+            padding: 40px 16px;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        /* Top control bar for web visitors */
+        .top-toolbar {
+            max-width: 840px;
+            margin: 0 auto 16px auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             font-size: 13px;
-            font-weight: 600;
-            padding: 4px 12px;
-            border-radius: 9999px;
-            margin-bottom: 14px;
-            border: 1px solid rgba(59, 130, 246, 0.3);
-        }}
-        h1 {{
-            font-size: 32px;
-            font-weight: 700;
-            letter-spacing: -0.5px;
-            margin-bottom: 8px;
-            color: #ffffff;
-        }}
-        .meta-info {{
-            color: var(--text-muted);
-            font-size: 14px;
-        }}
-        .intro {{
-            font-size: 16px;
-            color: var(--text-secondary);
-            margin-bottom: 32px;
-            padding: 18px 20px;
-            background: rgba(255, 255, 255, 0.02);
-            border-left: 3px solid var(--accent);
-            border-radius: 0 8px 8px 0;
-        }}
-        .policy-section {{
-            margin-bottom: 32px;
-        }}
-        h2 {{
-            font-size: 20px;
-            font-weight: 600;
-            color: #ffffff;
-            margin-bottom: 14px;
-            padding-top: 8px;
-        }}
-        .subsection-title {{
-            font-size: 16px;
-            font-weight: 600;
-            color: #d1d5db;
-            margin: 18px 0 8px 0;
-        }}
-        p {{
-            color: var(--text-secondary);
-            font-size: 15px;
-            margin-bottom: 12px;
-        }}
-        .list {{
-            list-style: none;
-            padding-left: 0;
-            margin: 12px 0 16px 0;
-        }}
-        .list li {{
-            position: relative;
-            padding-left: 24px;
-            margin-bottom: 8px;
-            color: var(--text-secondary);
-            font-size: 15px;
-        }}
-        .list li::before {{
-            content: "•";
-            position: absolute;
-            left: 8px;
-            color: var(--accent);
-            font-weight: bold;
-        }}
-        footer {{
-            margin-top: 48px;
-            padding-top: 24px;
-            border-top: 1px solid var(--border-color);
-            text-align: center;
-            color: var(--text-muted);
-            font-size: 13px;
-        }}
-        footer a {{
-            color: var(--accent);
+            color: #4b5563;
+        }
+
+        .top-toolbar a, .top-toolbar button {
+            color: #1f2937;
             text-decoration: none;
-        }}
-        footer a:hover {{
+            font-weight: 500;
+            background: #ffffff;
+            border: 1px solid #d1d5db;
+            padding: 6px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .top-toolbar a:hover, .top-toolbar button:hover {
+            background: #f9fafb;
+            border-color: #9ca3af;
+        }
+
+        /* Document Paper Container */
+        .pdf-page {
+            max-width: 840px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border: 1px solid #e5e7eb;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
+            padding: 68px 72px;
+            border-radius: 2px;
+        }
+
+        /* Document Header */
+        h1.doc-title {
+            font-size: 27px;
+            font-weight: 800;
+            color: #000000;
+            letter-spacing: -0.4px;
+            margin-bottom: 24px;
+            line-height: 1.25;
+        }
+
+        /* Section Titles */
+        h2.section-title {
+            font-size: 17.5px;
+            font-weight: 700;
+            color: #000000;
+            margin-top: 32px;
+            margin-bottom: 14px;
+            letter-spacing: -0.2px;
+            line-height: 1.35;
+        }
+
+        /* Paragraphs */
+        p {
+            color: #000000;
+            margin-bottom: 14px;
+            font-size: 14.5px;
+            line-height: 1.62;
+        }
+
+        p strong {
+            font-weight: 700;
+            color: #000000;
+        }
+
+        /* Bullet lists */
+        ul.bullet-list {
+            list-style-type: disc;
+            padding-left: 26px;
+            margin: 10px 0 16px 0;
+        }
+
+        ul.bullet-list li {
+            margin-bottom: 5px;
+            color: #000000;
+            font-size: 14.5px;
+            line-height: 1.55;
+        }
+
+        /* Tables matching PDF layout */
+        .table-wrap {
+            width: 100%;
+            overflow-x: auto;
+            margin: 18px 0 18px 0;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        table.policy-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+            line-height: 1.55;
+            color: #000000;
+        }
+
+        table.policy-table th {
+            text-align: left;
+            font-weight: 700;
+            color: #000000;
+            padding: 12px 18px 12px 0;
+            vertical-align: top;
+            border-bottom: 1px solid #111827;
+        }
+
+        table.policy-table th:last-child {
+            padding-right: 0;
+        }
+
+        table.policy-table td {
+            text-align: left;
+            padding: 14px 18px 14px 0;
+            vertical-align: top;
+            color: #000000;
+            border-bottom: 1px solid #f1f5f9;
+        }
+
+        table.policy-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        table.policy-table td:last-child {
+            padding-right: 0;
+        }
+
+        table.policy-table td strong {
+            font-weight: 600;
+        }
+
+        /* Links */
+        a {
+            color: #000000;
             text-decoration: underline;
-        }}
-        @media (max-width: 640px) {{
-            .container {{
-                padding: 24px;
-            }}
-            h1 {{
-                font-size: 26px;
-            }}
-        }}
+            text-underline-offset: 2px;
+        }
+
+        a:hover {
+            color: #2563eb;
+        }
+
+        /* Mobile responsiveness */
+        @media (max-width: 768px) {
+            body {
+                padding: 12px 8px;
+            }
+
+            .pdf-page {
+                padding: 32px 20px;
+                border-radius: 0;
+                box-shadow: none;
+                border: none;
+            }
+
+            h1.doc-title {
+                font-size: 22px;
+            }
+
+            h2.section-title {
+                font-size: 16px;
+                margin-top: 24px;
+            }
+
+            table.policy-table th, table.policy-table td {
+                padding: 10px 10px 10px 0;
+                font-size: 13px;
+            }
+        }
+
+        /* Print Mode: Exact paper output */
+        @media print {
+            body {
+                background: #ffffff;
+                padding: 0;
+            }
+
+            .top-toolbar {
+                display: none;
+            }
+
+            .pdf-page {
+                box-shadow: none;
+                border: none;
+                padding: 0;
+                max-width: 100%;
+            }
+
+            h1.doc-title {
+                margin-top: 0;
+            }
+        }
     </style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <span class="badge">AndiOS Enterprise Compliance</span>
-            <h1>Privacy Policy</h1>
-            <div class="meta-info">
-                <span>Effective Date: {PRIVACY_POLICY_DATA["effective_date"]}</span> &bull; 
-                <span>Last Updated: {PRIVACY_POLICY_DATA["last_updated"]}</span>
-            </div>
-        </header>
 
-        <div class="intro">
-            {PRIVACY_POLICY_DATA["introduction"]}
+    <div class="top-toolbar">
+        <span>Official AndiOS Legal Document &bull; UAE PDPL Compliant</span>
+        <div style="display: flex; gap: 8px;">
+            <button onclick="window.print()" title="Print or Save as PDF">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V2h12v7"></path><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path><rect x="6" y="14" width="12" height="8"></rect></svg>
+                Print / PDF
+            </button>
+            <a href="/api/privacy" target="_blank" title="View JSON format">JSON API</a>
+        </div>
+    </div>
+
+    <main class="pdf-page">
+        <!-- Document Title -->
+        <h1 class="doc-title">AndiOS Privacy Policy</h1>
+
+        <!-- Section 1 -->
+        <h2 class="section-title">1. Who we are and what this policy covers</h2>
+        <p>
+            AndiOS is an AI operating system for real estate brokerages in the UAE. It is operated by Funky Di Andi for Online Selling, a sole establishment registered in Dubai, UAE, under Department of Economy and Tourism licence no. 1582068, with its registered address at Villa 103, New Dubai, P.O. Box 12345, Dubai, UAE (&ldquo;AndiOS&rdquo;, &ldquo;we&rdquo;, &ldquo;us&rdquo;).
+        </p>
+        <p>This policy explains how we collect, use, share and protect personal data when you:</p>
+        <ul class="bullet-list">
+            <li>visit andios.ae or contact us through it</li>
+            <li>request a demo, sign up for early access or become a customer</li>
+            <li>use the AndiOS platform as a brokerage owner, manager or agent</li>
+            <li>interact with a brokerage that uses AndiOS, for example by messaging it on WhatsApp or receiving a call from its AI assistant</li>
+        </ul>
+        <p>
+            <strong>Our two roles.</strong> For website visitors, prospects and our own customer accounts, we decide how your data is used, so we are the <strong>controller</strong>. For the leads, clients, owners and tenants that a brokerage manages inside AndiOS, the brokerage is the controller and we act as its <strong>processor</strong>: we handle that data only on the brokerage's instructions and under our customer agreement. Our customers own their client data. We do not sell it, and we do not use one brokerage's client data to market to anyone or to benefit another brokerage.
+        </p>
+        <p>
+            If you are a brokerage's client and have a question about your data, contact that brokerage first. We will help them respond.
+        </p>
+
+        <!-- Section 2 -->
+        <h2 class="section-title">2. Information we collect</h2>
+        <div class="table-wrap">
+            <table class="policy-table">
+                <thead>
+                    <tr>
+                        <th style="width: 26%;">Who</th>
+                        <th style="width: 44%;">What we collect</th>
+                        <th style="width: 30%;">How we get it</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Website visitors</td>
+                        <td>IP address, browser and device type, time of visit</td>
+                        <td>Automatically, in our hosting provider's server logs</td>
+                    </tr>
+                    <tr>
+                        <td>Prospects and demo requests</td>
+                        <td>Name, email, phone or WhatsApp number, brokerage name, role, team size, messages you send us</td>
+                        <td>Forms on andios.ae, email, WhatsApp, calls</td>
+                    </tr>
+                    <tr>
+                        <td>Customer account users (owners, managers, agents)</td>
+                        <td>Name, work email, phone, role, RERA or BRN number if provided, login details, billing contact, usage and activity logs, support conversations</td>
+                        <td>You or your brokerage when the account is set up, and your use of the platform</td>
+                    </tr>
+                    <tr>
+                        <td>Brokerage clients and leads (processed for our customers)</td>
+                        <td>Name, phone, email, WhatsApp messages, property interests and requirements, budget, viewing appointments, notes added by agents, listing and transaction details</td>
+                        <td>The brokerage, connected channels (WhatsApp, phone, calendar), and the client's own messages</td>
+                    </tr>
+                    <tr>
+                        <td>Payment information</td>
+                        <td>Billing name and address, invoice history</td>
+                        <td>Our payment provider handles card details; we do not store full card numbers</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <p>
+            We do not ask for sensitive personal data such as health, religion or biometric data. If a brokerage uploads documents that contain it (for example a passport or Emirates ID for a tenancy contract), we process them only as that brokerage's processor and only for that purpose.
+        </p>
+
+        <!-- Section 3 -->
+        <h2 class="section-title">3. How we use information and why</h2>
+        <div class="table-wrap">
+            <table class="policy-table">
+                <thead>
+                    <tr>
+                        <th style="width: 40%;">Purpose</th>
+                        <th style="width: 30%;">Data used</th>
+                        <th style="width: 30%;">Legal basis under the PDPL</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Run the website and answer enquiries</td>
+                        <td>Visitor and prospect data</td>
+                        <td>Your consent, or steps you asked us to take before a contract</td>
+                    </tr>
+                    <tr>
+                        <td>Provide the platform: lead capture, WhatsApp replies, AI calling, scheduling, CRM</td>
+                        <td>Account and client data</td>
+                        <td>Performing our contract with the brokerage; as processor, on its instructions</td>
+                    </tr>
+                    <tr>
+                        <td>Billing, account management and support</td>
+                        <td>Account and payment data</td>
+                        <td>Performing our contract</td>
+                    </tr>
+                    <tr>
+                        <td>Security, fraud prevention and fixing errors</td>
+                        <td>Logs and usage data</td>
+                        <td>Our legal obligations and protecting the service</td>
+                    </tr>
+                    <tr>
+                        <td>Improve AndiOS using aggregated, de-identified usage statistics</td>
+                        <td>Usage data with names and contact details removed</td>
+                        <td>Consent where required; never identifiable client data</td>
+                    </tr>
+                    <tr>
+                        <td>Send product updates and marketing to prospects and customers</td>
+                        <td>Name, email, phone</td>
+                        <td>Your consent. You can opt out at any time</td>
+                    </tr>
+                    <tr>
+                        <td>Meet legal, tax and regulatory requirements</td>
+                        <td>What the law requires</td>
+                        <td>Legal obligation</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <p>
+            We will not use your data for a new purpose that is unrelated to these without telling you first and, where required, asking for your consent.
+        </p>
+
+        <!-- Section 4 -->
+        <h2 class="section-title">4. AI, WhatsApp and AI calling</h2>
+        <p>
+            <strong>AI processing.</strong> AndiOS uses large language models from OpenAI to draft replies, qualify leads, summarise conversations and schedule viewings. Message content and relevant lead details are sent to OpenAI only to produce a response. Under OpenAI's API terms, it does not use this data to train its models. We do not train our own AI models on identifiable client data.
+        </p>
+        <p>
+            <strong>Human oversight.</strong> AI outputs support agents; they do not replace them. Brokerages decide which actions run automatically and can review, edit or stop AI replies. AndiOS does not make decisions that produce legal effects for a person, such as approving or refusing a tenancy, without a human at the brokerage.
+        </p>
+        <p>
+            <strong>WhatsApp.</strong> Messages are sent and received through Meta's WhatsApp Business Platform. Meta processes message data under its own terms. Brokerages are responsible for having permission to message their contacts, and anyone can reply STOP to opt out.
+        </p>
+        <p>
+            <strong>AI Caller.</strong> When a brokerage uses the AI Caller, the person called is told at the start that they are speaking with an AI assistant on behalf of that brokerage. Calls are not currently recorded. If we add recording, we will update this policy and tell people before any recording starts. A person can ask to speak to a human or end the call at any time.
+        </p>
+
+        <!-- Section 5 -->
+        <h2 class="section-title">5. Who we share data with</h2>
+        <p>
+            We share personal data only with the service providers we need to run AndiOS, under contracts that require them to protect it and use it only for our service:
+        </p>
+        <div class="table-wrap">
+            <table class="policy-table">
+                <thead>
+                    <tr>
+                        <th style="width: 32%;">Provider</th>
+                        <th style="width: 48%;">What they do</th>
+                        <th style="width: 20%;">Location</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Supabase</td>
+                        <td>Database and file storage</td>
+                        <td>UAE</td>
+                    </tr>
+                    <tr>
+                        <td>OpenAI</td>
+                        <td>AI language models</td>
+                        <td>United States</td>
+                    </tr>
+                    <tr>
+                        <td>Meta (WhatsApp Business Platform)</td>
+                        <td>WhatsApp messaging</td>
+                        <td>Outside the UAE</td>
+                    </tr>
+                    <tr>
+                        <td>Google</td>
+                        <td>Calendar sync for viewings, when a user connects it</td>
+                        <td>Global</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <p>
+            We may also disclose data when UAE law, a court or a regulator requires it, or as part of a merger or sale of our business, with the buyer bound by this policy. We never sell personal data.
+        </p>
+        <p>
+            <strong>International transfers.</strong> Some providers process data outside the UAE. When that happens, we transfer it only as the PDPL allows: to countries with adequate protection, or under contractual safeguards with the recipient. Ask us for details of the safeguards for any provider.
+        </p>
+
+        <!-- Section 6 -->
+        <h2 class="section-title">6. How long we keep data</h2>
+        <div class="table-wrap">
+            <table class="policy-table">
+                <thead>
+                    <tr>
+                        <th style="width: 38%;">Data</th>
+                        <th style="width: 62%;">Kept for</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Prospect and demo enquiries</td>
+                        <td>[24 months] from last contact, unless you become a customer</td>
+                    </tr>
+                    <tr>
+                        <td>Customer account data</td>
+                        <td>Life of the contract plus [90 days], then deleted</td>
+                    </tr>
+                    <tr>
+                        <td>Brokerage client data</td>
+                        <td>As the brokerage instructs; exported or deleted within [30 days] of contract end</td>
+                    </tr>
+                    <tr>
+                        <td>Invoices and billing records</td>
+                        <td>As long as UAE tax and commercial law requires [5 years]</td>
+                    </tr>
+                    <tr>
+                        <td>Security logs</td>
+                        <td>[12 months]</td>
+                    </tr>
+                </tbody>
+            </table>
         </div>
 
-        <main>
-            {sections_html}
-        </main>
+        <!-- Section 7 -->
+        <h2 class="section-title">7. How we protect data</h2>
+        <p>
+            Data is encrypted in transit and at rest. Access is limited by role, so agents see only what their brokerage allows. We use multi-factor authentication for admin access, keep access logs and review our providers' security. If a breach affects your personal data, we will notify you, our customers and the UAE Data Office as the law requires.
+        </p>
 
-        <footer>
-            <p>&copy; 2026 AndiOS Technologies. All rights reserved. &bull; <a href="{PRIVACY_POLICY_DATA["company"]["website"]}" target="_blank">AndiOS Platform</a></p>
-        </footer>
-    </div>
+        <!-- Section 8 -->
+        <h2 class="section-title">8. Your rights</h2>
+        <p>Under the PDPL you can ask to:</p>
+        <ul class="bullet-list">
+            <li>access the personal data we hold about you</li>
+            <li>correct inaccurate data</li>
+            <li>delete your data, unless we must keep it by law</li>
+            <li>restrict or object to processing, including direct marketing</li>
+            <li>receive your data in a portable format</li>
+            <li>withdraw consent at any time, without affecting earlier processing</li>
+        </ul>
+        <p>
+            Email <a href="mailto:hello@funkydiandi.com">hello@funkydiandi.com</a> or call or WhatsApp <a href="tel:+971551094841">+971 55 109 4841</a>. We will reply within [30 days] and may ask you to confirm your identity. If your data is held for a brokerage, we will pass your request to them. If you are not satisfied, you can complain to the UAE Data Office.
+        </p>
+
+        <!-- Section 9 -->
+        <h2 class="section-title">9. Cookies</h2>
+        <p>
+            <a href="https://andios.ae" target="_blank">andios.ae</a> does not currently use analytics, advertising or tracking cookies. It may set strictly necessary cookies the site needs to work, such as keeping you signed in. If we add analytics or other cookies, we will update this policy and ask for your consent first.
+        </p>
+
+        <!-- Section 10 -->
+        <h2 class="section-title">10. Children</h2>
+        <p>
+            AndiOS is a business service. It is not meant for anyone under 18, and we do not knowingly collect their data.
+        </p>
+
+        <!-- Section 11 -->
+        <h2 class="section-title">11. Changes to this policy</h2>
+        <p>
+            We will post updates on this page and change the date at the top. For significant changes, we will email customers before they take effect.
+        </p>
+
+        <!-- Section 12 -->
+        <h2 class="section-title">12. Contact us</h2>
+        <p>
+            Funky Di Andi for Online Selling (Sole Establishment) Dubai licence no. 1582068 Villa 103, New Dubai, P.O. Box 12345, Dubai, UAE Email: <a href="mailto:hello@funkydiandi.com">hello@funkydiandi.com</a> Phone / WhatsApp: <a href="tel:+971551094841">+971 55 109 4841</a>
+        </p>
+    </main>
+
 </body>
 </html>
 """
@@ -498,10 +768,9 @@ def _render_privacy_html() -> str:
 @router.get("/privacy-policy", response_class=HTMLResponse)
 async def get_privacy_policy_page(request: Request):
     """
-    Renders the public Privacy Policy webpage.
+    Renders the public Privacy Policy webpage matching the official PDF document layout.
     Complies with Meta App Review & Developer Dashboard verification requirements.
     """
-    # If a client specifically asks for JSON via Accept header, deliver JSON
     accept = request.headers.get("accept", "")
     if "application/json" in accept and "text/html" not in accept:
         return JSONResponse(content=api_success(data=PRIVACY_POLICY_DATA))
