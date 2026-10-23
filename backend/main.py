@@ -84,7 +84,7 @@ def _check_communication_accounts_configuration() -> None:
         sb = get_supabase()
         res = (
             sb.table("communication_accounts")
-            .select("id, agency_id, provider, status, access_token_enc, access_token")
+            .select("id, agency_id, provider, status, access_token_enc")
             .eq("status", "active")
             .execute()
         )
@@ -268,6 +268,10 @@ app.include_router(calls.router)
 app.include_router(subscription.router)
 app.include_router(agent_phone_settings.router)
 app.include_router(privacy.router)
+
+# ─── API v1 Routing Aliases ───────────────────────────────────────────────────
+app.include_router(webhooks.router, prefix="/api/v1")
+app.include_router(connectors.router, prefix="/api/v1")
 
 
 # ─── Health Check ─────────────────────────────────────────────────────────────

@@ -1317,6 +1317,7 @@ async def whatsapp_verify(
 
 
 @router.post("/whatsapp")
+@router.post("/whatsapp/inbound")
 async def whatsapp_inbound(
     request: Request,
     background_tasks: BackgroundTasks = BackgroundTasks(),
@@ -1447,15 +1448,36 @@ async def whatsapp_inbound(
             if is_meta and to_phone:
                 try:
                     sb_lookup = get_supabase()
-                    rpc_res = sb_lookup.rpc(
-                        "get_agency_by_phone_number_id",
-                        {"p_phone_number_id": to_phone},
-                    ).execute()
-                    if rpc_res.data and len(rpc_res.data) > 0:
-                        row = rpc_res.data[0]
+                    row = None
+                    try:
+                        rpc_res = sb_lookup.rpc(
+                            "get_agency_by_phone_number_id",
+                            {"p_phone_number_id": to_phone},
+                        ).execute()
+                        if rpc_res.data and len(rpc_res.data) > 0:
+                            row = rpc_res.data[0]
+                    except Exception as rpc_err:
+                        logger.warning(f"[Meta BYON] RPC get_agency_by_phone_number_id failed for {to_phone}: {rpc_err} — falling back to direct table lookup")
+
+                    if not row:
+                        # Fallback direct query on communication_accounts table
+                        direct_res = (
+                            sb_lookup.table("communication_accounts")
+                            .select("id, agency_id, agent_id, status, provider, phone_number")
+                            .eq("phone_number_id", str(to_phone).strip())
+                            .eq("channel", "whatsapp")
+                            .eq("status", "active")
+                            .limit(1)
+                            .execute()
+                        )
+                        if direct_res.data and len(direct_res.data) > 0:
+                            row = direct_res.data[0]
+                            row["comm_account_id"] = row.get("id")
+
+                    if row:
                         resolved_agency_id = row.get("agency_id")
                         resolved_agent_id = row.get("agent_id")
-                        comm_account_id = row.get("comm_account_id")
+                        comm_account_id = row.get("comm_account_id") or row.get("id")
                         logger.info(
                             f"[Meta BYON] Resolved agency {resolved_agency_id} "
                             f"(agent: {resolved_agent_id}) from phone_number_id {to_phone}"
@@ -1543,15 +1565,22 @@ async def whatsapp_inbound(
                 norm_phone = from_phone if from_phone.startswith("+") else f"+{from_phone}"
                 property_ref = _extract_property_ref_from_wame_body(message_body)
                 # Detect if message came via Property Finder WhatsApp lead flow
-                # (buyer message contains propertyfinder.ae/go/<SLUG> + utm_medium=lead_user)
                 is_pf_lead = bool(
+                    property_ref or
                     _extract_pf_go_slug(message_body) or
-                    "utm_medium=lead_user" in message_body or
-                    "interested in your listing on Property Finder" in message_body
+                    "utm_medium=lead_user" in message_body.lower() or
+                    "propertyfinder" in message_body.lower() or
+                    "property finder" in message_body.lower()
                 )
+                sender_name = msg.get("sender_name")
+                if is_pf_lead and (not sender_name or sender_name == "WhatsApp Lead"):
+                    lead_name = "Property Finder Lead"
+                else:
+                    lead_name = sender_name or "WhatsApp Lead"
+
                 try:
                     new_lead_row = {
-                        "name": msg.get("sender_name") or "WhatsApp Lead",
+                        "name": lead_name,
                         "phone": norm_phone,
                         "source": "property_finder" if is_pf_lead else "whatsapp",
                         "status": "new",
@@ -1568,13 +1597,15 @@ async def whatsapp_inbound(
                         lead = insert_res.data[0]
                         match_reason = "auto_created"
                         logger.info(
-                            f"[WA Inbound] Auto-created new lead {lead.get('id')} "
-                            f"('{new_lead_row['name']}', phone: ***{_normalize_phone(norm_phone)[-3:]}) for agency {resolved_agency_id}"
+                            f"[Lead Engine] Auto-created lead for {norm_phone} "
+                            f"(lead_id: {lead.get('id')}, name: '{new_lead_row['name']}', agency: {resolved_agency_id}, agent: {resolved_agent_id})"
                         )
                 except Exception as create_err:
-                    logger.error(f"[WA Inbound] Error auto-creating lead: {create_err}")
-                    # Attempt safe re-query in case of race condition / unique constraint
-                    lead, _ = _find_lead_by_sender_phone(sb, from_phone, agency_id=resolved_agency_id)
+                    logger.warning(f"[Lead Engine] Conflict or error auto-creating lead: {create_err} — attempting recovery lookup")
+                    # Safe atomic lookup fallback
+                    lead, _ = _find_lead_by_sender_phone(sb, from_phone, agency_id=resolved_agency_id, agent_id=resolved_agent_id)
+                    if lead is None:
+                        lead, _ = _find_lead_by_sender_phone(sb, from_phone, agency_id=resolved_agency_id)
 
             if lead is None:
                 if match_reason in ("unknown", "invalid"):
@@ -1747,6 +1778,7 @@ async def whatsapp_inbound(
             # Quota consumed — now process with AI
             try:
                 ai_reply = await qualify_and_respond(lead, history, message_body)
+                logger.info(f"[Andi AI] Generated qualification greeting via GPT-4o for lead {lead_id}")
             except Exception as ai_err:
                 logger.error(f"Lead {lead_id}: AI processing error: {ai_err} — refunding quota")
                 await refund_whatsapp_quota(lead.get("agency_id") or resolved_agency_id or "")
@@ -1769,7 +1801,10 @@ async def whatsapp_inbound(
             )
 
             if send_result.get("status") == "sent":
-                logger.info(f"Lead {lead_id}: AI reply delivered successfully (SID={send_result.get('sid')})")
+                if effective_agent_id:
+                    logger.info(f"[Meta Outbound] Delivered response to {from_phone} using Agent's Access Token (lead_id={lead_id}, SID={send_result.get('sid')})")
+                else:
+                    logger.info(f"[Meta Outbound] Delivered response to {from_phone} (lead_id={lead_id}, SID={send_result.get('sid')})")
             elif send_result.get("status") == "queued":
                 logger.info(f"Lead {lead_id}: AI reply queued (outside 24h window, no approved template).")
             else:
