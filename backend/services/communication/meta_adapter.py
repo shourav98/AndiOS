@@ -113,10 +113,15 @@ class MetaWhatsAppAdapter(WhatsAppProvider):
                 resp.raise_for_status()
                 data = resp.json()
                 message_id = (data.get("messages") or [{}])[0].get("id")
-                logger.info(
-                    f"[Meta] Sent to {to_phone[-4:]}**** via phone_number_id={self._phone_number_id} "
-                    f"msg_id={message_id}"
-                )
+                is_agent_token = bool(self._account and getattr(self._account, "agent_id", None))
+                if is_agent_token:
+                    logger.info(
+                        f"[Meta Outbound] Delivered response to {to_phone} using Agent's Access Token (phone_number_id={self._phone_number_id}, msg_id={message_id})"
+                    )
+                else:
+                    logger.info(
+                        f"[Meta] Sent to {to_phone[-4:]}**** via phone_number_id={self._phone_number_id} msg_id={message_id}"
+                    )
                 return SendResult(success=True, message_id=message_id, raw=data)
             except httpx.HTTPStatusError as exc:
                 error_body = exc.response.text
