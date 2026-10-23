@@ -625,6 +625,7 @@ async def _verify_waba_and_phone(waba_id: str, phone_number_id: str, access_toke
                 detail=f"Phone number could not be verified with WhatsApp provider. Reference: {corr_id}",
             )
         phone_data = phone_resp.json()
+        logger.info("[ESU][%s] Verified phone_data for %s: %s", corr_id, phone_number_id, phone_data)
 
         # Step C: Verify phone belongs to WABA with pagination (fail-closed)
         waba_numbers_url = f"{base}/{waba_id}/phone_numbers"
@@ -715,9 +716,14 @@ async def _register_phone_number_if_needed(
         try:
             err_json = resp.json()
             err_obj = err_json.get("error", {})
-            err_msg = err_obj.get("message") or resp.text
+            user_title = err_obj.get("error_user_title")
+            user_msg = err_obj.get("error_user_msg")
+            base_msg = err_obj.get("message") or resp.text
             err_code = err_obj.get("code")
             err_subcode = err_obj.get("error_subcode")
+
+            parts = [p for p in (user_title, user_msg, base_msg) if p]
+            err_msg = " — ".join(parts) if parts else resp.text
         except Exception:
             err_msg = resp.text
             err_code = None
@@ -735,8 +741,8 @@ async def _register_phone_number_if_needed(
             return True, True, False, None
 
         logger.warning(
-            "[ESU][%s] Register endpoint returned unexpected status %s: %s (code=%s, subcode=%s)",
-            corr_id, resp.status_code, err_msg, err_code, err_subcode,
+            "[ESU][%s] Register endpoint returned status %s: %s (code=%s, subcode=%s, raw=%s)",
+            corr_id, resp.status_code, err_msg, err_code, err_subcode, resp.text,
         )
         return False, False, False, err_msg
 
