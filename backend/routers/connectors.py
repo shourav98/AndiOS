@@ -108,6 +108,7 @@ class ManualTokenConnectRequest(BaseModel):
     phone_number_id: Optional[str] = None  # Specific number; auto-discovers if omitted
     agent_id: Optional[str] = None
     confirm_replace_default: bool = False
+    pin: Optional[str] = None              # 6-digit PIN if Two-Step Verification is enabled in WhatsApp Manager
 
 
 class EmbeddedSignupDisconnectRequest(BaseModel):
@@ -692,12 +693,12 @@ async def _register_phone_number_if_needed(
             "[ESU][%s] Detected WhatsApp Business App Coexistence for phone %s (is_on_biz_app=True, platform_type=CLOUD_API). Skipping registration.",
             corr_id, phone_number_id,
         )
-        return True, True, False
+        return True, True, False, None
 
     # 2. Already registered non-coexistence Cloud API number:
     if phone_data.get("is_pin_enabled") is True and platform_type == "CLOUD_API":
         logger.info("[ESU][%s] Phone %s is already registered with Cloud API.", corr_id, phone_number_id)
-        return True, False, False
+        return True, False, False, None
 
     # 3. Normal number (e.g. platform_type NOT_APPLICABLE and is_on_biz_app not True): must register
     base = _graph_base_url()
@@ -709,16 +710,35 @@ async def _register_phone_number_if_needed(
         resp = await client.post(url, json=payload, headers=headers)
         if resp.status_code in (200, 201):
             logger.info("[ESU][%s] Successfully registered Cloud API number %s with PIN.", corr_id, phone_number_id)
-            return True, False, True
+            return True, False, True, None
+
+        try:
+            err_json = resp.json()
+            err_obj = err_json.get("error", {})
+            err_msg = err_obj.get("message") or resp.text
+            err_code = err_obj.get("code")
+            err_subcode = err_obj.get("error_subcode")
+        except Exception:
+            err_msg = resp.text
+            err_code = None
+            err_subcode = None
 
         resp_text = resp.text.lower()
-        # [UNVERIFIED fallback: error string matching]
-        if "register endpoint is not available for smb businesses" in resp_text:
-            logger.info("[ESU][%s] Detected SMB Coexistence mode for number %s via error string fallback.", corr_id, phone_number_id)
-            return True, True, False
+        # Fallback 1: Phone number is already registered in Cloud API (code 133010)
+        if err_code == 133010 or "already registered" in resp_text:
+            logger.info("[ESU][%s] Phone %s is already registered with Cloud API (code=%s).", corr_id, phone_number_id, err_code)
+            return True, False, False, None
 
-        logger.warning("[ESU][%s] Register endpoint returned unexpected status %s: %s", corr_id, resp.status_code, resp.text)
-        return False, False, False
+        # Fallback 2: SMB Coexistence mode
+        if "register endpoint is not available for smb businesses" in resp_text or err_code == 133015:
+            logger.info("[ESU][%s] Detected SMB Coexistence mode for number %s via error fallback.", corr_id, phone_number_id)
+            return True, True, False, None
+
+        logger.warning(
+            "[ESU][%s] Register endpoint returned unexpected status %s: %s (code=%s, subcode=%s)",
+            corr_id, resp.status_code, err_msg, err_code, err_subcode,
+        )
+        return False, False, False, err_msg
 
 
 async def _subscribe_app_to_waba(
@@ -930,12 +950,12 @@ async def meta_embedded_signup_callback(
 
     # 5. Registration with PIN & coexistence detection
     random_pin = f"{secrets.randbelow(900000) + 100000}"
-    reg_ok, server_is_coexistence, actually_registered_with_pin = await _register_phone_number_if_needed(
+    reg_ok, server_is_coexistence, actually_registered_with_pin, reg_err = await _register_phone_number_if_needed(
         resolved_phone_number_id, access_token, random_pin, phone_details, corr_id
     )
 
     if not reg_ok:
-        logger.error("[ESU][%s] Registration failed for phone %s", corr_id, resolved_phone_number_id)
+        logger.error("[ESU][%s] Registration failed for phone %s: %s", corr_id, resolved_phone_number_id, reg_err)
         # Record failure in meta_onboarding_state as 'registration_failed', status as 'pending'
         failed_upsert = {
             "agency_id": agency_id,
@@ -1197,14 +1217,14 @@ async def whatsapp_manual_token_connect(
             )
 
     # 4. Registration / coexistence detection
-    random_pin = f"{secrets.randbelow(900000) + 100000}"
-    reg_ok, server_is_coexistence, actually_registered_with_pin = await _register_phone_number_if_needed(
+    random_pin = (body.pin or "").strip() or f"{secrets.randbelow(900000) + 100000}"
+    reg_ok, server_is_coexistence, actually_registered_with_pin, reg_err = await _register_phone_number_if_needed(
         resolved_phone_number_id, access_token, random_pin, phone_details, corr_id
     )
     if not reg_ok:
         raise HTTPException(
             status_code=400,
-            detail=f"Phone number registration with WhatsApp Cloud API failed. Reference: {corr_id}",
+            detail=f"Phone number registration with WhatsApp Cloud API failed: {reg_err or 'unknown error'}. Reference: {corr_id}",
         )
 
     encrypted_pin = encrypt_token(random_pin) if actually_registered_with_pin else None
