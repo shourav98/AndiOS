@@ -86,10 +86,26 @@ class ConnectorCredentials(BaseModel):
 class EmbeddedSignupCallbackRequest(BaseModel):
     """
     Payload sent by frontend after completing Meta Embedded Signup (v4).
+    phone_number_id is optional — if omitted the backend auto-discovers it
+    from the WABA via Graph API (handles cases where postMessage never fires).
     """
     code: str
     waba_id: str
-    phone_number_id: str
+    phone_number_id: Optional[str] = None   # Auto-discovered if not supplied
+    agent_id: Optional[str] = None
+    confirm_replace_default: bool = False
+
+
+class ManualTokenConnectRequest(BaseModel):
+    """
+    Direct System User Token path — no Embedded Signup required.
+    Use when the agency already has a WABA and System User Token from
+    Meta Business Settings. The backend validates and registers all
+    (or a specified) phone number from the WABA.
+    """
+    waba_id: str
+    access_token: str                       # Permanent System User token
+    phone_number_id: Optional[str] = None  # Specific number; auto-discovers if omitted
     agent_id: Optional[str] = None
     confirm_replace_default: bool = False
 
@@ -505,6 +521,44 @@ async def _verify_token_waba_permission(access_token: str, waba_id: str, corr_id
 
 
 
+async def _discover_waba_phone_numbers(waba_id: str, access_token: str, corr_id: str) -> list[dict]:
+    """
+    Fetch all phone numbers registered under a WABA via Graph API.
+    Returns list of phone number objects with id, display_phone_number, etc.
+    Used when phone_number_id is not provided by the frontend.
+    """
+    import httpx
+    base = _graph_base_url()
+    headers = {"Authorization": f"Bearer {access_token}"}
+    url = f"{base}/{waba_id}/phone_numbers"
+    params = {
+        "fields": "id,display_phone_number,verified_name,quality_rating,platform_type,is_pin_enabled,code_verification_status,is_on_biz_app"
+    }
+    results = []
+    next_url: Optional[str] = url
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        while next_url:
+            if next_url == url:
+                resp = await client.get(next_url, headers=headers, params=params)
+            else:
+                resp = await client.get(next_url, headers=headers)
+            if resp.status_code != 200:
+                logger.error("[ESU][%s] _discover_waba_phone_numbers failed (%s): %s", corr_id, resp.status_code, resp.text)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to discover phone numbers from WhatsApp Business Account {waba_id}. Reference: {corr_id}",
+                )
+            data = resp.json()
+            results.extend(data.get("data", []))
+            next_url = (data.get("paging") or {}).get("next")
+
+    logger.info("[ESU][%s] Discovered %d phone number(s) in WABA %s: %s",
+                corr_id, len(results), waba_id,
+                [r.get("display_phone_number", r.get("id")) for r in results])
+    return results
+
+
 async def _verify_waba_and_phone(waba_id: str, phone_number_id: str, access_token: str, corr_id: str) -> dict:
     """
     Verify with new token that waba_id and phone_number_id belong to it before saving (fail-closed).
@@ -779,8 +833,42 @@ async def meta_embedded_signup_callback(
         else None
     )
 
-    # 3. Verify with new token that waba_id and phone_number_id belong to it (fail-closed)
-    phone_details = await _verify_waba_and_phone(body.waba_id, body.phone_number_id, access_token, corr_id)
+    # 3. Resolve phone_number_id: use supplied value OR auto-discover from WABA
+    resolved_phone_number_id = body.phone_number_id
+    if not resolved_phone_number_id:
+        logger.info(
+            "[ESU][%s] phone_number_id not supplied by frontend — auto-discovering from WABA %s",
+            corr_id, body.waba_id,
+        )
+        # Validate token against WABA before discovery
+        await _verify_token_waba_permission(access_token, body.waba_id, corr_id)
+        discovered = await _discover_waba_phone_numbers(body.waba_id, access_token, corr_id)
+        if not discovered:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No phone numbers found in WhatsApp Business Account {body.waba_id}. Add a number in Meta Business Manager first. Reference: {corr_id}",
+            )
+        if len(discovered) > 1:
+            # Pick the first active/verified one, or just the first
+            best = next(
+                (p for p in discovered if p.get("code_verification_status") == "VERIFIED"),
+                discovered[0]
+            )
+            logger.info(
+                "[ESU][%s] Multiple phones in WABA; auto-selected %s (%s). Others: %s",
+                corr_id, best.get("id"), best.get("display_phone_number"),
+                [p.get("display_phone_number") for p in discovered if p.get("id") != best.get("id")]
+            )
+            phone_details = best
+        else:
+            phone_details = discovered[0]
+        resolved_phone_number_id = str(phone_details["id"])
+        logger.info("[ESU][%s] Auto-resolved phone_number_id=%s (%s)",
+                    corr_id, resolved_phone_number_id, phone_details.get("display_phone_number"))
+    else:
+        # Verify with new token that waba_id and phone_number_id belong to it (fail-closed)
+        phone_details = await _verify_waba_and_phone(body.waba_id, resolved_phone_number_id, access_token, corr_id)
+
     display_phone = phone_details.get("display_phone_number", "")
     phone_e164_digits = re.sub(r"[^\d]", "", display_phone)
     verified_name = phone_details.get("verified_name", "")
@@ -789,7 +877,7 @@ async def meta_embedded_signup_callback(
     existing_phone = (
         sb.table("communication_accounts")
         .select("id, agency_id, agent_id, status")
-        .eq("phone_number_id", body.phone_number_id)
+        .eq("phone_number_id", resolved_phone_number_id)
         .neq("status", "disconnected")
         .limit(1)
         .execute()
@@ -799,17 +887,17 @@ async def meta_embedded_signup_callback(
         if conflict["agency_id"] != agency_id or (conflict.get("agent_id") != target_agent_id):
             raise HTTPException(
                 status_code=409,
-                detail=f"Phone number {display_phone or body.phone_number_id} is already connected to another account.",
+                detail=f"Phone number {display_phone or resolved_phone_number_id} is already connected to another account.",
             )
 
     # 5. Registration with PIN & coexistence detection
     random_pin = f"{secrets.randbelow(900000) + 100000}"
     reg_ok, server_is_coexistence, actually_registered_with_pin = await _register_phone_number_if_needed(
-        body.phone_number_id, access_token, random_pin, phone_details, corr_id
+        resolved_phone_number_id, access_token, random_pin, phone_details, corr_id
     )
 
     if not reg_ok:
-        logger.error("[ESU][%s] Registration failed for phone %s", corr_id, body.phone_number_id)
+        logger.error("[ESU][%s] Registration failed for phone %s", corr_id, resolved_phone_number_id)
         # Record failure in meta_onboarding_state as 'registration_failed', status as 'pending'
         failed_upsert = {
             "agency_id": agency_id,
@@ -817,7 +905,7 @@ async def meta_embedded_signup_callback(
             "channel": "whatsapp",
             "provider": "meta",
             "phone_number": phone_e164_digits,
-            "phone_number_id": body.phone_number_id,
+            "phone_number_id": resolved_phone_number_id,
             "external_account_id": body.waba_id,
             "status": "pending",
             "is_coexistence": False,
@@ -850,7 +938,7 @@ async def meta_embedded_signup_callback(
                     existing_meta["last_registration_failure"] = {
                         "failed_at": datetime.now(timezone.utc).isoformat(),
                         "corr_id": corr_id,
-                        "phone_number_id": body.phone_number_id,
+                        "phone_number_id": resolved_phone_number_id,
                         "error_code": "PHONE_REGISTRATION_FAILED",
                     }
                     sb.table("communication_accounts").update({"metadata": existing_meta}).eq("id", existing_row["id"]).execute()
@@ -873,6 +961,7 @@ async def meta_embedded_signup_callback(
 
     # 6. Subscribe to WABA webhooks
     sub_ok = await _subscribe_app_to_waba(body.waba_id, access_token, corr_id)
+    logger.info("[ESU][%s] Webhook subscription for WABA %s: %s", corr_id, body.waba_id, 'OK' if sub_ok else 'FAILED')
     onboarding_state = "embedded_signup" if sub_ok else "webhook_subscription_failed"
 
     # 7. Encrypt token and prepare upsert data (NO app_secret written to metadata)
@@ -884,7 +973,7 @@ async def meta_embedded_signup_callback(
         "channel": "whatsapp",
         "provider": "meta",
         "phone_number": phone_e164_digits,
-        "phone_number_id": body.phone_number_id,
+        "phone_number_id": resolved_phone_number_id,
         "external_account_id": body.waba_id,
         "access_token_enc": encrypted_token,
         "token_expires_at": token_expires_at,
@@ -944,10 +1033,10 @@ async def meta_embedded_signup_callback(
         asyncio.create_task(_bg_auto_create_templates(body.waba_id, access_token, account_id))
 
     logger.info(
-        "[ESU][%s] WhatsApp connected: agency=%s agent=%s phone=%s waba=%s coexistence=%s sub=%s",
+        "[ESU][%s] WhatsApp connected: agency=%s agent=%s phone=%s phone_id=%s waba=%s coexistence=%s sub=%s",
         corr_id, agency_id, target_agent_id,
         phone_e164_digits[-4:] + "****" if phone_e164_digits else "?",
-        body.waba_id, server_is_coexistence, sub_ok,
+        resolved_phone_number_id, body.waba_id, server_is_coexistence, sub_ok,
     )
 
     resp_status = "connected" if sub_ok else "partially_connected"
@@ -962,7 +1051,7 @@ async def meta_embedded_signup_callback(
             "status": resp_status,
             "account_id": account_id,
             "phone_number": display_phone,
-            "phone_number_id": body.phone_number_id,
+            "phone_number_id": resolved_phone_number_id,
             "waba_id": body.waba_id,
             "is_coexistence": server_is_coexistence,
             "verified_name": verified_name,
@@ -970,6 +1059,197 @@ async def meta_embedded_signup_callback(
             "meta_onboarding_state": onboarding_state,
         },
         message=resp_msg,
+    )
+
+
+
+# ─── Manual System User Token Connect ────────────────────────────────────────────
+
+@router.post("/whatsapp/manual-token-connect")
+@router.post("/meta-esu/manual-connect")
+async def whatsapp_manual_token_connect(
+    body: ManualTokenConnectRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(verify_token),
+):
+    """
+    Direct token-based WhatsApp connect for agencies that already have a WABA
+    and a permanent System User Token from Meta Business Settings.
+    No Embedded Signup popup required.
+
+    Steps:
+    1. Validates the token via debug_token endpoint.
+    2. Discovers phone numbers in the WABA (or uses the supplied phone_number_id).
+    3. Registers with Cloud API (or detects coexistence).
+    4. Subscribes WABA webhooks.
+    5. Saves to communication_accounts.
+    """
+    corr_id = uuid.uuid4().hex[:12]
+    agency_id = require_agency_id(current_user)
+    current_user_role = current_user.get("role", "")
+    current_user_id = current_user.get("id") or current_user.get("sub")
+
+    if not is_management_role(current_user_role):
+        raise HTTPException(status_code=403, detail="Only owners and managers can manually connect WhatsApp.")
+
+    # Agent scoping
+    if body.agent_id:
+        agent_res = (
+            sb_client := get_supabase(),
+            sb_client.table("agents")
+            .select("id")
+            .eq("id", body.agent_id)
+            .eq("agency_id", agency_id)
+            .limit(1)
+            .execute(),
+        )
+        if not agent_res[1].data:
+            raise HTTPException(status_code=400, detail=f"Agent {body.agent_id} not found in your agency.")
+        target_agent_id = body.agent_id
+    else:
+        target_agent_id = None
+
+    sb = get_supabase()
+    access_token = body.access_token.strip()
+
+    logger.info("[ManualConnect][%s] agency=%s agent=%s waba=%s", corr_id, agency_id, target_agent_id, body.waba_id)
+
+    # 1. Validate token and WABA access
+    await _verify_token_waba_permission(access_token, body.waba_id, corr_id)
+
+    # 2. Resolve phone number
+    resolved_phone_number_id = body.phone_number_id
+    if not resolved_phone_number_id:
+        discovered = await _discover_waba_phone_numbers(body.waba_id, access_token, corr_id)
+        if not discovered:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No phone numbers found in WABA {body.waba_id}. Add a number in Meta Business Manager first.",
+            )
+        best = next(
+            (p for p in discovered if p.get("code_verification_status") == "VERIFIED"),
+            discovered[0]
+        )
+        phone_details = best
+        resolved_phone_number_id = str(best["id"])
+        logger.info("[ManualConnect][%s] Auto-selected phone_number_id=%s (%s). Total in WABA: %d",
+                    corr_id, resolved_phone_number_id, best.get("display_phone_number"), len(discovered))
+    else:
+        phone_details = await _verify_waba_and_phone(body.waba_id, resolved_phone_number_id, access_token, corr_id)
+
+    display_phone = phone_details.get("display_phone_number", "")
+    phone_e164_digits = re.sub(r"[^\d]", "", display_phone)
+    verified_name = phone_details.get("verified_name", "")
+
+    # 3. Uniqueness check
+    existing_phone = (
+        sb.table("communication_accounts")
+        .select("id, agency_id, agent_id, status")
+        .eq("phone_number_id", resolved_phone_number_id)
+        .neq("status", "disconnected")
+        .limit(1)
+        .execute()
+    )
+    if existing_phone.data:
+        conflict = existing_phone.data[0]
+        if conflict["agency_id"] != agency_id or conflict.get("agent_id") != target_agent_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Phone number {display_phone} is already connected to another account.",
+            )
+
+    # 4. Registration / coexistence detection
+    random_pin = f"{secrets.randbelow(900000) + 100000}"
+    reg_ok, server_is_coexistence, actually_registered_with_pin = await _register_phone_number_if_needed(
+        resolved_phone_number_id, access_token, random_pin, phone_details, corr_id
+    )
+    if not reg_ok:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Phone number registration with WhatsApp Cloud API failed. Reference: {corr_id}",
+        )
+
+    encrypted_pin = encrypt_token(random_pin) if actually_registered_with_pin else None
+
+    # 5. Webhook subscription
+    sub_ok = await _subscribe_app_to_waba(body.waba_id, access_token, corr_id)
+    onboarding_state = "manual_token" if sub_ok else "manual_token_webhook_failed"
+
+    # 6. Save to DB
+    encrypted_token = encrypt_token(access_token)
+    upsert_data = {
+        "agency_id": agency_id,
+        "agent_id": target_agent_id,
+        "channel": "whatsapp",
+        "provider": "meta",
+        "phone_number": phone_e164_digits,
+        "phone_number_id": resolved_phone_number_id,
+        "external_account_id": body.waba_id,
+        "access_token_enc": encrypted_token,
+        "token_expires_at": None,  # System User tokens don't expire
+        "registration_pin_enc": encrypted_pin,
+        "status": "active",
+        "is_coexistence": server_is_coexistence,
+        "meta_onboarding_state": onboarding_state,
+        "connected_at": datetime.now(timezone.utc).isoformat(),
+        "disconnected_at": None,
+        "metadata": {
+            "waba_name": verified_name,
+            "platform_type": phone_details.get("platform_type", ""),
+            "templates_status": "pending",
+            "connected_via": "manual_system_user_token",
+        },
+    }
+    try:
+        existing_res = (
+            sb.table("communication_accounts")
+            .select("id, provider")
+            .eq("agency_id", agency_id)
+            .eq("channel", "whatsapp")
+        )
+        if target_agent_id:
+            existing_res = existing_res.eq("agent_id", target_agent_id)
+        else:
+            existing_res = existing_res.is_("agent_id", "null")
+        existing = existing_res.limit(1).execute()
+
+        if existing.data:
+            account_id = existing.data[0]["id"]
+            sb.table("communication_accounts").update(upsert_data).eq("id", account_id).execute()
+        else:
+            insert_res = sb.table("communication_accounts").insert(upsert_data).execute()
+            account_id = insert_res.data[0]["id"]
+    except Exception as exc:
+        err_str = str(exc).lower()
+        if "unique" in err_str or "duplicate" in err_str or "23505" in err_str:
+            raise HTTPException(status_code=409, detail="A WhatsApp account with these credentials already exists.")
+        logger.error("[ManualConnect][%s] DB save failed: %s", corr_id, exc)
+        raise HTTPException(status_code=500, detail=f"Failed to save WhatsApp account. Reference: {corr_id}")
+
+    # 7. Background template creation
+    background_tasks.add_task(_bg_auto_create_templates, body.waba_id, access_token, account_id)
+
+    logger.info(
+        "[ManualConnect][%s] Connected: agency=%s agent=%s phone=%s phone_id=%s waba=%s coexistence=%s sub=%s",
+        corr_id, agency_id, target_agent_id,
+        phone_e164_digits[-4:] + "****" if phone_e164_digits else "?",
+        resolved_phone_number_id, body.waba_id, server_is_coexistence, sub_ok,
+    )
+
+    return api_success(
+        data={
+            "status": "connected" if sub_ok else "partially_connected",
+            "account_id": account_id,
+            "phone_number": display_phone,
+            "phone_number_id": resolved_phone_number_id,
+            "waba_id": body.waba_id,
+            "is_coexistence": server_is_coexistence,
+            "verified_name": verified_name,
+            "provider": "meta",
+            "meta_onboarding_state": onboarding_state,
+        },
+        message="WhatsApp account connected via System User Token" if sub_ok
+        else "WhatsApp connected; webhook subscription failed — will retry automatically",
     )
 
 
