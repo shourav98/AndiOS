@@ -501,18 +501,56 @@ async def _verify_token_waba_permission(access_token: str, waba_id: str, corr_id
             )
 
         granular_scopes = data.get("granular_scopes", [])
+        scopes = data.get("scopes", [])
         waba_authorized = False
+
+        # 1. Embedded Signup tokens: check target_ids if present
         for gs in granular_scopes:
             if gs.get("scope") == "whatsapp_business_management":
                 target_ids = [str(t) for t in gs.get("target_ids", [])]
-                if str(waba_id) in target_ids:
+                if target_ids and str(waba_id) in target_ids:
+                    waba_authorized = True
+                    break
+                elif not target_ids:
+                    # Scope granted at System User / Portfolio level without granular target_id restriction
                     waba_authorized = True
                     break
 
+        # 2. General scopes list (standard for system user tokens)
+        if not waba_authorized and "whatsapp_business_management" in scopes:
+            waba_authorized = True
+
+        # 3. Conclusively verify access by querying the WABA directly with the token
+        try:
+            direct_waba_url = f"{base}/{waba_id}"
+            direct_resp = await client.get(
+                direct_waba_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"fields": "id,name,timezone_id"},
+            )
+            if direct_resp.status_code == 200:
+                direct_data = direct_resp.json()
+                if str(direct_data.get("id")) == str(waba_id):
+                    waba_authorized = True
+                    logger.info(
+                        "[ESU][%s] Direct WABA check confirmed access to WABA %s (name: %s)",
+                        corr_id, waba_id, direct_data.get("name")
+                    )
+            else:
+                logger.warning(
+                    "[ESU][%s] Direct WABA check failed for %s (%s): %s",
+                    corr_id, waba_id, direct_resp.status_code, direct_resp.text
+                )
+                # If direct check fails with permissions error, deny
+                if direct_resp.status_code in (400, 403, 404):
+                    waba_authorized = False
+        except Exception as check_exc:
+            logger.warning("[ESU][%s] Direct WABA check encountered exception: %s", corr_id, check_exc)
+
         if not waba_authorized:
             logger.error(
-                "[ESU][%s] Token granular scopes do not positively grant whatsapp_business_management access to WABA %s: %s",
-                corr_id, waba_id, granular_scopes
+                "[ESU][%s] Token granular scopes do not grant whatsapp_business_management access to WABA %s: granular=%s scopes=%s",
+                corr_id, waba_id, granular_scopes, scopes
             )
             raise HTTPException(
                 status_code=403,
