@@ -7,7 +7,7 @@ GET    /agents/{id}     — single agent with stats
 PATCH  /agents/{id}     — update agent
 DELETE /agents/{id}     — deactivate agent
 """
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from uuid import UUID
 from typing import Optional
 from pydantic import BaseModel, EmailStr
@@ -28,6 +28,7 @@ class InviteAgentRequest(BaseModel):
     name: str
     role: str = "agent"  # 'agent' or 'manager'
     branch: Optional[str] = None
+    phone: Optional[str] = None   # Agent's WhatsApp-enabled mobile number (E.164 preferred)
 
 
 def validate_and_normalize_branch(sb, agency_id: str, branch_val: Optional[str]) -> Optional[str]:
@@ -161,8 +162,12 @@ async def create_branch_endpoint(body: dict, current_user: dict = Depends(verify
 
 
 @router.post("", response_model=ApiResponse[AgentResponse], status_code=201)
-async def create_agent(body: AgentCreate, current_user: dict = Depends(verify_token)):
-    """Add a new agent — checks plan limits and validates branch before creating."""
+async def create_agent(
+    body: AgentCreate,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(verify_token),
+):
+    """Add a new agent — checks plan limits, validates branch, and auto-links WhatsApp."""
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
 
@@ -181,6 +186,22 @@ async def create_agent(body: AgentCreate, current_user: dict = Depends(verify_to
 
         result = sb.table("agents").insert(agent_data).execute()
         created_agent = _populate_agent_branch_info(sb, agency_id, result.data)[0]
+
+        # Auto-link WhatsApp in background if phone number provided
+        phone = body.phone or body.whatsapp_number
+        if phone:
+            from services.communication.whatsapp_auto_link import auto_link_agent_whatsapp
+            background_tasks.add_task(
+                auto_link_agent_whatsapp,
+                agency_id=agency_id,
+                agent_id=created_agent["id"],
+                phone_number=phone,
+            )
+            logger.info(
+                "[Agents] Queued WhatsApp auto-link for agent %s (phone=%s)",
+                created_agent["id"], phone[-4:] + "****" if len(phone) > 4 else "****",
+            )
+
         return api_success(data=created_agent, message="Agent created successfully", status_code=201)
     except HTTPException:
         raise
@@ -191,7 +212,11 @@ async def create_agent(body: AgentCreate, current_user: dict = Depends(verify_to
 
 
 @router.post("/invite", status_code=201)
-async def invite_agent(body: InviteAgentRequest, current_user: dict = Depends(verify_token)):
+async def invite_agent(
+    body: InviteAgentRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(verify_token),
+):
     """
     Invite a new agent via email.
     1. Checks plan limits
@@ -230,17 +255,34 @@ async def invite_agent(body: InviteAgentRequest, current_user: dict = Depends(ve
         }
         if norm_branch:
             insert_payload["branch"] = norm_branch
+        if body.phone:
+            insert_payload["phone"] = body.phone
 
         agent_result = sb.table("agents").insert(insert_payload).execute()
 
         if not agent_result.data:
             raise HTTPException(status_code=500, detail="Failed to create agent record")
 
+        agent = agent_result.data[0]
         agent_formatted = _populate_agent_branch_info(sb, agency_id, [agent])[0]
 
-        # Step 2: Send Supabase invite email
+        # Step 2: Auto-link WhatsApp in background if phone number provided
+        if body.phone:
+            from services.communication.whatsapp_auto_link import auto_link_agent_whatsapp
+            background_tasks.add_task(
+                auto_link_agent_whatsapp,
+                agency_id=agency_id,
+                agent_id=agent["id"],
+                phone_number=body.phone,
+            )
+            logger.info(
+                "[Agents] Queued WhatsApp auto-link for invited agent %s (phone=%s)",
+                agent["id"], body.phone[-4:] + "****" if len(body.phone) > 4 else "****",
+            )
+
+        # Step 3: Send Supabase invite email
         try:
-            invite_response = sb.auth.admin.invite_user_by_email(
+            sb.auth.admin.invite_user_by_email(
                 body.email,
                 options={
                     "data": {
@@ -319,7 +361,12 @@ async def get_agent(agent_id: UUID, current_user: dict = Depends(verify_token)):
 
 
 @router.patch("/{agent_id}", response_model=ApiResponse[AgentResponse])
-async def update_agent(agent_id: UUID, body: AgentUpdate, current_user: dict = Depends(verify_token)):
+async def update_agent(
+    agent_id: UUID,
+    body: AgentUpdate,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(verify_token),
+):
     sb = get_supabase()
     agency_id = require_agency_id(current_user)
     update_data = body.model_dump(exclude_none=True)
@@ -347,6 +394,22 @@ async def update_agent(agent_id: UUID, body: AgentUpdate, current_user: dict = D
     if not result.data:
         raise HTTPException(status_code=404, detail="Agent not found")
     updated_agent = _populate_agent_branch_info(sb, agency_id, result.data)[0]
+
+    # Auto-link WhatsApp if phone or whatsapp_number was just updated
+    new_phone = update_data.get("phone") or update_data.get("whatsapp_number")
+    if new_phone:
+        from services.communication.whatsapp_auto_link import auto_link_agent_whatsapp
+        background_tasks.add_task(
+            auto_link_agent_whatsapp,
+            agency_id=agency_id,
+            agent_id=str(agent_id),
+            phone_number=new_phone,
+        )
+        logger.info(
+            "[Agents] Queued WhatsApp auto-link on profile update for agent %s (phone=%s)",
+            agent_id, new_phone[-4:] + "****" if len(new_phone) > 4 else "****",
+        )
+
     return api_success(data=updated_agent, message="Agent updated successfully")
 
 

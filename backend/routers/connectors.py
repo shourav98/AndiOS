@@ -678,6 +678,7 @@ async def _bg_auto_create_templates(waba_id: str, access_token: str, account_id:
 
 @router.post("/meta-esu/callback")
 @router.post("/whatsapp/embedded-signup-callback")
+@router.post("/whatsapp/callback")
 async def meta_embedded_signup_callback(
     body: EmbeddedSignupCallbackRequest,
     background_tasks: BackgroundTasks,
