@@ -291,9 +291,43 @@ def _render_privacy_html() -> str:
             align-items: center;
             font-size: 13px;
             color: #4b5563;
+            flex-wrap: wrap;
+            gap: 10px;
         }
 
-        .top-toolbar a, .top-toolbar button {
+        .legal-nav {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .legal-nav a {
+            color: #4b5563;
+            text-decoration: none;
+            font-weight: 500;
+            padding: 4px 10px;
+            border-radius: 4px;
+            transition: all 0.15s ease;
+        }
+
+        .legal-nav a:hover {
+            color: #000000;
+            background: #e5e7eb;
+        }
+
+        .legal-nav a.active {
+            color: #000000;
+            font-weight: 700;
+            background: #ffffff;
+            border: 1px solid #d1d5db;
+        }
+
+        .top-toolbar .action-buttons {
+            display: flex;
+            gap: 8px;
+        }
+
+        .top-toolbar a.btn, .top-toolbar button {
             color: #1f2937;
             text-decoration: none;
             font-weight: 500;
@@ -306,9 +340,10 @@ def _render_privacy_html() -> str:
             display: inline-flex;
             align-items: center;
             gap: 6px;
+            font-size: 13px;
         }
 
-        .top-toolbar a:hover, .top-toolbar button:hover {
+        .top-toolbar a.btn:hover, .top-toolbar button:hover {
             background: #f9fafb;
             border-color: #9ca3af;
         }
@@ -487,13 +522,17 @@ def _render_privacy_html() -> str:
 <body>
 
     <div class="top-toolbar">
-        <span>Official AndiOS Legal Document &bull; UAE PDPL Compliant</span>
-        <div style="display: flex; gap: 8px;">
+        <nav class="legal-nav">
+            <a href="/privacy" class="active">Privacy Policy</a>
+            <a href="/terms">Terms of Service</a>
+            <a href="/data-deletion">Data Deletion</a>
+        </nav>
+        <div class="action-buttons">
             <button onclick="window.print()" title="Print or Save as PDF">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V2h12v7"></path><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path><rect x="6" y="14" width="12" height="8"></rect></svg>
                 Print / PDF
             </button>
-            <a href="/api/privacy" target="_blank" title="View JSON format">JSON API</a>
+            <a href="/api/privacy" class="btn" target="_blank" title="View JSON format">JSON API</a>
         </div>
     </div>
 
@@ -733,6 +772,9 @@ def _render_privacy_html() -> str:
         <p>
             Email <a href="mailto:hello@funkydiandi.com">hello@funkydiandi.com</a> or call or WhatsApp <a href="tel:+971551094841">+971 55 109 4841</a>. We will reply within [30 days] and may ask you to confirm your identity. If your data is held for a brokerage, we will pass your request to them. If you are not satisfied, you can complain to the UAE Data Office.
         </p>
+        <p>
+            You can also submit an automated deletion request or track its progress on our dedicated <a href="/data-deletion">User Data Deletion Instructions</a> page.
+        </p>
 
         <!-- Section 9 -->
         <h2 class="section-title">9. Cookies</h2>
@@ -755,8 +797,21 @@ def _render_privacy_html() -> str:
         <!-- Section 12 -->
         <h2 class="section-title">12. Contact us</h2>
         <p>
-            Funky Di Andi for Online Selling (Sole Establishment) Dubai licence no. 1582068 Villa 103, New Dubai, P.O. Box 12345, Dubai, UAE Email: <a href="mailto:hello@funkydiandi.com">hello@funkydiandi.com</a> Phone / WhatsApp: <a href="tel:+971551094841">+971 55 109 4841</a>
+            Funky Di Andi for Online Selling (Sole Establishment)<br>
+            Dubai licence no. 1582068<br>
+            Villa 103, New Dubai, P.O. Box 12345, Dubai, UAE<br>
+            Email: <a href="mailto:hello@funkydiandi.com">hello@funkydiandi.com</a><br>
+            Phone / WhatsApp: <a href="tel:+971551094841">+971 55 109 4841</a>
         </p>
+
+        <div class="doc-footer" style="margin-top: 40px; padding-top: 24px; border-top: 1px solid #e5e7eb; font-size: 13px; color: #6b7280; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
+            <span>&copy; 2026 Funky Di Andi for Online Selling. All rights reserved.</span>
+            <span>
+                <a href="/privacy">Privacy Policy</a> &bull;
+                <a href="/terms">Terms of Service</a> &bull;
+                <a href="/data-deletion">Data Deletion</a>
+            </span>
+        </div>
     </main>
 
 </body>

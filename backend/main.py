@@ -246,6 +246,8 @@ from routers import (
     branches,
     agent_phone_settings,
     privacy,
+    terms,
+    data_deletion,
 )
 
 app.include_router(auth.router)
@@ -268,6 +270,8 @@ app.include_router(calls.router)
 app.include_router(subscription.router)
 app.include_router(agent_phone_settings.router)
 app.include_router(privacy.router)
+app.include_router(terms.router)
+app.include_router(data_deletion.router)
 
 # ─── API v1 Routing Aliases ───────────────────────────────────────────────────
 app.include_router(webhooks.router, prefix="/api/v1")
