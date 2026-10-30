@@ -166,7 +166,7 @@ DATA_DELETION_DATA = {
             "content": (
                 "Acknowledgment: Within 24 to 48 hours of your submission, you will receive an acknowledgment receipt containing your unique Tracking Code.\n\n"
                 "Identity Verification: To prevent unauthorized or malicious deletion of another person's records, our team may verify your identity by sending a short confirmation code to the registered phone number or email address.\n\n"
-                "Execution Timeframe: In full compliance with Article 14 of the UAE Personal Data Protection Law (PDPL), all personal data stored across active databases, caching layers, and connected systems will be permanently removed or irreversibly anonymized within thirty (30) calendar days from verified request.\n\n"
+                "Execution Timeframe: As part of our privacy commitment, all personal data stored across active databases, caching layers, and connected systems will be permanently removed or irreversibly anonymized within thirty (30) calendar days from verified request.\n\n"
                 "Final Confirmation: Once data deletion is completed, our system dispatches a final confirmation email or notification to the contact details provided."
             )
         },
@@ -801,7 +801,7 @@ def _render_data_deletion_html(confirmation_id: Optional[str] = None) -> str:
             <strong>Identity Verification:</strong> To protect our users against fraudulent or unauthorized deletion requests, our security team may verify ownership of the phone number or email address via SMS or email confirmation before final purging.
         </p>
         <p>
-            <strong>Timeline:</strong> In strict compliance with <strong>Article 14 of the UAE Personal Data Protection Law (PDPL)</strong>, all verified personal data is permanently deleted from primary databases, cache stores, and backup rotations within <strong>thirty (30) calendar days</strong>.
+            <strong>Timeline:</strong> As part of our privacy commitment, all verified personal data is permanently deleted from primary databases, cache stores, and backup rotations within <strong>thirty (30) calendar days</strong>.
         </p>
         <p>
             <strong>Completion Notice:</strong> Once the deletion process is finalized, a formal completion confirmation will be recorded in our audit logs and sent to the requester.
