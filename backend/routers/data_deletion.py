@@ -719,7 +719,7 @@ def _render_data_deletion_html(confirmation_id: Optional[str] = None) -> str:
         <div class="method-card">
             <h3><span class="method-badge">Email</span> Option 3: Direct Email Request to Data Protection Team</h3>
             <p>
-                You may email our Data Protection Team directly at <a href="mailto:hello@funkydiandi.com">hello@funkydiandi.com</a> or our compliance contact at <a href="mailto:somn.riam@outlook.com">somn.riam@outlook.com</a>.
+                You may email our Data Protection Team directly at <a href="mailto:hello@funkydiandi.com">hello@funkydiandi.com</a>.
             </p>
             <p style="margin-bottom: 0;">
                 Please set the subject line to <em>&ldquo;User Data Deletion Request&rdquo;</em> and include your full name, the phone/WhatsApp number used, and the brokerage you interacted with. We will respond with your official tracking receipt within 24 to 48 hours.
@@ -885,7 +885,6 @@ def _render_data_deletion_html(confirmation_id: Optional[str] = None) -> str:
             Dubai DET Licence No. 1582068<br>
             Villa 103, New Dubai, P.O. Box 12345, Dubai, UAE<br>
             Primary Email: <a href="mailto:hello@funkydiandi.com">hello@funkydiandi.com</a><br>
-            Compliance Contact: <a href="mailto:somn.riam@outlook.com">somn.riam@outlook.com</a><br>
             Phone / WhatsApp: <a href="tel:+971551094841">+971 55 109 4841</a>
         </p>
         <p>
