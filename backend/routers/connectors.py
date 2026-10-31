@@ -438,6 +438,18 @@ def _graph_base_url() -> str:
     return f"https://graph.facebook.com/{version}"
 
 
+def _get_meta_app_id() -> str:
+    """Sanitize and return Meta App ID, stripping quotes or whitespace."""
+    val = getattr(settings, "META_APP_ID", "") or getattr(settings, "WHATSAPP_APP_ID", "") or ""
+    return str(val).strip().strip('"').strip("'")
+
+
+def _get_meta_app_secret() -> str:
+    """Sanitize and return Meta App Secret, stripping quotes or whitespace."""
+    val = getattr(settings, "META_APP_SECRET", "") or getattr(settings, "WHATSAPP_APP_SECRET", "") or ""
+    return str(val).strip().strip('"').strip("'")
+
+
 async def _exchange_code_for_token(code: str, corr_id: str) -> dict:
     """
     Exchange ESU authorization code for an access token.
@@ -445,16 +457,25 @@ async def _exchange_code_for_token(code: str, corr_id: str) -> dict:
     Logs details server-side with correlation id; returns generic error to client.
     """
     import httpx
+    app_id = _get_meta_app_id()
+    app_secret = _get_meta_app_secret()
+    if not app_id or not app_secret:
+        logger.error("[ESU][%s] META_APP_ID or META_APP_SECRET not configured on server", corr_id)
+        raise HTTPException(
+            status_code=503,
+            detail=f"WhatsApp provider credentials not configured on server. Reference: {corr_id}",
+        )
+
     url = f"{_graph_base_url()}/oauth/access_token"
     params = {
-        "client_id": getattr(settings, "META_APP_ID", ""),
-        "client_secret": getattr(settings, "META_APP_SECRET", ""),
-        "code": code,
+        "client_id": app_id,
+        "client_secret": app_secret,
+        "code": str(code).strip(),
     }
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.get(url, params=params)
         if resp.status_code != 200:
-            logger.error("[ESU][%s] Token exchange error: %s %s", corr_id, resp.status_code, resp.text)
+            logger.error("[ESU][%s] Token exchange error: %s %s (app_id=%s)", corr_id, resp.status_code, resp.text, app_id)
             raise HTTPException(
                 status_code=502,
                 detail=f"WhatsApp provider authorization failed. Reference: {corr_id}",
@@ -470,8 +491,8 @@ async def _verify_token_waba_permission(access_token: str, waba_id: str, corr_id
     Sentence: "The debug_token endpoint returns metadata about the given user or page access token." (13 words).
     """
     import httpx
-    app_id = getattr(settings, "META_APP_ID", "")
-    app_secret = getattr(settings, "META_APP_SECRET", "")
+    app_id = _get_meta_app_id()
+    app_secret = _get_meta_app_secret()
     if not app_id or not app_secret:
         logger.error("[ESU][%s] META_APP_ID or META_APP_SECRET not configured for debug_token check", corr_id)
         raise HTTPException(
@@ -573,8 +594,8 @@ async def _discover_waba_id_from_token(access_token: str, corr_id: str) -> Optio
     that have phone numbers configured.
     """
     import httpx
-    app_id = getattr(settings, "META_APP_ID", "")
-    app_secret = getattr(settings, "META_APP_SECRET", "")
+    app_id = _get_meta_app_id()
+    app_secret = _get_meta_app_secret()
     base = _graph_base_url()
 
     discovered_wabas: list[str] = []
