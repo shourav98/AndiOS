@@ -86,11 +86,12 @@ class ConnectorCredentials(BaseModel):
 class EmbeddedSignupCallbackRequest(BaseModel):
     """
     Payload sent by frontend after completing Meta Embedded Signup (v4).
-    phone_number_id is optional — if omitted the backend auto-discovers it
-    from the WABA via Graph API (handles cases where postMessage never fires).
+    Both waba_id and phone_number_id are optional — if omitted or null, the backend
+    auto-discovers them from the exchanged Meta access token and WABA Graph API
+    (handles cases where postMessage never fires or only authorization code is returned).
     """
     code: str
-    waba_id: str
+    waba_id: Optional[str] = None           # Auto-discovered if not supplied
     phone_number_id: Optional[str] = None   # Auto-discovered if not supplied
     agent_id: Optional[str] = None
     confirm_replace_default: bool = False
@@ -560,6 +561,183 @@ async def _verify_token_waba_permission(access_token: str, waba_id: str, corr_id
 
 
 
+async def _discover_waba_id_from_token(access_token: str, corr_id: str) -> Optional[str]:
+    """
+    Auto-discover WABA ID from an access token when not supplied by frontend.
+    Tries multiple methods in order:
+    1. debug_token endpoint granular_scopes.target_ids for whatsapp_business_management/messaging
+    2. /me/whatsapp_business_accounts endpoint
+    3. /me/businesses endpoint with owned/client_whatsapp_business_accounts
+    4. /me endpoint with whatsapp_business_accounts
+    Resolves Business IDs to WABA IDs where appropriate, and prioritizes WABAs
+    that have phone numbers configured.
+    """
+    import httpx
+    app_id = getattr(settings, "META_APP_ID", "")
+    app_secret = getattr(settings, "META_APP_SECRET", "")
+    base = _graph_base_url()
+
+    discovered_wabas: list[str] = []
+
+    # Method 1: Check debug_token granular_scopes
+    if app_id and app_secret:
+        debug_url = f"{base}/debug_token"
+        params = {
+            "input_token": access_token,
+            "access_token": f"{app_id}|{app_secret}",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(debug_url, params=params)
+                if resp.status_code == 200:
+                    data = resp.json().get("data", {})
+                    granular_scopes = data.get("granular_scopes", [])
+                    for gs in granular_scopes:
+                        scope_name = gs.get("scope")
+                        if scope_name in ("whatsapp_business_management", "whatsapp_business_messaging"):
+                            for tid in gs.get("target_ids", []):
+                                tid_str = str(tid).strip()
+                                if tid_str and tid_str not in discovered_wabas:
+                                    discovered_wabas.append(tid_str)
+                    if discovered_wabas:
+                        logger.info(
+                            "[ESU][%s] Auto-discovered %d candidate WABA ID(s) via debug_token: %s",
+                            corr_id, len(discovered_wabas), discovered_wabas
+                        )
+        except Exception as exc:
+            logger.warning("[ESU][%s] Exception in _discover_waba_id_from_token via debug_token: %s", corr_id, exc)
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    # Method 2: /me/whatsapp_business_accounts
+    if not discovered_wabas:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(
+                    f"{base}/me/whatsapp_business_accounts",
+                    headers=headers,
+                    params={"fields": "id,name,timezone_id"},
+                )
+                if resp.status_code == 200:
+                    waba_items = resp.json().get("data", [])
+                    for w in waba_items:
+                        wid = str(w.get("id", "")).strip()
+                        if wid and wid not in discovered_wabas:
+                            discovered_wabas.append(wid)
+                    if discovered_wabas:
+                        logger.info(
+                            "[ESU][%s] Auto-discovered %d WABA ID(s) via /me/whatsapp_business_accounts: %s",
+                            corr_id, len(discovered_wabas), discovered_wabas
+                        )
+        except Exception as exc:
+            logger.warning("[ESU][%s] Exception in _discover_waba_id_from_token via /me/whatsapp_business_accounts: %s", corr_id, exc)
+
+    # Method 3: /me/businesses (owned/client WABAs)
+    if not discovered_wabas:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(
+                    f"{base}/me/businesses",
+                    headers=headers,
+                    params={"fields": "id,name,owned_whatsapp_business_accounts{id,name},client_whatsapp_business_accounts{id,name}"},
+                )
+                if resp.status_code == 200:
+                    biz_items = resp.json().get("data", [])
+                    for b in biz_items:
+                        owned = (b.get("owned_whatsapp_business_accounts") or {}).get("data", [])
+                        for w in owned:
+                            wid = str(w.get("id", "")).strip()
+                            if wid and wid not in discovered_wabas:
+                                discovered_wabas.append(wid)
+                        client_wabas = (b.get("client_whatsapp_business_accounts") or {}).get("data", [])
+                        for w in client_wabas:
+                            wid = str(w.get("id", "")).strip()
+                            if wid and wid not in discovered_wabas:
+                                discovered_wabas.append(wid)
+                    if discovered_wabas:
+                        logger.info(
+                            "[ESU][%s] Auto-discovered %d WABA ID(s) via /me/businesses: %s",
+                            corr_id, len(discovered_wabas), discovered_wabas
+                        )
+        except Exception as exc:
+            logger.warning("[ESU][%s] Exception in _discover_waba_id_from_token via /me/businesses: %s", corr_id, exc)
+
+    # Method 4: /me?fields=whatsapp_business_accounts
+    if not discovered_wabas:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(
+                    f"{base}/me",
+                    headers=headers,
+                    params={"fields": "id,name,whatsapp_business_accounts{id,name}"},
+                )
+                if resp.status_code == 200:
+                    w_data = (resp.json().get("whatsapp_business_accounts") or {}).get("data", [])
+                    for w in w_data:
+                        wid = str(w.get("id", "")).strip()
+                        if wid and wid not in discovered_wabas:
+                            discovered_wabas.append(wid)
+                    if discovered_wabas:
+                        logger.info(
+                            "[ESU][%s] Auto-discovered %d WABA ID(s) via /me: %s",
+                            corr_id, len(discovered_wabas), discovered_wabas
+                        )
+        except Exception as exc:
+            logger.warning("[ESU][%s] Exception in _discover_waba_id_from_token via /me: %s", corr_id, exc)
+
+    if not discovered_wabas:
+        return None
+
+    # Resolve candidate IDs: some might be Business IDs containing WABAs
+    resolved_waba_list: list[str] = []
+    async with httpx.AsyncClient(timeout=20) as client:
+        for cid in discovered_wabas:
+            try:
+                c_resp = await client.get(
+                    f"{base}/{cid}",
+                    headers=headers,
+                    params={"fields": "id,name,timezone_id,owned_whatsapp_business_accounts{id,name},client_whatsapp_business_accounts{id,name}"},
+                )
+                if c_resp.status_code == 200:
+                    c_data = c_resp.json()
+                    owned = (c_data.get("owned_whatsapp_business_accounts") or {}).get("data", [])
+                    for o in owned:
+                        oid = str(o.get("id", "")).strip()
+                        if oid and oid not in resolved_waba_list:
+                            resolved_waba_list.append(oid)
+                    client_w = (c_data.get("client_whatsapp_business_accounts") or {}).get("data", [])
+                    for c in client_w:
+                        cwid = str(c.get("id", "")).strip()
+                        if cwid and cwid not in resolved_waba_list:
+                            resolved_waba_list.append(cwid)
+
+                    # If no child accounts, candidate itself is a WABA
+                    if not owned and not client_w:
+                        if cid not in resolved_waba_list:
+                            resolved_waba_list.append(cid)
+                else:
+                    if cid not in resolved_waba_list:
+                        resolved_waba_list.append(cid)
+            except Exception:
+                if cid not in resolved_waba_list:
+                    resolved_waba_list.append(cid)
+
+    final_candidates = resolved_waba_list or discovered_wabas
+
+    # If multiple candidates exist, prioritize one with registered phone numbers
+    if len(final_candidates) > 1:
+        for wid in final_candidates:
+            try:
+                nums = await _discover_waba_phone_numbers(wid, access_token, corr_id)
+                if nums:
+                    logger.info("[ESU][%s] Auto-selected WABA %s because it contains %d phone number(s)", corr_id, wid, len(nums))
+                    return wid
+            except Exception:
+                continue
+
+    return final_candidates[0] if final_candidates else None
+
+
 async def _discover_waba_phone_numbers(waba_id: str, access_token: str, corr_id: str) -> list[dict]:
     """
     Fetch all phone numbers registered under a WABA via Graph API.
@@ -580,6 +758,16 @@ async def _discover_waba_phone_numbers(waba_id: str, access_token: str, corr_id:
         while next_url:
             if next_url == url:
                 resp = await client.get(next_url, headers=headers, params=params)
+                if resp.status_code != 200:
+                    logger.warning(
+                        "[ESU][%s] Extended phone_numbers query failed (%s): %s. Retrying with basic fields...",
+                        corr_id, resp.status_code, resp.text
+                    )
+                    resp = await client.get(
+                        next_url,
+                        headers=headers,
+                        params={"fields": "id,display_phone_number,verified_name,quality_rating,platform_type"}
+                    )
             else:
                 resp = await client.get(next_url, headers=headers)
             if resp.status_code != 200:
@@ -897,20 +1085,37 @@ async def meta_embedded_signup_callback(
         else None
     )
 
-    # 3. Resolve phone_number_id: use supplied value OR auto-discover from WABA
-    resolved_phone_number_id = body.phone_number_id
+    # 3. Resolve waba_id: use supplied value OR auto-discover from access token
+    resolved_waba_id = (resolved_waba_id or "").strip()
+    if not resolved_waba_id:
+        logger.info(
+            "[ESU][%s] waba_id not supplied by frontend — auto-discovering from access token",
+            corr_id,
+        )
+        resolved_waba_id = await _discover_waba_id_from_token(access_token, corr_id)
+        if not resolved_waba_id:
+            logger.error("[ESU][%s] Could not auto-discover any WABA from access token", corr_id)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not discover any WhatsApp Business Account (WABA) associated with your Meta authorization. Ensure a WhatsApp Business Account is set up in your Meta Business portfolio. Reference: {corr_id}",
+            )
+        logger.info("[ESU][%s] Auto-discovered waba_id=%s from access token", corr_id, resolved_waba_id)
+    else:
+        # Validate token against supplied WABA (fail-closed)
+        await _verify_token_waba_permission(access_token, resolved_waba_id, corr_id)
+
+    # 4. Resolve phone_number_id: use supplied value OR auto-discover from WABA
+    resolved_phone_number_id = (body.phone_number_id or "").strip() or None
     if not resolved_phone_number_id:
         logger.info(
             "[ESU][%s] phone_number_id not supplied by frontend — auto-discovering from WABA %s",
-            corr_id, body.waba_id,
+            corr_id, resolved_waba_id,
         )
-        # Validate token against WABA before discovery
-        await _verify_token_waba_permission(access_token, body.waba_id, corr_id)
-        discovered = await _discover_waba_phone_numbers(body.waba_id, access_token, corr_id)
+        discovered = await _discover_waba_phone_numbers(resolved_waba_id, access_token, corr_id)
         if not discovered:
             raise HTTPException(
                 status_code=400,
-                detail=f"No phone numbers found in WhatsApp Business Account {body.waba_id}. Add a number in Meta Business Manager first. Reference: {corr_id}",
+                detail=f"No phone numbers found in WhatsApp Business Account {resolved_waba_id}. Add a number in Meta Business Manager first. Reference: {corr_id}",
             )
         if len(discovered) > 1:
             # Pick the first active/verified one, or just the first
@@ -931,7 +1136,7 @@ async def meta_embedded_signup_callback(
                     corr_id, resolved_phone_number_id, phone_details.get("display_phone_number"))
     else:
         # Verify with new token that waba_id and phone_number_id belong to it (fail-closed)
-        phone_details = await _verify_waba_and_phone(body.waba_id, resolved_phone_number_id, access_token, corr_id)
+        phone_details = await _verify_waba_and_phone(resolved_waba_id, resolved_phone_number_id, access_token, corr_id)
 
     display_phone = phone_details.get("display_phone_number", "")
     phone_e164_digits = re.sub(r"[^\d]", "", display_phone)
@@ -970,7 +1175,7 @@ async def meta_embedded_signup_callback(
             "provider": "meta",
             "phone_number": phone_e164_digits,
             "phone_number_id": resolved_phone_number_id,
-            "external_account_id": body.waba_id,
+            "external_account_id": resolved_waba_id,
             "status": "pending",
             "is_coexistence": False,
             "meta_onboarding_state": "registration_failed",
@@ -1024,8 +1229,8 @@ async def meta_embedded_signup_callback(
     encrypted_pin = encrypt_token(random_pin) if actually_registered_with_pin else None
 
     # 6. Subscribe to WABA webhooks
-    sub_ok = await _subscribe_app_to_waba(body.waba_id, access_token, corr_id)
-    logger.info("[ESU][%s] Webhook subscription for WABA %s: %s", corr_id, body.waba_id, 'OK' if sub_ok else 'FAILED')
+    sub_ok = await _subscribe_app_to_waba(resolved_waba_id, access_token, corr_id)
+    logger.info("[ESU][%s] Webhook subscription for WABA %s: %s", corr_id, resolved_waba_id, 'OK' if sub_ok else 'FAILED')
     onboarding_state = "embedded_signup" if sub_ok else "webhook_subscription_failed"
 
     # 7. Encrypt token and prepare upsert data (NO app_secret written to metadata)
@@ -1038,7 +1243,7 @@ async def meta_embedded_signup_callback(
         "provider": "meta",
         "phone_number": phone_e164_digits,
         "phone_number_id": resolved_phone_number_id,
-        "external_account_id": body.waba_id,
+        "external_account_id": resolved_waba_id,
         "access_token_enc": encrypted_token,
         "token_expires_at": token_expires_at,
         "registration_pin_enc": encrypted_pin,
@@ -1091,16 +1296,16 @@ async def meta_embedded_signup_callback(
 
     # 9. Schedule standard template creation in background
     if background_tasks:
-        background_tasks.add_task(_bg_auto_create_templates, body.waba_id, access_token, account_id)
+        background_tasks.add_task(_bg_auto_create_templates, resolved_waba_id, access_token, account_id)
     else:
         import asyncio
-        asyncio.create_task(_bg_auto_create_templates(body.waba_id, access_token, account_id))
+        asyncio.create_task(_bg_auto_create_templates(resolved_waba_id, access_token, account_id))
 
     logger.info(
         "[ESU][%s] WhatsApp connected: agency=%s agent=%s phone=%s phone_id=%s waba=%s coexistence=%s sub=%s",
         corr_id, agency_id, target_agent_id,
         phone_e164_digits[-4:] + "****" if phone_e164_digits else "?",
-        resolved_phone_number_id, body.waba_id, server_is_coexistence, sub_ok,
+        resolved_phone_number_id, resolved_waba_id, server_is_coexistence, sub_ok,
     )
 
     resp_status = "connected" if sub_ok else "partially_connected"
@@ -1116,7 +1321,7 @@ async def meta_embedded_signup_callback(
             "account_id": account_id,
             "phone_number": display_phone,
             "phone_number_id": resolved_phone_number_id,
-            "waba_id": body.waba_id,
+            "waba_id": resolved_waba_id,
             "is_coexistence": server_is_coexistence,
             "verified_name": verified_name,
             "provider": "meta",
