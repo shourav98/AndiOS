@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     WHATSAPP_API_KEY: str = ""
     # Meta Graph API version — single configurable version.
     # Latest stable version per official changelog: v26.0 (released July 29, 2026).
-    META_GRAPH_API_VERSION: str = "v26.0"
+    META_GRAPH_API_VERSION: str = "v21.0"
     WHATSAPP_PHONE_NUMBER_ID: str = ""
     WHATSAPP_VERIFY_TOKEN: str = "andios_verify_token"
     META_APP_SECRET: str = ""  # App Secret for Meta Cloud API X-Hub-Signature-256 verification

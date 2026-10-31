@@ -434,7 +434,7 @@ async def test_whatsapp(to_phone: str = Query(...), current_user: dict = Depends
 
 def _graph_base_url() -> str:
     """Return versioned Graph API base URL using settings."""
-    version = getattr(settings, "META_GRAPH_API_VERSION", "v26.0") or "v26.0"
+    version = getattr(settings, "META_GRAPH_API_VERSION", "v21.0") or "v21.0"
     return f"https://graph.facebook.com/{version}"
 
 
