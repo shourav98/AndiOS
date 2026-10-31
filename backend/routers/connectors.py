@@ -586,12 +586,11 @@ async def _discover_waba_id_from_token(access_token: str, corr_id: str) -> Optio
     """
     Auto-discover WABA ID from an access token when not supplied by frontend.
     Tries multiple methods in order:
-    1. debug_token endpoint granular_scopes.target_ids for whatsapp_business_management/messaging
+    1. debug_token endpoint granular_scopes.target_ids for whatsapp scopes
     2. /me/whatsapp_business_accounts endpoint
-    3. /me/businesses endpoint with owned/client_whatsapp_business_accounts
+    3. /me/businesses endpoint, followed by /{business_id}/owned_whatsapp_business_accounts
+       and /{business_id}/client_whatsapp_business_accounts
     4. /me endpoint with whatsapp_business_accounts
-    Resolves Business IDs to WABA IDs where appropriate, and prioritizes WABAs
-    that have phone numbers configured.
     """
     import httpx
     app_id = _get_meta_app_id()
@@ -599,6 +598,7 @@ async def _discover_waba_id_from_token(access_token: str, corr_id: str) -> Optio
     base = _graph_base_url()
 
     discovered_wabas: list[str] = []
+    headers = {"Authorization": f"Bearer {access_token}"}
 
     # Method 1: Check debug_token granular_scopes
     if app_id and app_secret:
@@ -610,132 +610,123 @@ async def _discover_waba_id_from_token(access_token: str, corr_id: str) -> Optio
         try:
             async with httpx.AsyncClient(timeout=20) as client:
                 resp = await client.get(debug_url, params=params)
+                logger.info("[ESU][%s] debug_token status=%s: %s", corr_id, resp.status_code, resp.text)
                 if resp.status_code == 200:
                     data = resp.json().get("data", {})
                     granular_scopes = data.get("granular_scopes", [])
                     for gs in granular_scopes:
-                        scope_name = gs.get("scope")
-                        if scope_name in ("whatsapp_business_management", "whatsapp_business_messaging"):
-                            for tid in gs.get("target_ids", []):
-                                tid_str = str(tid).strip()
-                                if tid_str and tid_str not in discovered_wabas:
-                                    discovered_wabas.append(tid_str)
+                        scope_name = gs.get("scope", "")
+                        for tid in gs.get("target_ids", []):
+                            tid_str = str(tid).strip()
+                            if tid_str and tid_str not in discovered_wabas:
+                                discovered_wabas.append(tid_str)
                     if discovered_wabas:
                         logger.info(
-                            "[ESU][%s] Auto-discovered %d candidate WABA ID(s) via debug_token: %s",
+                            "[ESU][%s] Discovered %d candidate ID(s) via debug_token: %s",
                             corr_id, len(discovered_wabas), discovered_wabas
                         )
         except Exception as exc:
             logger.warning("[ESU][%s] Exception in _discover_waba_id_from_token via debug_token: %s", corr_id, exc)
 
-    headers = {"Authorization": f"Bearer {access_token}"}
-
     # Method 2: /me/whatsapp_business_accounts
-    if not discovered_wabas:
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.get(
-                    f"{base}/me/whatsapp_business_accounts",
-                    headers=headers,
-                    params={"fields": "id,name,timezone_id"},
-                )
-                if resp.status_code == 200:
-                    waba_items = resp.json().get("data", [])
-                    for w in waba_items:
-                        wid = str(w.get("id", "")).strip()
-                        if wid and wid not in discovered_wabas:
-                            discovered_wabas.append(wid)
-                    if discovered_wabas:
-                        logger.info(
-                            "[ESU][%s] Auto-discovered %d WABA ID(s) via /me/whatsapp_business_accounts: %s",
-                            corr_id, len(discovered_wabas), discovered_wabas
-                        )
-        except Exception as exc:
-            logger.warning("[ESU][%s] Exception in _discover_waba_id_from_token via /me/whatsapp_business_accounts: %s", corr_id, exc)
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                f"{base}/me/whatsapp_business_accounts",
+                headers=headers,
+                params={"fields": "id,name,timezone_id"},
+            )
+            logger.info("[ESU][%s] /me/whatsapp_business_accounts status=%s: %s", corr_id, resp.status_code, resp.text)
+            if resp.status_code == 200:
+                waba_items = resp.json().get("data", [])
+                for w in waba_items:
+                    wid = str(w.get("id", "")).strip()
+                    if wid and wid not in discovered_wabas:
+                        discovered_wabas.append(wid)
+    except Exception as exc:
+        logger.warning("[ESU][%s] Exception in /me/whatsapp_business_accounts: %s", corr_id, exc)
 
-    # Method 3: /me/businesses (owned/client WABAs)
-    if not discovered_wabas:
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.get(
-                    f"{base}/me/businesses",
-                    headers=headers,
-                    params={"fields": "id,name,owned_whatsapp_business_accounts{id,name},client_whatsapp_business_accounts{id,name}"},
-                )
-                if resp.status_code == 200:
-                    biz_items = resp.json().get("data", [])
-                    for b in biz_items:
-                        owned = (b.get("owned_whatsapp_business_accounts") or {}).get("data", [])
-                        for w in owned:
-                            wid = str(w.get("id", "")).strip()
-                            if wid and wid not in discovered_wabas:
-                                discovered_wabas.append(wid)
-                        client_wabas = (b.get("client_whatsapp_business_accounts") or {}).get("data", [])
-                        for w in client_wabas:
-                            wid = str(w.get("id", "")).strip()
-                            if wid and wid not in discovered_wabas:
-                                discovered_wabas.append(wid)
-                    if discovered_wabas:
-                        logger.info(
-                            "[ESU][%s] Auto-discovered %d WABA ID(s) via /me/businesses: %s",
-                            corr_id, len(discovered_wabas), discovered_wabas
+    # Method 3: /me/businesses and query each business for owned/client WABAs
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                f"{base}/me/businesses",
+                headers=headers,
+                params={"fields": "id,name"},
+            )
+            logger.info("[ESU][%s] /me/businesses status=%s: %s", corr_id, resp.status_code, resp.text)
+            if resp.status_code == 200:
+                businesses = resp.json().get("data", [])
+                for b in businesses:
+                    biz_id = str(b.get("id", "")).strip()
+                    if not biz_id:
+                        continue
+                    
+                    # Query /{biz_id}/owned_whatsapp_business_accounts
+                    try:
+                        owned_resp = await client.get(
+                            f"{base}/{biz_id}/owned_whatsapp_business_accounts",
+                            headers=headers,
+                            params={"fields": "id,name,timezone_id"},
                         )
-        except Exception as exc:
-            logger.warning("[ESU][%s] Exception in _discover_waba_id_from_token via /me/businesses: %s", corr_id, exc)
+                        logger.info("[ESU][%s] biz %s owned_wabas status=%s: %s", corr_id, biz_id, owned_resp.status_code, owned_resp.text)
+                        if owned_resp.status_code == 200:
+                            for ow in owned_resp.json().get("data", []):
+                                owid = str(ow.get("id", "")).strip()
+                                if owid and owid not in discovered_wabas:
+                                    discovered_wabas.append(owid)
+                    except Exception as ow_err:
+                        logger.warning("[ESU][%s] Error fetching owned_wabas for biz %s: %s", corr_id, biz_id, ow_err)
 
-    # Method 4: /me?fields=whatsapp_business_accounts
-    if not discovered_wabas:
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.get(
-                    f"{base}/me",
-                    headers=headers,
-                    params={"fields": "id,name,whatsapp_business_accounts{id,name}"},
-                )
-                if resp.status_code == 200:
-                    w_data = (resp.json().get("whatsapp_business_accounts") or {}).get("data", [])
-                    for w in w_data:
-                        wid = str(w.get("id", "")).strip()
-                        if wid and wid not in discovered_wabas:
-                            discovered_wabas.append(wid)
-                    if discovered_wabas:
-                        logger.info(
-                            "[ESU][%s] Auto-discovered %d WABA ID(s) via /me: %s",
-                            corr_id, len(discovered_wabas), discovered_wabas
+                    # Query /{biz_id}/client_whatsapp_business_accounts
+                    try:
+                        client_resp = await client.get(
+                            f"{base}/{biz_id}/client_whatsapp_business_accounts",
+                            headers=headers,
+                            params={"fields": "id,name,timezone_id"},
                         )
-        except Exception as exc:
-            logger.warning("[ESU][%s] Exception in _discover_waba_id_from_token via /me: %s", corr_id, exc)
+                        logger.info("[ESU][%s] biz %s client_wabas status=%s: %s", corr_id, biz_id, client_resp.status_code, client_resp.text)
+                        if client_resp.status_code == 200:
+                            for cw in client_resp.json().get("data", []):
+                                cwid = str(cw.get("id", "")).strip()
+                                if cwid and cwid not in discovered_wabas:
+                                    discovered_wabas.append(cwid)
+                    except Exception as cw_err:
+                        logger.warning("[ESU][%s] Error fetching client_wabas for biz %s: %s", corr_id, biz_id, cw_err)
+    except Exception as exc:
+        logger.warning("[ESU][%s] Exception in /me/businesses: %s", corr_id, exc)
 
+    logger.info("[ESU][%s] Total candidate WABA IDs discovered: %s", corr_id, discovered_wabas)
     if not discovered_wabas:
         return None
 
-    # Resolve candidate IDs: some might be Business IDs containing WABAs
+    # Resolve candidate IDs: if any candidate is a business ID, get its WABAs; otherwise verify it's a WABA
     resolved_waba_list: list[str] = []
     async with httpx.AsyncClient(timeout=20) as client:
         for cid in discovered_wabas:
             try:
-                c_resp = await client.get(
-                    f"{base}/{cid}",
+                # Check if cid directly has phone numbers (meaning it's definitely a WABA)
+                p_resp = await client.get(
+                    f"{base}/{cid}/phone_numbers",
                     headers=headers,
-                    params={"fields": "id,name,timezone_id,owned_whatsapp_business_accounts{id,name},client_whatsapp_business_accounts{id,name}"},
+                    params={"fields": "id,display_phone_number"},
                 )
-                if c_resp.status_code == 200:
-                    c_data = c_resp.json()
-                    owned = (c_data.get("owned_whatsapp_business_accounts") or {}).get("data", [])
-                    for o in owned:
-                        oid = str(o.get("id", "")).strip()
-                        if oid and oid not in resolved_waba_list:
-                            resolved_waba_list.append(oid)
-                    client_w = (c_data.get("client_whatsapp_business_accounts") or {}).get("data", [])
-                    for c in client_w:
-                        cwid = str(c.get("id", "")).strip()
-                        if cwid and cwid not in resolved_waba_list:
-                            resolved_waba_list.append(cwid)
+                if p_resp.status_code == 200:
+                    if cid not in resolved_waba_list:
+                        resolved_waba_list.append(cid)
+                    continue
 
-                    # If no child accounts, candidate itself is a WABA
-                    if not owned and not client_w:
-                        if cid not in resolved_waba_list:
-                            resolved_waba_list.append(cid)
+                # If phone_numbers check didn't succeed, check if it's a Business that owns WABAs
+                b_resp = await client.get(
+                    f"{base}/{cid}/owned_whatsapp_business_accounts",
+                    headers=headers,
+                    params={"fields": "id,name"},
+                )
+                if b_resp.status_code == 200:
+                    for w in b_resp.json().get("data", []):
+                        wid = str(w.get("id", "")).strip()
+                        if wid and wid not in resolved_waba_list:
+                            resolved_waba_list.append(wid)
                 else:
                     if cid not in resolved_waba_list:
                         resolved_waba_list.append(cid)
@@ -744,8 +735,8 @@ async def _discover_waba_id_from_token(access_token: str, corr_id: str) -> Optio
                     resolved_waba_list.append(cid)
 
     final_candidates = resolved_waba_list or discovered_wabas
+    logger.info("[ESU][%s] Final candidate WABAs: %s", corr_id, final_candidates)
 
-    # If multiple candidates exist, prioritize one with registered phone numbers
     if len(final_candidates) > 1:
         for wid in final_candidates:
             try:
@@ -757,6 +748,7 @@ async def _discover_waba_id_from_token(access_token: str, corr_id: str) -> Optio
                 continue
 
     return final_candidates[0] if final_candidates else None
+
 
 
 async def _discover_waba_phone_numbers(waba_id: str, access_token: str, corr_id: str) -> list[dict]:
