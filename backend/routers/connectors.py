@@ -1107,7 +1107,7 @@ async def meta_embedded_signup_callback(
     )
 
     # 3. Resolve waba_id: use supplied value OR auto-discover from access token
-    resolved_waba_id = (resolved_waba_id or "").strip()
+    resolved_waba_id = (body.waba_id or "").strip()
     if not resolved_waba_id:
         logger.info(
             "[ESU][%s] waba_id not supplied by frontend — auto-discovering from access token",
