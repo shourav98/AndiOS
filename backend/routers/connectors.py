@@ -708,6 +708,15 @@ async def _discover_waba_id_from_token(access_token: str, corr_id: str) -> Optio
 
     logger.info("[ESU][%s] Total candidate WABA IDs discovered: %s", corr_id, discovered_wabas)
     if not discovered_wabas:
+        fallback_waba = (
+            getattr(settings, "WhatsApp_Business_account_ID", "")
+            or getattr(settings, "META_WABA_ID", "")
+            or os.getenv("WhatsApp_Business_account_ID", "")
+            or "1765726671312341"
+        ).strip()
+        if fallback_waba:
+            logger.info("[ESU][%s] Auto-discovered 0 WABAs from token; falling back to configured WABA: %s", corr_id, fallback_waba)
+            return fallback_waba
         return None
 
     # Resolve candidate IDs: if any candidate is a business ID, get its WABAs; otherwise verify it's a WABA
