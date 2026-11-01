@@ -30,6 +30,7 @@ POST   /connectors/{connector_name}/disconnect        — disconnect any generic
 from __future__ import annotations
 
 import logging
+import os
 import re
 import secrets
 import uuid
