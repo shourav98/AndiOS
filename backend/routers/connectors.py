@@ -599,6 +599,7 @@ async def _discover_waba_id_from_token(access_token: str, corr_id: str) -> Optio
 
     discovered_wabas: list[str] = []
     headers = {"Authorization": f"Bearer {access_token}"}
+    token_user_id: Optional[str] = None
 
     # Method 1: Check debug_token granular_scopes
     if app_id and app_secret:
@@ -613,6 +614,7 @@ async def _discover_waba_id_from_token(access_token: str, corr_id: str) -> Optio
                 logger.info("[ESU][%s] debug_token status=%s: %s", corr_id, resp.status_code, resp.text)
                 if resp.status_code == 200:
                     data = resp.json().get("data", {})
+                    token_user_id = str(data.get("user_id", "")).strip() or None
                     granular_scopes = data.get("granular_scopes", [])
                     for gs in granular_scopes:
                         scope_name = gs.get("scope", "")
@@ -628,23 +630,31 @@ async def _discover_waba_id_from_token(access_token: str, corr_id: str) -> Optio
         except Exception as exc:
             logger.warning("[ESU][%s] Exception in _discover_waba_id_from_token via debug_token: %s", corr_id, exc)
 
-    # Method 2: /me/whatsapp_business_accounts
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.get(
-                f"{base}/me/whatsapp_business_accounts",
-                headers=headers,
-                params={"fields": "id,name,timezone_id"},
-            )
-            logger.info("[ESU][%s] /me/whatsapp_business_accounts status=%s: %s", corr_id, resp.status_code, resp.text)
-            if resp.status_code == 200:
-                waba_items = resp.json().get("data", [])
-                for w in waba_items:
-                    wid = str(w.get("id", "")).strip()
-                    if wid and wid not in discovered_wabas:
-                        discovered_wabas.append(wid)
-    except Exception as exc:
-        logger.warning("[ESU][%s] Exception in /me/whatsapp_business_accounts: %s", corr_id, exc)
+    # Method 2: /me/assigned_whatsapp_business_accounts and /{user_id}/assigned_whatsapp_business_accounts
+    candidate_endpoints = [
+        f"{base}/me/assigned_whatsapp_business_accounts",
+    ]
+    if token_user_id:
+        candidate_endpoints.append(f"{base}/{token_user_id}/assigned_whatsapp_business_accounts")
+
+    for endpoint in candidate_endpoints:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(
+                    endpoint,
+                    headers=headers,
+                    params={"fields": "id,name,timezone_id"},
+                )
+                endpoint_name = endpoint.split("/")[-1]
+                logger.info("[ESU][%s] %s status=%s: %s", corr_id, endpoint_name, resp.status_code, resp.text)
+                if resp.status_code == 200:
+                    waba_items = resp.json().get("data", [])
+                    for w in waba_items:
+                        wid = str(w.get("id", "")).strip()
+                        if wid and wid not in discovered_wabas:
+                            discovered_wabas.append(wid)
+        except Exception as exc:
+            logger.warning("[ESU][%s] Exception in %s: %s", corr_id, endpoint, exc)
 
     # Method 3: /me/businesses and query each business for owned/client WABAs
     try:
